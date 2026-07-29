@@ -14,7 +14,7 @@ while IFS=$'\t' read -r document link; do
     link=${link%>}
 
     case "$link" in
-        ""|\#*|http://*|https://*|mailto:*|../../releases/*)
+        ""|\#*|http://*|https://*|mailto:*|../../releases|../../releases/*)
             continue
             ;;
     esac

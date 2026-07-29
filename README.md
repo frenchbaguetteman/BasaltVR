@@ -16,7 +16,7 @@ Basically a vibecoded clone of MoltenVR. Only tested on steam beatsaber + bsmana
 ## Download
 
 Download the latest Apple Silicon developer preview from
-[GitHub Releases](../../releases/latest). Each release includes a SHA-256 checksum and exact
+[GitHub Releases](../../releases). Each release includes a SHA-256 checksum and exact
 limitations. The app requires macOS 14 or newer and is currently ad-hoc signed rather than
 notarized.
 
