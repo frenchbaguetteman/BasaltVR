@@ -31,7 +31,7 @@ jobs:
 
       - name: Resolve version
         id: version
-        shell: zsh
+        shell: zsh {0}
         run: |
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
@@ -71,7 +71,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ steps.version.outputs.tag }}
-        shell: zsh
+        shell: zsh {0}
         run: |
           notes="docs/releases/${TAG}.md"
           [[ -f "$notes" ]] || {
