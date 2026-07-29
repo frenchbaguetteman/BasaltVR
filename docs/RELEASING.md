@@ -39,9 +39,14 @@ notarized, and accepted from a clean macOS user account with a live headset.
 
 ## Publishing
 
-Push an annotated `vX.Y.Z` tag. The release workflow rebuilds and verifies the pinned Basalt DXMT
-fork, runs Swift tests, creates the archive and checksum, and publishes a GitHub prerelease using
-`docs/releases/vX.Y.Z.md`.
+Push an annotated `vX.Y.Z` tag. The release workflow rebuilds the pinned Basalt DXMT fork, verifies
+the generated PE/Mach-O architectures and macOS deployment target, runs Swift tests, creates the
+archive and checksum, and publishes a GitHub prerelease using `docs/releases/vX.Y.Z.md`.
+
+GitHub's virtual macOS runners do not expose the physical Metal/IOSurface sharing needed by
+`make dxmt-test`. That full graphics and cross-process pixel gate remains mandatory on a physical
+Apple Silicon Mac before tagging; the hosted workflow performs deterministic source, build, and
+artifact verification without weakening the local release gate.
 
 The workflow uses the repository-scoped `GITHUB_TOKEN` with only `contents: write`. No Apple
 signing credentials are required for the current ad-hoc-signed preview. It refuses to overwrite

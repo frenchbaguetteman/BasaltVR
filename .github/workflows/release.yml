@@ -55,10 +55,10 @@ jobs:
       - name: Install release prerequisites
         run: brew install cmake mingw-w64 meson ninja
 
-      - name: Build and verify Basalt DXMT fork
+      - name: Build and inspect Basalt DXMT fork
         run: |
           runtime/scripts/build-dxmt-fork.zsh
-          runtime/scripts/test-dxmt.zsh
+          runtime/scripts/verify-dxmt-artifacts.zsh
 
       - name: Run contributor quality gate
         run: make check
