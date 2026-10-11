@@ -2,7 +2,7 @@
 
 Runs windows vr programs on mac.
 
-Basically a vibecoded clone of MoltenVR. Only tested on steam beatsaber + bsmanager. Hardware tested: M3 Max, Quest 3+ALVr. 
+Only tested on steam beatsaber + bsmanager. Hardware tested: M3 Max, Quest 3+ALVr.
 
 **A clean-room, open-source PCVR streaming stack for Apple Silicon Macs.**
 
