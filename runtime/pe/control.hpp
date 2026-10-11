@@ -28,11 +28,29 @@ void controlSessionDestroyed(XrSession session);
 // True only while the daemon handshake is complete for the live session.
 bool controlActive(XrSession session);
 
-// Returns the latest fresh ALVR head pose (LOCAL-from-HEAD). The Quest
-// timestamp is preserved only for ordering because it is not in the runtime's
-// XrTime clock domain. False means disconnected, missing, or stale tracking.
+// Reads the optional per-eye render size from the BASALT_CONTROL handoff.
+// This is available before session creation so OpenXR system/view queries can
+// advertise the stream's actual target size to the application.
+bool controlConfiguredViewSize(uint32_t* width, uint32_t* height);
+
+// Blocks frame production while two submitted frames are still unconsumed by
+// the daemon (an app that calls xrWaitFrame(N+1) before xrEndFrame(N) can
+// have one more in flight). This is the end-to-end backpressure boundary: it
+// covers the GPU fence, control socket, compositor, and encoder admission
+// instead of allowing latency to accumulate in any of those queues.
+bool controlWaitForFrameBudget(XrSession session);
+// Records a predictedDisplayTime returned by xrWaitFrame, so a later recenter
+// takes effect only after every frame the application may be rendering.
+void controlNotePredictedDisplayTime(XrSession session, XrTime predictedDisplayTime);
+
+// Returns the latest fresh ALVR head pose (LOCAL-from-HEAD), selecting the
+// previous LOCAL definition for locateTime values before a pending recenter's
+// changeTime. The Quest timestamp is preserved only for ordering because it is
+// not in the runtime's XrTime clock domain. False means disconnected, missing,
+// or stale tracking. A zero locateTime selects the current definition.
 bool controlHeadPose(
     XrSession session,
+    XrTime locateTime,
     uint64_t* questTimestampNanoseconds,
     XrPosef* poseInLocal);
 
@@ -63,6 +81,11 @@ struct ControlButtonState {
     XrTime lastChangeTime;
 };
 
+// valueType 0 is a digital 0/1 button; 1 is an analog value pressed at 0.5.
+inline bool controlButtonPressed(uint32_t valueType, float value) {
+    return valueType == 0 ? value != 0.0f : value >= 0.5f;
+}
+
 struct ControlInputSnapshot {
     ControlControllerState controllers[2];
     uint32_t buttonCount;
@@ -79,7 +102,10 @@ bool controlViewConfig(
 // Atomically copies the live controller/profile/button state used by one
 // xrSyncActions call. Controller pose activity includes the freshness gate;
 // sparse button values persist until the control connection is replaced.
-bool controlInputSnapshot(XrSession session, ControlInputSnapshot* snapshot);
+bool controlInputSnapshot(
+    XrSession session,
+    ControlInputSnapshot* snapshot,
+    XrTime locateTime = 0);
 
 // Sends one resolved OpenXR haptic command to the streamer. A zero duration
 // and amplitude is the stop representation.

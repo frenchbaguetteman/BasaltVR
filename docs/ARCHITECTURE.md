@@ -136,7 +136,8 @@ input-to-display latency fell from roughly 55–58 ms to 47–51 ms. A separate 
 held approximately 72 fps at 1344×1408 per eye (2688×1408 encoded), with decode near 21 ms and
 steady local capture-to-encode latency near 12 ms. These samples validate the preset plumbing and
 show available headroom, but do not establish subjective head-motion quality or sustained thermal
-behavior. Low latency therefore remains opt-in, and comparisons should change one setting at a
+behavior. Ultra latency is the explicit one-frame, reduced-history option for latency-focused
+USB sessions; low remains the safer default. Comparisons should change one setting at a
 time from a cool headset. Per-eye resolution and conservative decoder-buffering presets are shared
 model values exposed through the CLI today and intended for management-app launch profiles. The
 runtime path now consumes full HMD/controller tracking and game swapchain textures; the remaining
@@ -219,6 +220,12 @@ missing/stale samples clear tracking-dependent flags. A synthetic interleaving t
 Quest run both pass. ALVR v20.14 already pre-predicts the head pose and zeros head velocities, so
 additional extrapolation is intentionally deferred until the Quest/runtime clock domains are
 mapped.
+
+The first live head sample also establishes a gravity-aligned LOCAL origin at the current X/Z and
+yaw. Holding the right Quest system/Meta button for 600 ms recenters that origin and queues the
+core OpenXR LOCAL reference-space-change event. `changeTime` follows the latest predicted display
+time already returned by `xrWaitFrame`, and the runtime retains the previous transform for lookups
+before it, so an in-flight frame cannot jump into the new coordinate definition.
 
 The second M4 slice advances the control channel through protocol v7. ALVR's corrected Touch grip
 motions and velocities, sparse button deltas, active profile packets, calibrated views, and an

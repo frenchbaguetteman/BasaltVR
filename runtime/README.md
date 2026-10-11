@@ -42,6 +42,13 @@ state at `xrSyncActions`, locate live grip action spaces, expose controller velo
 `XrSpaceVelocity`, enumerate and localize resolved sources, and forward priority-filtered haptic
 apply/stop commands to ALVR. Protocol v7's timestamped `ControllerMask` clears a missing hand's
 pose and velocity immediately and permits recovery only from a newer presence/motion sample.
+The first fresh head sample defines LOCAL at the viewer's horizontal position and leveled yaw.
+Holding the right Quest system/Meta button for 600 ms redefines that origin at the current head
+position/yaw and queues `XrEventDataReferenceSpaceChangePending` for LOCAL. Pose lookup observes
+the event's `changeTime`, which follows the latest predicted display time `xrWaitFrame` has
+returned, so frames already in flight retain the previous space definition. The Quest OS normally
+reserves the Meta button, so this gesture is so far exercised only by the control-daemon test; the
+runtime logs `right system button pressed` to stderr when ALVR forwards the button on hardware.
 
 `xrEndFrame` now accepts stereo `XrCompositionLayerProjection` layers: it validates layer
 flags, session ownership of the layer space and each subimage swapchain, per-view poses and
@@ -163,14 +170,16 @@ an external-app runtime/transport/session pass. The separate long-running live Q
 physically confirmed with fused, level/world-fixed stereo, tracked controller motion, analog
 squeeze, and haptics; the left controller menu button requests clean exit from `hello_xr`.
 
-To build without running Wine:
+To build without running Wine (`make runtime-build` runs the same preset):
 
 ```sh
-cmake -S runtime -B runtime/build \
-  -DCMAKE_TOOLCHAIN_FILE="$PWD/runtime/cmake/toolchains/mingw-x86_64.cmake" \
-  -DCMAKE_BUILD_TYPE=Release
+cmake -S runtime --preset mingw-release
 cmake --build runtime/build --parallel
 ```
+
+IDEs that read `runtime/CMakePresets.json` (VS Code CMake Tools, CLion) pick up the MinGW
+toolchain and the same `runtime/build` tree the test scripts use. Configuring `runtime/` with the
+host compiler does not produce a usable runtime.
 
 If `runtime/scripts/build-dxmt-fork.zsh` has produced the Basalt DXMT fork
 (`runtime/dxmt-fork`, MIT v0.80 base plus the IOSurface texture-export patches), the script
@@ -183,7 +192,7 @@ pass. The phase ends with the cross-process zero-copy proof: a Wine process uplo
 known pattern into a gated texture through the immediate context, waits an
 `ID3D11Fence`, and publishes the ID; a native host tool (`tests/native/iosurface_readback.c`)
 maps that IOSurface by ID and must read the exact bytes. The tree is restored to the
-pinned stock overlay afterwards.
+pinned stock overlay afterwards, including when a fork-phase step fails.
 
 ## Next implementation boundary
 
@@ -199,13 +208,18 @@ The next app-facing and graphics slices are:
    progress `SYNCHRONIZED→VISIBLE→FOCUSED` (and unwind on exit), and let
    `xrSyncActions`/haptics succeed with inactive actions; headless behavior is unchanged.
    `test-dxmt.zsh` gates a 21-frame hello_xr-shaped stereo render loop whose per-frame clear
-   colors the native daemon verifies byte-exact after each fence-confirmed FrameReady, and
-   the Swift streamer's `RuntimeLink` (`streamer/Sources/BasaltCore/RuntimeLink.swift`,
-   exercised by `basalt-streamer runtime-link-selftest`) encoded those same frames to H.264
+   colors the native daemon verifies byte-exact after each fence-confirmed FrameReady. It then
+   repeats the smoke against the Swift streamer's `RuntimeLink`
+   (`streamer/Sources/BasaltCore/RuntimeLink.swift`, via `basalt-streamer
+   runtime-link-selftest`), which must acknowledge and encode at least 21 frames to H.264
    through the zero-copy IOSurface → CVPixelBuffer → VideoToolbox path. The runtime advertises
    only BGRA/BGRA-sRGB swapchains because CoreVideo cannot wrap DXMT's RGBA IOSurfaces; rejecting
-   that format at negotiation prevents a silent black stream. Protocol v7 binds each frame to the exact Quest tracking timestamp
-   used by its successful `xrLocateViews` call and preserves it through VideoToolbox into ALVR.
+   that format at negotiation prevents a silent black stream. Protocol v9 binds each frame to the exact Quest tracking timestamp
+   used by its successful `xrLocateViews` call, preserves it through VideoToolbox into ALVR,
+   and requires an ordered post-Metal-read acknowledgement. A strict two-frame window overlaps
+   game rendering with native compose/encode while preventing latency accumulation. The control handoff also carries the
+   selected per-eye stream dimensions so applications render at the target resolution instead
+   of rendering 1680×1760 and immediately downscaling it.
    `runtime/scripts/test-headset.zsh` now runs that producer for a
    visible interval and sends the resulting H.264 through the live wired ALVR path. Remaining:
    the storage-mode frame-time comparison and a continuous real application/game producer.
@@ -227,7 +241,8 @@ The next app-facing and graphics slices are:
    the pose a second time. Stock ALVR does not transmit its separately-polled aim pose, so aim
    necessarily aliases grip until upstream provides distinct aim motion. The native daemon gates
    pose/velocity, immediate loss and recovery, a button change, profiles, priority, bound/localized
-   sources, and apply/stop haptics. The pinned official Khronos `hello_xr` completes a live
+   sources, apply/stop haptics, and time-bounded LOCAL recentering from the Quest reset gesture.
+   The pinned official Khronos `hello_xr` completes a live
    external-app transport/session run. The live Quest scene physically verifies level/world-fixed
    stereo, tracked controller response, analog squeeze, and squeeze-triggered haptics at 72 fps;
    M4 is complete.

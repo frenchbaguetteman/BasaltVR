@@ -1,7 +1,11 @@
 .DS_Store
 .swiftpm/
+.vscode/
 DerivedData/
 *.dSYM/
+
+# Stray IDE configure outputs; use runtime/CMakePresets.json (runtime/build).
+/build/
 
 streamer/.build/
 streamer/streamer-control-file
@@ -12,3 +16,10 @@ runtime/build*/
 dist/
 release/
 packaging/*.iconset/
+
+# Personal editor state, local secrets, and logs.
+.idea/
+xcuserdata/
+.env
+.env.*
+*.log

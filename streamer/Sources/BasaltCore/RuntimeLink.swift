@@ -8,13 +8,38 @@ import Security
 /// (docs/DXMT-INTEROP.md §4; wire format in runtime/pe/basalt_control_protocol.h,
 /// mirrored here because the constants are trivially small).
 ///
-/// Listens on loopback, writes "<port> <token>" to the control file the
+/// Listens on loopback, writes "<port> <token> <width> <height>" to the control file the
 /// launcher hands the game bottle via BASALT_CONTROL, validates the Hello
 /// token, retains every registered swapchain IOSurface (IDs are untrusted:
 /// dimensions are re-checked after lookup), and surfaces fence-confirmed
 /// frames to `onFrame`. One runtime connection at a time.
 public final class RuntimeLink: @unchecked Sendable {
-    private enum MessageType: UInt16 {
+    /// Acknowledges one frame to the runtime, exactly once. Holders must keep
+    /// it alive until their reads of the frame's surfaces finish: releasing
+    /// the last reference acknowledges the frame, so a forgotten `complete()`
+    /// cannot stall every later acknowledgement and starve `xrWaitFrame`.
+    public final class FrameConsumption: @unchecked Sendable {
+        private let lock = NSLock()
+        private var action: (@Sendable () -> Void)?
+
+        fileprivate init(_ action: @escaping @Sendable () -> Void) {
+            self.action = action
+        }
+
+        deinit {
+            complete()
+        }
+
+        public func complete() {
+            lock.lock()
+            let pending = action
+            action = nil
+            lock.unlock()
+            pending?()
+        }
+    }
+
+    enum MessageType: UInt16, CaseIterable {
         case hello = 1
         case helloAck = 2
         case createSwapchain = 3
@@ -31,11 +56,15 @@ public final class RuntimeLink: @unchecked Sendable {
         case inputReset = 14
         case viewConfig = 15
         case controllerMask = 16
+        case frameConsumed = 17
     }
 
-    private static let protocolVersion: UInt16 = 7
-    private static let tokenLength = 32
-    private static let maxMessageLength = 4096
+    public static let protocolVersion: UInt16 = 9
+    static let tokenLength = 32
+    static let maxMessageLength = 4096
+    /// The runtime's largest per-eye view; it ignores a larger configured size.
+    public static let maximumViewWidth = 1680
+    public static let maximumViewHeight = 1760
     static let maximumRetainedButtonPaths = 64
 
     public struct FrameView {
@@ -75,12 +104,22 @@ public final class RuntimeLink: @unchecked Sendable {
 
     public var onHello: ((_ sessionId: UInt64, _ renderer: String) -> Void)?
     public var onSwapchain: ((Swapchain) -> Void)?
-    public var onFrame: ((Frame) -> Void)?
+    /// The consumer must invoke `consumed` after it has finished reading the
+    /// frame's source IOSurfaces. The callback is one-shot and connection
+    /// scoped, so late completions after teardown are harmless.
+    public var onFrame: ((_ frame: Frame, _ consumption: FrameConsumption) -> Void)?
     public var onTeardown: (() -> Void)?
+    /// A runtime connection was refused (wrong protocol version or token,
+    /// malformed Hello). Called on the link's queue with a readable reason.
+    public var onProtocolError: ((String) -> Void)?
+    /// The streamer prefixes refusal reasons with this on stderr so the
+    /// manager can surface them; the game itself only sees a headless session.
+    public static let connectionRefusedLogPrefix = "OpenXR runtime connection refused: "
     private var hapticHandler: ((_ hand: AlvrHand, _ durationNanoseconds: UInt64,
                                  _ frequency: Float, _ amplitude: Float) -> Void)?
 
     private let controlFilePath: String
+    private let recommendedViewSize: PerEyeResolution?
     private let queue = DispatchQueue(label: "basalt.runtime-link")
     private let listener: NWListener
     private var connection: NWConnection?
@@ -100,10 +139,28 @@ public final class RuntimeLink: @unchecked Sendable {
     private var latestViewConfigPayload: Data?
     private var latestControllerMask: UInt32?
     private var latestControllerMaskPayload: Data?
+    private var completedFrameNumbers = Set<UInt64>()
+    private var lastAcknowledgedFrameNumber: UInt64 = 0
 
-    public init(controlFilePath: String) throws {
+    public init(
+        controlFilePath: String,
+        recommendedViewSize: PerEyeResolution? = nil
+    ) throws {
+        if let size = recommendedViewSize,
+           size.width > Self.maximumViewWidth || size.height > Self.maximumViewHeight {
+            // The runtime would fall back to its maximum, so the game would
+            // render at a different size than the streamer encodes.
+            throw BasaltError(
+                "Per-eye resolution \(size.width)x\(size.height) exceeds the OpenXR "
+                + "runtime's \(Self.maximumViewWidth)x\(Self.maximumViewHeight) maximum")
+        }
         self.controlFilePath = controlFilePath
-        let parameters = NWParameters.tcp
+        self.recommendedViewSize = recommendedViewSize
+        // FrameConsumed gates the game's xrWaitFrame; never let Nagle hold
+        // the tiny ack behind an unacknowledged pose write.
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        let parameters = NWParameters(tls: nil, tcp: tcp)
         parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host("127.0.0.1"), port: NWEndpoint.Port(rawValue: 0)!)
         listener = try NWListener(using: parameters)
@@ -141,7 +198,9 @@ public final class RuntimeLink: @unchecked Sendable {
                             // 0600 in one step so it is never briefly exposed.
                             try? FileManager.default.removeItem(
                                 atPath: self.controlFilePath)
-                            let controlLine = "\(port) \(self.token)\n"
+                            let controlLine = Self.controlFileLine(
+                                port: port, token: self.token,
+                                recommendedViewSize: self.recommendedViewSize)
                             guard FileManager.default.createFile(
                                 atPath: self.controlFilePath,
                                 contents: Data(controlLine.utf8),
@@ -164,6 +223,17 @@ public final class RuntimeLink: @unchecked Sendable {
                 self.listener.start(queue: self.queue)
             }
         }
+    }
+
+    static func controlFileLine(
+        port: UInt16,
+        token: String,
+        recommendedViewSize: PerEyeResolution?
+    ) -> String {
+        guard let size = recommendedViewSize else {
+            return "\(port) \(token)\n"
+        }
+        return "\(port) \(token) \(size.width) \(size.height)\n"
     }
 
     public func stop() {
@@ -410,11 +480,24 @@ public final class RuntimeLink: @unchecked Sendable {
         connection = newConnection
         receiveBuffer.removeAll()
         helloDone = false
-        newConnection.stateUpdateHandler = { [weak self] state in
-            if case .failed = state { self?.queue.async { self?.dropConnection() } }
+        newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
+            guard case .failed = state, let self, let newConnection else { return }
+            // A replaced connection's late failure must not drop its
+            // successor (e.g. a quick OpenXR session restart).
+            self.onQueue(ifCurrent: newConnection) { self.dropConnection() }
         }
         newConnection.start(queue: queue)
         receiveMore()
+    }
+
+    /// Runs `body` on `queue` only while `expected` is still the live
+    /// connection. Late completions from a dropped connection (failures,
+    /// sends, released frames) must never act on its successor.
+    private func onQueue(ifCurrent expected: NWConnection, _ body: @escaping () -> Void) {
+        queue.async { [weak self, weak expected] in
+            guard let self, let expected, self.connection === expected else { return }
+            body()
+        }
     }
 
     private func dropConnection() {
@@ -430,6 +513,8 @@ public final class RuntimeLink: @unchecked Sendable {
         nextControllerHand = .left
         pendingButtonPayloads.removeAll()
         buttonSendInFlight = false
+        completedFrameNumbers.removeAll()
+        lastAcknowledgedFrameNumber = 0
         if helloDone {
             helloDone = false
             onTeardown?()
@@ -437,9 +522,14 @@ public final class RuntimeLink: @unchecked Sendable {
     }
 
     private func receiveMore() {
-        connection?.receive(minimumIncompleteLength: 1, maximumLength: 65536) {
-            [weak self] data, _, isComplete, error in
-            guard let self else { return }
+        guard let activeConnection = connection else { return }
+        activeConnection.receive(minimumIncompleteLength: 1, maximumLength: 65536) {
+            [weak self, weak activeConnection] data, _, isComplete, error in
+            // Cancelling a dropped connection completes its outstanding
+            // receive with an error; that completion must neither drop nor
+            // feed bytes into a newer connection.
+            guard let self, let activeConnection,
+                  self.connection === activeConnection else { return }
             if let data, !data.isEmpty {
                 self.receiveBuffer.append(data)
                 if !self.drainMessages() {
@@ -490,14 +580,9 @@ public final class RuntimeLink: @unchecked Sendable {
         message.append(payload)
         connection.send(content: message, completion: .contentProcessed { [weak self, weak connection] error in
             guard let self, let connection else { return }
-            self.queue.async {
-                guard self.connection === connection else { return }
+            self.onQueue(ifCurrent: connection) {
                 self.headPoseSendInFlight = false
-                if error != nil {
-                    self.dropConnection()
-                } else {
-                    self.pumpHeadPose()
-                }
+                if error != nil { self.dropConnection() } else { self.pumpHeadPose() }
             }
         })
     }
@@ -518,8 +603,7 @@ public final class RuntimeLink: @unchecked Sendable {
         message.append(payload)
         connection.send(content: message, completion: .contentProcessed { [weak self, weak connection] error in
             guard let self, let connection else { return }
-            self.queue.async {
-                guard self.connection === connection else { return }
+            self.onQueue(ifCurrent: connection) {
                 self.controllerMotionSendInFlight = false
                 if error != nil { self.dropConnection() } else { self.pumpControllerMotion() }
             }
@@ -538,8 +622,7 @@ public final class RuntimeLink: @unchecked Sendable {
         connection.send(content: message, completion: .contentProcessed {
             [weak self, weak connection] error in
             guard let self, let connection else { return }
-            self.queue.async {
-                guard self.connection === connection else { return }
+            self.onQueue(ifCurrent: connection) {
                 self.buttonSendInFlight = false
                 if error != nil { self.dropConnection() } else { self.pumpButtonState() }
             }
@@ -566,19 +649,11 @@ public final class RuntimeLink: @unchecked Sendable {
     }
 
     private func handleHello(_ payload: Data) -> Bool {
-        let headerLength = 2 + Self.tokenLength + 8 + 2
-        guard payload.count >= headerLength,
-              payload.readU16(at: 0) == Self.protocolVersion,
-              String(data: payload.subdata(in: 2..<(2 + Self.tokenLength)),
-                     encoding: .ascii) == token else {
+        let verdict = Self.helloVerdict(payload, token: token)
+        guard case .accept(let sessionId, let renderer) = verdict else {
+            if case .refuse(let reason) = verdict { onProtocolError?(reason) }
             return false
         }
-        let sessionId = payload.readU64(at: 2 + Self.tokenLength)
-        let rendererLength = Int(payload.readU16(at: 2 + Self.tokenLength + 8))
-        guard payload.count == headerLength + rendererLength else { return false }
-        let renderer = String(
-            data: payload.subdata(in: headerLength..<(headerLength + rendererLength)),
-            encoding: .utf8) ?? ""
         helloDone = true
         var ack = Data()
         ack.appendU16(Self.protocolVersion)
@@ -599,6 +674,45 @@ public final class RuntimeLink: @unchecked Sendable {
             send(type: .controllerMask, payload: latestControllerMaskPayload)
         }
         return true
+    }
+
+    enum HelloVerdict: Equatable {
+        case accept(sessionId: UInt64, renderer: String)
+        /// Not authenticated by the control token: drop without reporting,
+        /// so an arbitrary local process cannot raise a user-facing alert.
+        case ignore
+        /// An authenticated runtime that cannot start a session.
+        case refuse(String)
+    }
+
+    /// Whether a Hello may start a session. The token is checked first; it
+    /// sits at the same offset in every protocol version. A version mismatch
+    /// from an authenticated runtime means the bottle's DLL and this streamer
+    /// come from different builds; the game then runs headless (a black
+    /// headset), so the reason must reach the session log.
+    static func helloVerdict(_ payload: Data, token: String) -> HelloVerdict {
+        let headerLength = 2 + tokenLength + 8 + 2
+        guard payload.count >= 2 + tokenLength,
+              String(data: payload.subdata(in: 2..<(2 + tokenLength)),
+                     encoding: .ascii) == token else {
+            return .ignore
+        }
+        let version = payload.readU16(at: 0)
+        guard version == protocolVersion else {
+            return .refuse(
+                "OpenXR runtime speaks control protocol v\(version), but this streamer "
+                + "speaks v\(protocolVersion): the bottle's basalt_openxr.dll is from a "
+                + "different build (from source, run `make runtime-build`, then relaunch)")
+        }
+        guard payload.count >= headerLength,
+              payload.count == headerLength
+                + Int(payload.readU16(at: 2 + tokenLength + 8)) else {
+            return .refuse("runtime sent a malformed Hello")
+        }
+        return .accept(
+            sessionId: payload.readU64(at: 2 + tokenLength),
+            renderer: String(data: payload.subdata(in: headerLength..<payload.count),
+                             encoding: .utf8) ?? "")
     }
 
     private func handleCreateSwapchain(_ payload: Data) -> Bool {
@@ -674,12 +788,49 @@ public final class RuntimeLink: @unchecked Sendable {
                 rect: rect,
                 surface: swapchain.surfaces[Int(imageIndex)]))
         }
-        onFrame?(Frame(
+        let frame = Frame(
             frameNumber: header.frameNumber,
             displayTime: header.displayTime,
             questTrackingTimestampNanoseconds: header.questTrackingTimestampNanoseconds,
-            views: views))
+            views: views)
+        guard let onFrame else {
+            markFrameConsumed(header.frameNumber)
+            return true
+        }
+        let activeConnection = connection
+        let consumption = FrameConsumption { [weak self, weak activeConnection] in
+            guard let self, let activeConnection else { return }
+            self.onQueue(ifCurrent: activeConnection) {
+                guard self.helloDone else { return }
+                self.markFrameConsumed(header.frameNumber)
+            }
+        }
+        onFrame(frame, consumption)
         return true
+    }
+
+    private func markFrameConsumed(_ frameNumber: UInt64) {
+        guard frameNumber > lastAcknowledgedFrameNumber else { return }
+        completedFrameNumbers.insert(frameNumber)
+        for acknowledged in Self.orderedAcknowledgements(
+                completed: &completedFrameNumbers,
+                lastAcknowledged: &lastAcknowledgedFrameNumber) {
+            var payload = Data()
+            payload.appendU64(acknowledged)
+            send(type: .frameConsumed, payload: payload)
+        }
+    }
+
+    static func orderedAcknowledgements(
+        completed: inout Set<UInt64>,
+        lastAcknowledged: inout UInt64
+    ) -> [UInt64] {
+        var ready: [UInt64] = []
+        while completed.remove(lastAcknowledged + 1) != nil {
+            lastAcknowledged += 1
+            ready.append(lastAcknowledged)
+        }
+        return ready
     }
 
     static func frameReadyHeader(from payload: Data) -> FrameReadyHeader? {

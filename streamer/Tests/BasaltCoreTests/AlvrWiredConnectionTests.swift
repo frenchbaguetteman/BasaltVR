@@ -26,18 +26,18 @@ final class AlvrWiredConnectionTests: XCTestCase {
         let output = """
         List of devices attached
         emulator-5554 device product:sdk model:Emulator transport_id:1
-        2G0YC1ZF98034T device usb:0-1 product:eureka model:Quest_3 transport_id:2
+        TESTQUEST00001 device usb:0-1 product:eureka model:Quest_3 transport_id:2
 
         """
         XCTAssertEqual(AlvrADBDeviceParser.authorizedUSBSerial(from: output),
-                       "2G0YC1ZF98034T")
+                       "TESTQUEST00001")
         XCTAssertFalse(AlvrADBDeviceParser.hasUnauthorizedDevice(in: output))
     }
 
     func testReportsUnauthorizedDeviceAndIgnoresNetworkADB() {
         let unauthorized = """
         List of devices attached
-        2G0YC1ZF98034T unauthorized usb:0-1 transport_id:2
+        TESTQUEST00001 unauthorized usb:0-1 transport_id:2
 
         """
         XCTAssertNil(AlvrADBDeviceParser.authorizedUSBSerial(from: unauthorized))
@@ -45,7 +45,7 @@ final class AlvrWiredConnectionTests: XCTestCase {
 
         let network = """
         List of devices attached
-        192.168.1.227:5555 device product:eureka model:Quest_3 transport_id:3
+        192.168.1.20:5555 device product:eureka model:Quest_3 transport_id:3
 
         """
         XCTAssertNil(AlvrADBDeviceParser.authorizedUSBSerial(from: network))

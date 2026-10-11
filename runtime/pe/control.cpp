@@ -4,6 +4,7 @@
 #include <ws2tcpip.h>
 
 #include "control.hpp"
+#include "runtime.hpp"
 
 #include <d3d11_4.h>
 
@@ -14,8 +15,13 @@
 #include <cstring>
 
 #include "basalt_control_protocol.h"
+#include "pose_math.hpp"
 
 namespace {
+
+using basalt::poseCompose;
+using basalt::poseInvert;
+using basalt::quaternionRotate;
 
 // Must match BASALT_GUID_IOSURFACE_ID in the Basalt DXMT fork
 // (runtime/dxmt-fork). {DD807311-529E-4856-A5C0-48BED2048129}
@@ -24,8 +30,21 @@ constexpr GUID kBasaltIOSurfaceIdGuid = {
 
 constexpr DWORD kSocketTimeoutMilliseconds = 5000;
 constexpr DWORD kFenceWaitMilliseconds = 10000;
+// A frame is consumed only after its GPU fence (up to kFenceWaitMilliseconds),
+// the FrameReady send, and the daemon's Metal reads. Waiting for consumption
+// must outlast the fence wait, or a long GPU hitch would disconnect from the
+// frame budget before the waiter's own fence deadline.
+constexpr DWORD kFrameConsumeMilliseconds =
+    kFenceWaitMilliseconds + kSocketTimeoutMilliseconds;
 constexpr DWORD kWaiterJoinMilliseconds = 15000;
-constexpr size_t kPendingFrameCapacity = 8;
+// Two frames allow game rendering to overlap the native Metal compose and
+// VideoToolbox stages. The daemon still acks only after Metal has finished
+// reading a source surface, so this is a strict latency/memory bound.
+constexpr uint64_t kFrameWindow = 2;
+// xrWaitFrame checks the window against frames already queued, so an app that
+// calls xrWaitFrame(N+1) before xrEndFrame(N) can have one more frame in
+// flight. Sizing the ring for that keeps the overflow guard unreachable.
+constexpr size_t kPendingFrameCapacity = kFrameWindow + 1;
 constexpr uint32_t kMaxFrameViews = 2;
 constexpr size_t kMaxRendererLength = 256;
 constexpr size_t kHeadPosePayloadLength = 8 + 7 * sizeof(float);
@@ -34,6 +53,7 @@ constexpr size_t kButtonStatePayloadLength = 8 + 4 + sizeof(float);
 constexpr size_t kInteractionProfilePayloadLength = 4 + 8;
 constexpr XrDuration kHeadPoseFreshness = 500'000'000;
 constexpr XrDuration kControllerPoseFreshness = 500'000'000;
+constexpr XrDuration kSystemButtonRecenterHold = 600'000'000;
 
 // Serialized FrameReady payload: header (8 + 8 + 8 + 4) plus per view
 // (8 + 4 + 4 + 16 + 28 + 16).
@@ -53,9 +73,16 @@ struct ControllerInputRecord {
     uint64_t presenceTimestamp = 0;
     uint64_t profileId = 0;
     XrTime poseArrival = 0;
-    XrPosef pose{};
-    XrVector3f linearVelocity{};
-    XrVector3f angularVelocity{};
+    XrPosef rawPose{};
+    XrVector3f rawLinearVelocity{};
+    XrVector3f rawAngularVelocity{};
+};
+
+struct RecenterNotification {
+    bool ready = false;
+    XrSession session = XR_NULL_HANDLE;
+    XrTime changeTime = 0;
+    XrPosef poseInPreviousSpace{};
 };
 
 struct ButtonInputRecord {
@@ -94,20 +121,63 @@ size_t gAckPayloadLength = 0;
 bool gHeadPoseValid = false;
 uint64_t gHeadPoseQuestTimestamp = 0;
 XrTime gHeadPoseArrival = 0;
-XrPosef gHeadPose{};
-bool gHorizontalOriginValid = false;
-float gHorizontalOriginX = 0.0f;
-float gHorizontalOriginZ = 0.0f;
+XrPosef gRawHeadPose{};
+bool gLocalOriginValid = false;
+XrPosef gLocalFromQuest{};
+XrPosef gPreviousLocalFromQuest{};
+XrTime gLocalSpaceChangeTime = 0;
+// Latest xrWaitFrame predictedDisplayTime handed to the control session. A
+// recenter must not take effect at or before it: the application may already
+// have located part of that frame against the previous LOCAL definition.
+XrTime gLatestPredictedDisplayTime = 0;
+// Nonzero while the right system button is held; the recenter gesture fires
+// once per hold.
+XrTime gSystemButtonPressTime = 0;
+bool gSystemButtonRecentered = false;
 ControllerInputRecord gControllerInputs[2]{};
 ButtonInputRecord gButtonInputs[basalt::kControlButtonCapacity]{};
 bool gViewConfigValid = false;
 float gViewConfigIpdMeters = 0.0f;
 XrFovf gViewConfigFov[2]{};
 uint64_t gNextFrameNumber = 1;
-uint64_t gLastSentFrameNumber = 0;
+uint64_t gLastConsumedFrameNumber = 0;
 PendingFrame gPendingFrames[kPendingFrameCapacity]{};
 size_t gPendingHead = 0;
 size_t gPendingCount = 0;
+
+void resetSystemButtonLocked() {
+    gSystemButtonPressTime = 0;
+    gSystemButtonRecentered = false;
+}
+
+void resetInputsLocked() {
+    for (ControllerInputRecord& record : gControllerInputs) {
+        record = {};
+    }
+    for (ButtonInputRecord& record : gButtonInputs) {
+        record = {};
+    }
+    resetSystemButtonLocked();
+}
+
+// Everything the daemon streams per connection. A new or closing connection
+// must never inherit the previous one's poses, LOCAL origin, or held buttons.
+void resetTrackingStateLocked() {
+    gHeadPoseValid = false;
+    gHeadPoseQuestTimestamp = 0;
+    gHeadPoseArrival = 0;
+    gRawHeadPose = {};
+    gLocalOriginValid = false;
+    gLocalFromQuest = basalt::identityPose();
+    gPreviousLocalFromQuest = gLocalFromQuest;
+    gLocalSpaceChangeTime = 0;
+    gLatestPredictedDisplayTime = 0;
+    resetInputsLocked();
+    gViewConfigValid = false;
+    gViewConfigIpdMeters = 0.0f;
+    gViewConfigFov[0] = {};
+    gViewConfigFov[1] = {};
+}
 
 template <typename Interface>
 void release(Interface*& object) {
@@ -134,6 +204,54 @@ XrTime monotonicTime() {
     const int64_t remainder = counter.QuadPart % frequency.QuadPart;
     return static_cast<XrTime>(seconds) * 1'000'000'000 +
            static_cast<XrTime>((remainder * 1'000'000'000) / frequency.QuadPart);
+}
+
+// Returns the gravity-aligned horizontal origin at the head's current X/Z
+// and yaw. Keeping Y at zero preserves the Quest floor height in LOCAL.
+XrPosef leveledHeadOrigin(const XrPosef& head) {
+    const XrVector3f forward =
+        quaternionRotate(head.orientation, {0.0f, 0.0f, -1.0f});
+    const float horizontalLength = std::hypot(forward.x, forward.z);
+    float yaw = 0.0f;
+    if (std::isfinite(horizontalLength) && horizontalLength >= 0.001f) {
+        yaw = std::atan2(-forward.x, -forward.z);
+    }
+    const float halfYaw = yaw * 0.5f;
+    return {
+        {0.0f, std::sin(halfYaw), 0.0f, std::cos(halfYaw)},
+        {head.position.x, 0.0f, head.position.z},
+    };
+}
+
+void establishInitialLocalOriginLocked() {
+    gLocalFromQuest = poseInvert(leveledHeadOrigin(gRawHeadPose));
+    gPreviousLocalFromQuest = gLocalFromQuest;
+    gLocalSpaceChangeTime = 0;
+    gLocalOriginValid = true;
+}
+
+const XrPosef& localTransformForTimeLocked(XrTime locateTime) {
+    return locateTime > 0 && gLocalSpaceChangeTime > 0 &&
+                   locateTime < gLocalSpaceChangeTime
+        ? gPreviousLocalFromQuest
+        : gLocalFromQuest;
+}
+
+void recenterLocalOriginLocked(
+    XrTime changeTime, RecenterNotification* notification) {
+    if (!gLocalOriginValid || !gHeadPoseValid || notification == nullptr) {
+        return;
+    }
+    const XrPosef originInPreviousLocal =
+        leveledHeadOrigin(poseCompose(gLocalFromQuest, gRawHeadPose));
+    gPreviousLocalFromQuest = gLocalFromQuest;
+    gLocalSpaceChangeTime = changeTime;
+    gLocalFromQuest = poseCompose(
+        poseInvert(originInPreviousLocal), gLocalFromQuest);
+    notification->ready = true;
+    notification->session = gControlSession;
+    notification->changeTime = changeTime;
+    notification->poseInPreviousSpace = originInPreviousLocal;
 }
 
 // --- little-endian message building ----------------------------------------
@@ -249,7 +367,10 @@ bool recvExpectedMessage(
            type == expectedType;
 }
 
-bool parseHeadPose(const uint8_t* payload, size_t payloadLength) {
+bool parseHeadPose(
+    const uint8_t* payload,
+    size_t payloadLength,
+    RecenterNotification* recenter) {
     if (payloadLength != kHeadPosePayloadLength) {
         return false;
     }
@@ -272,29 +393,29 @@ bool parseHeadPose(const uint8_t* payload, size_t payloadLength) {
     }
 
     const float inverseNorm = static_cast<float>(1.0 / norm);
-    gHeadPose.orientation = {
+    gRawHeadPose.orientation = {
         values[0] * inverseNorm,
         values[1] * inverseNorm,
         values[2] * inverseNorm,
         values[3] * inverseNorm,
     };
-    if (!gHorizontalOriginValid) {
-        gHorizontalOriginX = values[4];
-        gHorizontalOriginZ = values[6];
-        gHorizontalOriginValid = true;
-    }
-    // LOCAL starts at the viewer horizontally, but retains Quest floor height
-    // and orientation. Subtracting a constant X/Z offset preserves all pose
-    // deltas used by ALVR reprojection while keeping the game out of the
-    // guardian's arbitrary absolute stage position.
-    gHeadPose.position = {
-        values[4] - gHorizontalOriginX,
-        values[5],
-        values[6] - gHorizontalOriginZ,
-    };
+    gRawHeadPose.position = {values[4], values[5], values[6]};
     gHeadPoseQuestTimestamp = timestamp;
-    gHeadPoseArrival = monotonicTime();
+    const XrTime now = monotonicTime();
+    gHeadPoseArrival = now;
     gHeadPoseValid = true;
+    if (!gLocalOriginValid) {
+        establishInitialLocalOriginLocked();
+    }
+    if (!gSystemButtonRecentered &&
+        gSystemButtonPressTime > 0 && now >= gSystemButtonPressTime &&
+        now - gSystemButtonPressTime >= kSystemButtonRecenterHold) {
+        const XrTime changeTime = gLatestPredictedDisplayTime >= now
+            ? gLatestPredictedDisplayTime + 1 : now;
+        recenterLocalOriginLocked(changeTime, recenter);
+        gSystemButtonRecentered = true;
+        std::fprintf(stderr, "Basalt OpenXR: recentered LOCAL from the right system button\n");
+    }
     return true;
 }
 
@@ -332,21 +453,17 @@ bool parseControllerMotion(const uint8_t* payload, size_t payloadLength) {
         (timestamp == record.presenceTimestamp && !record.presenceActive)) {
         return true;
     }
-    if (!gHorizontalOriginValid) {
+    if (!gLocalOriginValid) {
         return true;
     }
     const float inverseNorm = static_cast<float>(1.0 / norm);
-    record.pose.orientation = {
+    record.rawPose.orientation = {
         values[0] * inverseNorm, values[1] * inverseNorm,
         values[2] * inverseNorm, values[3] * inverseNorm,
     };
-    record.pose.position = {
-        values[4] - gHorizontalOriginX,
-        values[5],
-        values[6] - gHorizontalOriginZ,
-    };
-    record.linearVelocity = {values[7], values[8], values[9]};
-    record.angularVelocity = {values[10], values[11], values[12]};
+    record.rawPose.position = {values[4], values[5], values[6]};
+    record.rawLinearVelocity = {values[7], values[8], values[9]};
+    record.rawAngularVelocity = {values[10], values[11], values[12]};
     record.questTimestamp = timestamp;
     record.poseArrival = monotonicTime();
     record.poseValid = true;
@@ -375,6 +492,16 @@ bool parseButtonState(const uint8_t* payload, size_t payloadLength) {
         }
         if (!record.valid && available == nullptr) {
             available = &record;
+        }
+    }
+    if (pathId == basalt::kAlvrRightSystemClickPathId) {
+        if (!basalt::controlButtonPressed(valueType, value)) {
+            resetSystemButtonLocked();
+        } else if (gSystemButtonPressTime == 0) {
+            // Quest normally reserves the Meta button, so confirm on hardware
+            // that ALVR forwards it before relying on the recenter gesture.
+            std::fprintf(stderr, "Basalt OpenXR: right system button pressed\n");
+            gSystemButtonPressTime = monotonicTime();
         }
     }
     if (available == nullptr) {
@@ -414,12 +541,7 @@ bool parseInputReset(size_t payloadLength) {
     if (payloadLength != 0) {
         return false;
     }
-    for (ControllerInputRecord& record : gControllerInputs) {
-        record = {};
-    }
-    for (ButtonInputRecord& record : gButtonInputs) {
-        record = {};
-    }
+    resetInputsLocked();
     return true;
 }
 
@@ -491,8 +613,8 @@ bool parseControllerMask(const uint8_t* payload, size_t payloadLength) {
         record.poseValid = false;
         record.poseArrival = 0;
         record.questTimestamp = timestamp;
-        record.linearVelocity = {};
-        record.angularVelocity = {};
+        record.rawLinearVelocity = {};
+        record.rawAngularVelocity = {};
     }
     return true;
 }
@@ -506,6 +628,7 @@ void markReceiverFailedLocked() {
         SetEvent(gWaiterWake);
     }
     WakeAllConditionVariable(&gAckCondition);
+    WakeAllConditionVariable(&gFrameDeliveryCondition);
 }
 
 DWORD WINAPI receiverThreadProc(LPVOID) {
@@ -517,6 +640,7 @@ DWORD WINAPI receiverThreadProc(LPVOID) {
         uint16_t type = 0;
         uint8_t payload[BASALT_CONTROL_MAX_MESSAGE_LENGTH]{};
         size_t payloadLength = 0;
+        RecenterNotification recenter{};
         if (!recvMessage(socket, &type, payload, sizeof(payload), &payloadLength)) {
             AcquireSRWLockExclusive(&gControlLock);
             if (gSocket == socket && !gReceiverFailed) {
@@ -533,7 +657,7 @@ DWORD WINAPI receiverThreadProc(LPVOID) {
             return 0;
         }
         if (type == BASALT_MSG_HEAD_POSE) {
-            accepted = parseHeadPose(payload, payloadLength);
+            accepted = parseHeadPose(payload, payloadLength, &recenter);
         } else if (type == BASALT_MSG_CONTROLLER_MOTION) {
             accepted = parseControllerMotion(payload, payloadLength);
         } else if (type == BASALT_MSG_BUTTON_STATE) {
@@ -546,6 +670,15 @@ DWORD WINAPI receiverThreadProc(LPVOID) {
             accepted = parseViewConfig(payload, payloadLength);
         } else if (type == BASALT_MSG_CONTROLLER_MASK) {
             accepted = parseControllerMask(payload, payloadLength);
+        } else if (type == BASALT_MSG_FRAME_CONSUMED && payloadLength == 8) {
+            uint64_t frameNumber = 0;
+            std::memcpy(&frameNumber, payload, sizeof(frameNumber));
+            if (frameNumber > gLastConsumedFrameNumber &&
+                frameNumber < gNextFrameNumber) {
+                gLastConsumedFrameNumber = frameNumber;
+                WakeAllConditionVariable(&gFrameDeliveryCondition);
+                accepted = true;
+            }
         } else if (type == gExpectedAckType && !gAckReady && !gAckFailed &&
                    payloadLength <= sizeof(gAckPayload)) {
             std::memcpy(gAckPayload, payload, payloadLength);
@@ -561,6 +694,11 @@ DWORD WINAPI receiverThreadProc(LPVOID) {
             return 0;
         }
         ReleaseSRWLockExclusive(&gControlLock);
+        if (recenter.ready) {
+            basalt::queueReferenceSpaceChange(
+                recenter.session, recenter.changeTime,
+                recenter.poseInPreviousSpace);
+        }
     }
 }
 
@@ -653,23 +791,7 @@ DisconnectState beginDisconnectLocked() {
     gAckReady = false;
     gAckFailed = true;
     gAckPayloadLength = 0;
-    gHeadPoseValid = false;
-    gHeadPoseQuestTimestamp = 0;
-    gHeadPoseArrival = 0;
-    gHeadPose = {};
-    gHorizontalOriginValid = false;
-    gHorizontalOriginX = 0.0f;
-    gHorizontalOriginZ = 0.0f;
-    for (ControllerInputRecord& record : gControllerInputs) {
-        record = {};
-    }
-    for (ButtonInputRecord& record : gButtonInputs) {
-        record = {};
-    }
-    gViewConfigValid = false;
-    gViewConfigIpdMeters = 0.0f;
-    gViewConfigFov[0] = {};
-    gViewConfigFov[1] = {};
+    resetTrackingStateLocked();
     gPendingHead = 0;
     gPendingCount = 0;
     WakeAllConditionVariable(&gAckCondition);
@@ -718,6 +840,8 @@ void finishDisconnect(DisconnectState& state, bool sendTeardown) {
 
 // The waiter thread: pops queued frames in order, waits the fence value on
 // the CPU, and only then sends FrameReady — the Phase-1 frame-done contract.
+// The receiver advances gLastConsumedFrameNumber only after the daemon has
+// completed Metal reads of the submitted swapchain surfaces.
 DWORD WINAPI waiterThreadProc(LPVOID) {
     for (;;) {
         AcquireSRWLockExclusive(&gControlLock);
@@ -774,10 +898,6 @@ DWORD WINAPI waiterThreadProc(LPVOID) {
         if (!gWaiterStop && gSocket != INVALID_SOCKET) {
             sent = sendMessage(
                 gSocket, BASALT_MSG_FRAME_READY, frame.payload, frame.payloadLength);
-            if (sent) {
-                gLastSentFrameNumber = frame.frameNumber;
-                WakeAllConditionVariable(&gFrameDeliveryCondition);
-            }
         } else {
             sent = true;  // shutting down; nothing to report
         }
@@ -802,8 +922,13 @@ DWORD WINAPI waiterThreadProc(LPVOID) {
     }
 }
 
-// Reads "<port> <token>" from the BASALT_CONTROL file.
-bool readControlFile(uint16_t* port, char token[BASALT_CONTROL_TOKEN_LENGTH + 1]) {
+// Reads "<port> <token> [<per-eye width> <per-eye height>]" from the
+// BASALT_CONTROL file.
+bool readControlFile(
+    uint16_t* port,
+    char token[BASALT_CONTROL_TOKEN_LENGTH + 1],
+    uint32_t* viewWidth,
+    uint32_t* viewHeight) {
     char path[MAX_PATH]{};
     const DWORD pathLength =
         GetEnvironmentVariableA("BASALT_CONTROL", path, sizeof(path));
@@ -828,13 +953,25 @@ bool readControlFile(uint16_t* port, char token[BASALT_CONTROL_TOKEN_LENGTH + 1]
 
     char tokenBuffer[64]{};
     unsigned int parsedPort = 0;
-    if (std::sscanf(contents, "%u %63s", &parsedPort, tokenBuffer) != 2 ||
+    unsigned int parsedWidth = 0;
+    unsigned int parsedHeight = 0;
+    char extra = '\0';
+    const int parsed = std::sscanf(
+        contents, "%u %63s %u %u %c", &parsedPort, tokenBuffer,
+        &parsedWidth, &parsedHeight, &extra);
+    if ((parsed != 2 && parsed != 4) ||
         parsedPort == 0 || parsedPort > 65535 ||
         std::strlen(tokenBuffer) != BASALT_CONTROL_TOKEN_LENGTH) {
         return false;
     }
     *port = static_cast<uint16_t>(parsedPort);
     std::memcpy(token, tokenBuffer, BASALT_CONTROL_TOKEN_LENGTH + 1);
+    if (viewWidth != nullptr) {
+        *viewWidth = parsed == 4 ? parsedWidth : 0;
+    }
+    if (viewHeight != nullptr) {
+        *viewHeight = parsed == 4 ? parsedHeight : 0;
+    }
     return true;
 }
 
@@ -928,6 +1065,28 @@ void adapterDescription(ID3D11Device* device, char* buffer, size_t capacity) {
 
 namespace basalt {
 
+bool controlConfiguredViewSize(uint32_t* width, uint32_t* height) {
+    if (width == nullptr || height == nullptr) {
+        return false;
+    }
+    uint16_t port = 0;
+    char token[BASALT_CONTROL_TOKEN_LENGTH + 1]{};
+    uint32_t configuredWidth = 0;
+    uint32_t configuredHeight = 0;
+    if (!readControlFile(
+            &port, token, &configuredWidth, &configuredHeight) ||
+        configuredWidth < BASALT_CONTROL_MIN_VIEW_DIMENSION ||
+        configuredHeight < BASALT_CONTROL_MIN_VIEW_DIMENSION ||
+        configuredWidth > kMaxViewWidth ||
+        configuredHeight > kMaxViewHeight ||
+        configuredWidth % 2 != 0 || configuredHeight % 2 != 0) {
+        return false;
+    }
+    *width = configuredWidth;
+    *height = configuredHeight;
+    return true;
+}
+
 uint32_t queryTextureIOSurfaceId(ID3D11Texture2D* texture) {
     uint32_t id = 0;
     UINT size = sizeof(id);
@@ -945,7 +1104,7 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
 
     uint16_t port = 0;
     char token[BASALT_CONTROL_TOKEN_LENGTH + 1]{};
-    if (!readControlFile(&port, token)) {
+    if (!readControlFile(&port, token, nullptr, nullptr)) {
         return;
     }
 
@@ -1032,30 +1191,14 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
         gExpectedAckType = 0;
         gAckReady = false;
         gAckFailed = false;
-        gHeadPoseValid = false;
-        gHeadPoseQuestTimestamp = 0;
-        gHeadPoseArrival = 0;
-        gHeadPose = {};
-        gHorizontalOriginValid = false;
-        gHorizontalOriginX = 0.0f;
-        gHorizontalOriginZ = 0.0f;
-        for (ControllerInputRecord& record : gControllerInputs) {
-            record = {};
-        }
-        for (ButtonInputRecord& record : gButtonInputs) {
-            record = {};
-        }
-        gViewConfigValid = false;
-        gViewConfigIpdMeters = 0.0f;
-        gViewConfigFov[0] = {};
-        gViewConfigFov[1] = {};
+        resetTrackingStateLocked();
         gControlSession = session;
         gContext4 = context4;
         gFence = fence;
         context4 = nullptr;
         fence = nullptr;
         gNextFrameNumber = 1;
-        gLastSentFrameNumber = 0;
+        gLastConsumedFrameNumber = 0;
         gPendingHead = 0;
         gPendingCount = 0;
         gReceiverThread = CreateThread(
@@ -1100,8 +1243,47 @@ bool controlActive(XrSession session) {
     return active;
 }
 
+void controlNotePredictedDisplayTime(XrSession session, XrTime predictedDisplayTime) {
+    AcquireSRWLockExclusive(&gControlLock);
+    if (session != XR_NULL_HANDLE && gControlSession == session &&
+        predictedDisplayTime > gLatestPredictedDisplayTime) {
+        gLatestPredictedDisplayTime = predictedDisplayTime;
+    }
+    ReleaseSRWLockExclusive(&gControlLock);
+}
+
+bool controlWaitForFrameBudget(XrSession session) {
+    AcquireSRWLockExclusive(&gControlLock);
+    const uint64_t lastQueuedFrame =
+        gNextFrameNumber == 0 ? 0 : gNextFrameNumber - 1;
+    bool timedOut = false;
+    while (gControlSession == session && gSocket != INVALID_SOCKET &&
+           !gReceiverFailed &&
+           gLastConsumedFrameNumber + kFrameWindow <= lastQueuedFrame) {
+        if (!SleepConditionVariableSRW(
+                &gFrameDeliveryCondition, &gControlLock,
+                kFrameConsumeMilliseconds, 0)) {
+            timedOut = true;
+            break;
+        }
+    }
+    const bool active = gControlSession == session &&
+                        gSocket != INVALID_SOCKET && !gReceiverFailed &&
+                        !timedOut;
+    DisconnectState state;
+    if (timedOut && gControlSession == session) {
+        state = beginDisconnectLocked();
+    }
+    ReleaseSRWLockExclusive(&gControlLock);
+    if (state.socket != INVALID_SOCKET) {
+        finishDisconnect(state, false);
+    }
+    return active;
+}
+
 bool controlHeadPose(
     XrSession session,
+    XrTime locateTime,
     uint64_t* questTimestampNanoseconds,
     XrPosef* poseInLocal) {
     const XrTime now = monotonicTime();
@@ -1116,14 +1298,18 @@ bool controlHeadPose(
             *questTimestampNanoseconds = gHeadPoseQuestTimestamp;
         }
         if (poseInLocal != nullptr) {
-            *poseInLocal = gHeadPose;
+            *poseInLocal = poseCompose(
+                localTransformForTimeLocked(locateTime), gRawHeadPose);
         }
     }
     ReleaseSRWLockShared(&gControlLock);
     return fresh;
 }
 
-bool controlInputSnapshot(XrSession session, ControlInputSnapshot* snapshot) {
+bool controlInputSnapshot(
+    XrSession session,
+    ControlInputSnapshot* snapshot,
+    XrTime locateTime) {
     if (snapshot == nullptr) {
         return false;
     }
@@ -1133,6 +1319,7 @@ bool controlInputSnapshot(XrSession session, ControlInputSnapshot* snapshot) {
     const bool connected = session != XR_NULL_HANDLE && gControlSession == session &&
                            gSocket != INVALID_SOCKET && !gReceiverFailed;
     if (connected) {
+        const XrPosef& localFromQuest = localTransformForTimeLocked(locateTime);
         for (uint32_t hand = 0; hand < 2; ++hand) {
             const ControllerInputRecord& source = gControllerInputs[hand];
             ControlControllerState& destination = snapshot->controllers[hand];
@@ -1142,9 +1329,11 @@ bool controlInputSnapshot(XrSession session, ControlInputSnapshot* snapshot) {
                                      now >= source.poseArrival &&
                                      now - source.poseArrival <= kControllerPoseFreshness;
             destination.questTimestampNanoseconds = source.questTimestamp;
-            destination.poseInLocal = source.pose;
-            destination.linearVelocity = source.linearVelocity;
-            destination.angularVelocity = source.angularVelocity;
+            destination.poseInLocal = poseCompose(localFromQuest, source.rawPose);
+            destination.linearVelocity = quaternionRotate(
+                localFromQuest.orientation, source.rawLinearVelocity);
+            destination.angularVelocity = quaternionRotate(
+                localFromQuest.orientation, source.rawAngularVelocity);
         }
         for (const ButtonInputRecord& source : gButtonInputs) {
             if (!source.valid || snapshot->buttonCount >= kControlButtonCapacity) {
@@ -1266,16 +1455,16 @@ void controlUnregisterSwapchain(XrSwapchain swapchain) {
     bool headless = gSocket == INVALID_SOCKET;
     bool drained = headless;
     while (!headless && !gReceiverFailed &&
-           gLastSentFrameNumber < lastQueuedFrame) {
+           gLastConsumedFrameNumber < lastQueuedFrame) {
         if (!SleepConditionVariableSRW(
                 &gFrameDeliveryCondition, &gControlLock,
-                kFenceWaitMilliseconds, 0)) {
+                kFrameConsumeMilliseconds, 0)) {
             break;
         }
         headless = gSocket == INVALID_SOCKET;
     }
     drained = headless || (!gReceiverFailed &&
-        gLastSentFrameNumber >= lastQueuedFrame);
+        gLastConsumedFrameNumber >= lastQueuedFrame);
     ReleaseSRWLockExclusive(&gControlLock);
     if (headless) {
         return;
@@ -1343,9 +1532,13 @@ void controlFrameReady(
     const uint64_t frameNumber = gNextFrameNumber++;
     PendingFrame* slot = nullptr;
     if (gPendingCount == kPendingFrameCapacity) {
-        // Drop the oldest: a later fence value implies its completion anyway.
-        gPendingHead = (gPendingHead + 1) % kPendingFrameCapacity;
-        --gPendingCount;
+        // xrWaitFrame's budget bounds unconsumed frames to the ring capacity,
+        // so reaching this guard means that contract broke; disconnect rather
+        // than drop ordered frame metadata.
+        DisconnectState state = beginDisconnectLocked();
+        ReleaseSRWLockExclusive(&gControlLock);
+        finishDisconnect(state, false);
+        return;
     }
     slot = &gPendingFrames[(gPendingHead + gPendingCount) % kPendingFrameCapacity];
     ++gPendingCount;

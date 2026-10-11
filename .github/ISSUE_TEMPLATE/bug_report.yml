@@ -52,5 +52,8 @@ body:
     id: actual
     attributes:
       label: Actual behavior and sanitized logs
+      description: >-
+        In the management app, Help › Diagnostic Report… builds a redacted report you can review
+        and paste here.
     validations:
       required: true

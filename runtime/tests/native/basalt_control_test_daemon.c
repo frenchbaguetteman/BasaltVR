@@ -1,13 +1,15 @@
 /*
  * Native test daemon for the BasaltVR control socket (docs/DXMT-INTEROP.md
  * §4). Plays the streamer daemon's role against the PE runtime under Wine:
- * listens on 127.0.0.1, writes "<port> <token>" to the control file, then
+ * listens on 127.0.0.1, writes "<port> <token> [<width> <height>]" to the
+ * control file, then
  * validates the Hello handshake, swapchain registration (every IOSurfaceID
  * must resolve via IOSurfaceLookup with matching dimensions), FrameReady
  * consistency, and teardown. Exits 0 only if at least --expect-frames
  * FrameReady messages referencing registered swapchains arrived.
  *
  * Usage: basalt_control_test_daemon --control-file <path> [--expect-frames N]
+ *        [--frame-delay-ms N] [--view-width N --view-height N]
  */
 
 #include <IOSurface/IOSurfaceRef.h>
@@ -62,6 +64,10 @@ static uint64_t g_last_frame_number = 0;
 static bool g_verify_clears = false;
 static uint64_t g_haptics_received = 0;
 static bool g_refresh_tracking = false;
+static bool g_head_turned = false;
+static unsigned int g_frame_delay_ms = 0;
+static unsigned int g_view_width = 0;
+static unsigned int g_view_height = 0;
 
 static uint16_t read_u16(const uint8_t* p) { uint16_t v; memcpy(&v, p, 2); return v; }
 static uint32_t read_u32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
@@ -113,14 +119,20 @@ static bool send_message(int fd, uint16_t type, const uint8_t* payload, size_t l
 
 static bool send_head_pose(int fd, uint64_t timestamp) {
     uint8_t payload[8 + 7 * sizeof(float)];
-    /* A 90-degree yaw plus nonzero position proves the runtime recenters only
-     * horizontal X/Z while preserving Quest floor height and orientation. */
-    const float pose[7] = {
+    /* Start at 90-degree yaw, then turn another 90 degrees before the reset
+     * gesture. Both poses have nonzero guardian-stage positions so the smoke
+     * can verify yaw and horizontal position recenter together. */
+    const float initial_pose[7] = {
         0.0f, 0.707106781f, 0.0f, 0.707106781f,
         0.25f, 1.5f, -0.5f,
     };
+    const float turned_pose[7] = {
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.5f, 1.5f, -0.25f,
+    };
+    const float* pose = g_head_turned ? turned_pose : initial_pose;
     memcpy(payload, &timestamp, sizeof(timestamp));
-    memcpy(payload + sizeof(timestamp), pose, sizeof(pose));
+    memcpy(payload + sizeof(timestamp), pose, 7 * sizeof(float));
     return send_message(fd, BASALT_MSG_HEAD_POSE, payload, sizeof(payload));
 }
 
@@ -163,14 +175,23 @@ static bool send_view_config(int fd) {
         (const uint8_t*)values, sizeof(values));
 }
 
-static bool send_left_squeeze(int fd, float value) {
+static bool send_button_state(
+    int fd, uint64_t path_id, uint32_t value_type, float value) {
     uint8_t payload[16];
-    const uint64_t path_id = UINT64_C(0x01f1b9c689804b82);
-    const uint32_t value_type = 1;
     memcpy(payload, &path_id, 8);
     memcpy(payload + 8, &value_type, 4);
     memcpy(payload + 12, &value, 4);
     return send_message(fd, BASALT_MSG_BUTTON_STATE, payload, sizeof(payload));
+}
+
+// ALVR path hashes bound in runtime/pe/input.cpp. Value type 1 is analog,
+// 0 is a digital 0/1 button.
+static bool send_left_squeeze(int fd, float value) {
+    return send_button_state(fd, UINT64_C(0x01f1b9c689804b82), 1, value);
+}
+
+static bool send_right_system_click(int fd, float value) {
+    return send_button_state(fd, UINT64_C(0x19729bd97073d474), 0, value);
 }
 
 static bool handle_haptic(int fd, const uint8_t* payload, size_t length) {
@@ -200,6 +221,24 @@ static bool handle_haptic(int fd, const uint8_t* payload, size_t length) {
     if (duration != 0 && __builtin_fabsf(amplitude - 0.25f) < 0.0001f) {
         return send_controller_motion(fd, 4, 0) &&
                send_controller_mask(fd, 4, 1);
+    }
+    // Hold the right system click while publishing a turned head pose. This
+    // deterministically exercises the runtime's Quest reset-view gesture and
+    // reference-space-change event without introducing a test-only protocol.
+    // Hold for 1 s: the runtime measures its 600 ms threshold between receipt
+    // times, so a loaded machine can delay the press well past a few frames.
+    if (duration != 0 && __builtin_fabsf(amplitude - 0.375f) < 0.0001f) {
+        g_head_turned = true;
+        if (!send_head_pose(fd, 2) || !send_right_system_click(fd, 1.0f)) {
+            return false;
+        }
+        for (int sample = 0; sample < 20; ++sample) {
+            usleep(50000);
+            if (!send_head_pose(fd, 2)) {
+                return false;
+            }
+        }
+        return send_right_system_click(fd, 0.0f);
     }
     // Interleave a sparse button delta with reverse haptic traffic. The next
     // xrSyncActions must observe this as a change, without disturbing other
@@ -325,7 +364,7 @@ static bool handle_destroy_swapchain(int fd, const uint8_t* payload, size_t leng
     return send_message(fd, BASALT_MSG_DESTROY_SWAPCHAIN_ACK, payload, 8);
 }
 
-static bool handle_frame_ready(const uint8_t* payload, size_t length) {
+static bool handle_frame_ready(int fd, const uint8_t* payload, size_t length) {
     if (length < 28) {
         fprintf(stderr, "FAIL: FrameReady payload too short (%zu)\n", length);
         return false;
@@ -371,15 +410,15 @@ static bool handle_frame_ready(const uint8_t* payload, size_t length) {
             fprintf(stderr, "FAIL: FrameReady image index %u out of range\n", image_index);
             return false;
         }
-        const float expected_x = 0.0f;
-        const float expected_z = i == 0 ? 0.032f : -0.032f;
+        const float expected_x = i == 0 ? -0.032f : 0.032f;
+        const float expected_z = 0.0f;
         const float orientation_y = read_f32(view + 36);
         const float orientation_w = read_f32(view + 44);
         const float position_x = read_f32(view + 48);
         const float position_y = read_f32(view + 52);
         const float position_z = read_f32(view + 56);
-        if (__builtin_fabsf(orientation_y - 0.707106781f) > 0.0001f ||
-            __builtin_fabsf(orientation_w - 0.707106781f) > 0.0001f ||
+        if (__builtin_fabsf(orientation_y) > 0.0001f ||
+            __builtin_fabsf(orientation_w - 1.0f) > 0.0001f ||
             __builtin_fabsf(position_x - expected_x) > 0.0001f ||
             __builtin_fabsf(position_y - 1.5f) > 0.0001f ||
             __builtin_fabsf(position_z - expected_z) > 0.0001f) {
@@ -414,7 +453,19 @@ static bool handle_frame_ready(const uint8_t* payload, size_t length) {
         printf("daemon: frame %" PRIu64 " ready (display time %" PRId64 ", %u views)\n",
                frame_number, display_time, view_count);
     }
-    return true;
+    // A continuously readable frame socket can prevent the select timeout in
+    // the main loop from firing. Refresh tracking here as well so an
+    // intentionally slow consumer does not make the test pose expire while
+    // it is exercising frame backpressure.
+    if (g_refresh_tracking && !send_head_pose(fd, 2)) {
+        return false;
+    }
+    if (g_frame_delay_ms > 0) {
+        usleep((useconds_t)g_frame_delay_ms * 1000);
+    }
+    uint8_t consumed[8];
+    memcpy(consumed, &frame_number, sizeof(frame_number));
+    return send_message(fd, BASALT_MSG_FRAME_CONSUMED, consumed, sizeof(consumed));
 }
 
 int main(int argc, char** argv) {
@@ -427,13 +478,21 @@ int main(int argc, char** argv) {
             expect_frames = strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--verify-clears") == 0) {
             g_verify_clears = true;
+        } else if (strcmp(argv[i], "--frame-delay-ms") == 0 && i + 1 < argc) {
+            g_frame_delay_ms = (unsigned int)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--view-width") == 0 && i + 1 < argc) {
+            g_view_width = (unsigned int)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--view-height") == 0 && i + 1 < argc) {
+            g_view_height = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else {
-            fprintf(stderr, "usage: %s --control-file <path> [--expect-frames N]\n", argv[0]);
-            return 2;
+            control_file = NULL;  // Reported as a usage error below.
+            break;
         }
     }
-    if (control_file == NULL) {
-        fprintf(stderr, "usage: %s --control-file <path> [--expect-frames N]\n", argv[0]);
+    if (control_file == NULL || (g_view_width == 0) != (g_view_height == 0)) {
+        fprintf(stderr, "usage: %s --control-file <path> [--expect-frames N] "
+                        "[--frame-delay-ms N] [--view-width N --view-height N]\n",
+                argv[0]);
         return 2;
     }
 
@@ -469,7 +528,11 @@ int main(int argc, char** argv) {
         perror("control file");
         return 1;
     }
-    fprintf(file, "%u %s\n", port, token);
+    if (g_view_width > 0) {
+        fprintf(file, "%u %s %u %u\n", port, token, g_view_width, g_view_height);
+    } else {
+        fprintf(file, "%u %s\n", port, token);
+    }
     fclose(file);
     printf("daemon: listening on 127.0.0.1:%u\n", port);
     fflush(stdout);
@@ -587,7 +650,7 @@ int main(int argc, char** argv) {
             ok = handle_destroy_swapchain(fd, payload, payload_length);
             break;
         case BASALT_MSG_FRAME_READY:
-            ok = handle_frame_ready(payload, payload_length);
+            ok = handle_frame_ready(fd, payload, payload_length);
             break;
         case BASALT_MSG_HAPTIC:
             ok = handle_haptic(fd, payload, payload_length);
@@ -626,9 +689,9 @@ int main(int argc, char** argv) {
                 g_frames_received, expect_frames);
         return 1;
     }
-    if (g_haptics_received != 4) {
+    if (g_haptics_received != 5) {
         fprintf(stderr,
-                "FAIL: received %" PRIu64 " haptic commands, expected exactly 4\n",
+                "FAIL: received %" PRIu64 " haptic commands, expected exactly 5\n",
                 g_haptics_received);
         return 1;
     }

@@ -30,13 +30,23 @@ swift package --package-path streamer dump-package >/dev/null
 "$script_dir/check-markdown-links.zsh"
 git diff --check
 
+# The native control daemon and readback tool otherwise compile only inside
+# the Metal-dependent DXMT suite, so a protocol-header change could break them
+# unnoticed. Same flags as runtime/scripts/test-dxmt.zsh.
+native_tools=$(mktemp -d)
+trap 'rm -rf "$native_tools"' EXIT
+for source in runtime/tests/native/*.c; do
+    cc -O2 -Wall -Wextra -framework IOSurface -framework CoreFoundation \
+        -o "$native_tools/${source:t:r}" "$source"
+done
+
 ignored_tracked=$(git ls-files -ci --exclude-standard)
 if [[ -n "$ignored_tracked" ]]; then
     print -u2 "Ignored development artifacts are tracked:"
     print -rC1 -- "${(@f)ignored_tracked}" >&2
     exit 1
 fi
-print "PASS: scripts, metadata, package manifest, and tracked-file hygiene"
+print "PASS: scripts, metadata, package manifest, native test tools, and tracked-file hygiene"
 
 run_step "Swift tests" swift test --package-path streamer
 run_step "Apple Silicon release build" \

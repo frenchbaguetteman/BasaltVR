@@ -21,14 +21,14 @@ final class OptionsTests: XCTestCase {
     func testAllFlags() throws {
         let options = try XCTUnwrap(StreamerOptions.parse(
             ["--port", "8000", "--fps", "72", "--mbps", "40",
-             "--resolution", "quality", "--latency", "low",
+             "--resolution", "quality", "--latency", "ultra",
              "--bind", "0.0.0.0", "--discover",
              "--audio-device", "BlackHole 2ch", "--route-audio"]))
         XCTAssertEqual(options.port, 8000)
         XCTAssertEqual(options.fps, 72)
         XCTAssertEqual(options.megabits, 40)
         XCTAssertEqual(options.perEyeResolution, .quality)
-        XCTAssertEqual(options.latencyPreset, .low)
+        XCTAssertEqual(options.latencyPreset, .ultra)
         XCTAssertEqual(options.bindHost, "0.0.0.0")
         XCTAssertFalse(options.bindIsLoopback)
         XCTAssertTrue(options.discover)

@@ -2,6 +2,82 @@ import XCTest
 @testable import BasaltCore
 
 final class RuntimeLinkTests: XCTestCase {
+    func testControlFileCarriesOptionalRecommendedViewSize() {
+        let token = String(repeating: "a", count: 32)
+        XCTAssertEqual(
+            RuntimeLink.controlFileLine(
+                port: 4321, token: token, recommendedViewSize: .balanced),
+            "4321 \(token) 1152 1216\n")
+        XCTAssertEqual(
+            RuntimeLink.controlFileLine(
+                port: 4321, token: token, recommendedViewSize: nil),
+            "4321 \(token)\n")
+    }
+
+    func testRejectsViewSizesTheRuntimeWouldIgnore() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("basalt-\(UUID().uuidString).control").path
+        XCTAssertNoThrow(try RuntimeLink(
+            controlFilePath: path,
+            recommendedViewSize: try PerEyeResolution(
+                width: RuntimeLink.maximumViewWidth, height: RuntimeLink.maximumViewHeight)))
+        XCTAssertThrowsError(try RuntimeLink(
+            controlFilePath: path,
+            recommendedViewSize: try PerEyeResolution(width: 1_920, height: 1_920)))
+    }
+
+    /// RuntimeLink mirrors basalt_control_protocol.h by hand. A drifted
+    /// version or message id connects headlessly (black headset), so pin the
+    /// mirror to the header the PE runtime is built from.
+    func testWireConstantsMatchRuntimeProtocolHeader() throws {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let header = try String(
+            contentsOf: repository.appendingPathComponent(
+                "runtime/pe/basalt_control_protocol.h"),
+            encoding: .utf8)
+
+        func values(_ pattern: String) throws -> [String: Int] {
+            let regex = try NSRegularExpression(pattern: pattern)
+            let range = NSRange(header.startIndex..., in: header)
+            var result: [String: Int] = [:]
+            for match in regex.matches(in: header, range: range) {
+                guard let name = Range(match.range(at: 1), in: header),
+                      let value = Range(match.range(at: 2), in: header) else { continue }
+                result[String(header[name])] = Int(header[value])
+            }
+            return result
+        }
+
+        let defines = try values(#"#define BASALT_CONTROL_([A-Z_]+) ([0-9]+)u"#)
+        XCTAssertEqual(defines["PROTOCOL_VERSION"], Int(RuntimeLink.protocolVersion))
+        XCTAssertEqual(defines["TOKEN_LENGTH"], RuntimeLink.tokenLength)
+        XCTAssertEqual(defines["MAX_MESSAGE_LENGTH"], RuntimeLink.maxMessageLength)
+        XCTAssertEqual(defines["MIN_VIEW_DIMENSION"], PerEyeResolution.dimensionRange.lowerBound)
+        XCTAssertEqual(defines["MAX_VIEW_WIDTH"], RuntimeLink.maximumViewWidth)
+        XCTAssertEqual(defines["MAX_VIEW_HEIGHT"], RuntimeLink.maximumViewHeight)
+
+        // BASALT_MSG_HELLO_ACK = 2 must mirror `case helloAck = 2`.
+        let headerMessages = try values(#"BASALT_MSG_([A-Z_]+) = ([0-9]+),"#)
+        let swiftMessages = Dictionary(uniqueKeysWithValues:
+            RuntimeLink.MessageType.allCases.map {
+                (String(describing: $0), Int($0.rawValue))
+            })
+        let camelCasedHeader = Dictionary(uniqueKeysWithValues:
+            headerMessages.map { name, value in
+                let words = name.lowercased().split(separator: "_")
+                let camel = words.enumerated().map { index, word in
+                    index == 0 ? String(word) : word.capitalized
+                }.joined()
+                return (camel, value)
+            })
+        XCTAssertFalse(camelCasedHeader.isEmpty)
+        XCTAssertEqual(swiftMessages, camelCasedHeader)
+    }
+
     func testOnlyCoreVideoCompatibleBGRAIsStreamable() {
         let bgraFourCC: UInt32 = 0x4247_5241
         let rgbaFourCC: UInt32 = 0x5247_4241
@@ -38,6 +114,24 @@ final class RuntimeLinkTests: XCTestCase {
         var payload = Data(repeating: 0, count: 28 + 76)
         payload.replaceSubrange(24..<28, with: [2, 0, 0, 0])
         XCTAssertNil(RuntimeLink.frameReadyHeader(from: payload))
+    }
+
+    func testAsynchronousFrameCompletionsAreAcknowledgedInOrder() {
+        var completed: Set<UInt64> = [2]
+        var lastAcknowledged: UInt64 = 0
+        XCTAssertEqual(RuntimeLink.orderedAcknowledgements(
+            completed: &completed, lastAcknowledged: &lastAcknowledged), [])
+
+        completed.insert(1)
+        XCTAssertEqual(RuntimeLink.orderedAcknowledgements(
+            completed: &completed, lastAcknowledged: &lastAcknowledged), [1, 2])
+        XCTAssertEqual(lastAcknowledged, 2)
+        XCTAssertTrue(completed.isEmpty)
+
+        completed.formUnion([4, 3])
+        XCTAssertEqual(RuntimeLink.orderedAcknowledgements(
+            completed: &completed, lastAcknowledged: &lastAcknowledged), [3, 4])
+        XCTAssertEqual(lastAcknowledged, 4)
     }
 
     func testHeadPosePayloadPreservesTimestampAndNormalizesQuaternion() throws {
@@ -172,9 +266,59 @@ final class RuntimeLinkTests: XCTestCase {
         XCTAssertEqual(payloads.count, RuntimeLink.maximumRetainedButtonPaths)
         XCTAssertEqual(payloads[1], Data([99]))
     }
+
+    func testHelloRejectionExplainsStaleRuntimeBuilds() throws {
+        let token = String(repeating: "b", count: RuntimeLink.tokenLength)
+        func hello(version: UInt16, token: String, renderer: String = "Apple M3 Max") -> Data {
+            var payload = Data()
+            payload.appendTestU16(version)
+            payload.append(Data(token.utf8))
+            payload.appendTestU64(131_072)
+            payload.appendTestU16(UInt16(renderer.utf8.count))
+            payload.append(Data(renderer.utf8))
+            return payload
+        }
+
+        XCTAssertEqual(RuntimeLink.helloVerdict(
+            hello(version: RuntimeLink.protocolVersion, token: token), token: token),
+            .accept(sessionId: 131_072, renderer: "Apple M3 Max"))
+
+        // An older bottle DLL is the black-headset case: name both versions.
+        guard case .refuse(let stale) = RuntimeLink.helloVerdict(
+            hello(version: RuntimeLink.protocolVersion - 2, token: token), token: token) else {
+            return XCTFail("a stale authenticated runtime must be reported")
+        }
+        XCTAssertTrue(stale.contains("v\(RuntimeLink.protocolVersion - 2)"))
+        XCTAssertTrue(stale.contains("v\(RuntimeLink.protocolVersion)"))
+        XCTAssertTrue(stale.contains("make runtime-build"))
+
+        // Without the token, nothing is reported: an arbitrary local process
+        // must not be able to raise the stale-runtime alert.
+        let wrongToken = String(repeating: "c", count: RuntimeLink.tokenLength)
+        XCTAssertEqual(
+            RuntimeLink.helloVerdict(
+                hello(version: RuntimeLink.protocolVersion, token: wrongToken), token: token),
+            .ignore)
+        XCTAssertEqual(
+            RuntimeLink.helloVerdict(
+                hello(version: RuntimeLink.protocolVersion - 2, token: wrongToken), token: token),
+            .ignore)
+        XCTAssertEqual(RuntimeLink.helloVerdict(Data([1]), token: token), .ignore)
+
+        var truncated = hello(version: RuntimeLink.protocolVersion, token: token)
+        truncated.removeLast()
+        XCTAssertEqual(
+            RuntimeLink.helloVerdict(truncated, token: token),
+            .refuse("runtime sent a malformed Hello"))
+    }
 }
 
 private extension Data {
+    mutating func appendTestU16(_ value: UInt16) {
+        append(UInt8(value & 0xff))
+        append(UInt8(value >> 8))
+    }
+
     mutating func appendTestU32(_ value: UInt32) {
         for index in 0..<4 {
             append(UInt8((value >> UInt32(index * 8)) & 0xff))

@@ -40,9 +40,9 @@ public struct StreamerOptions: Equatable {
                         per-eye headset resolution: performance (896x944),
                         balanced (1152x1216), quality (1344x1408, default),
                         or custom even dimensions
-          --latency <balanced|low>
-                        Quest decoder buffering (default low; trims 0.2 frame
-                        and may be less tolerant of timing jitter)
+          --latency <balanced|low|ultra>
+                        Quest decoder buffering (default low; ultra targets
+                        one frame with less history and may expose jitter)
           --bind <ip>   address to listen on (default 127.0.0.1, i.e.
                         this machine only; 0.0.0.0 accepts LAN clients
                         and exposes your screen to the network)
@@ -54,7 +54,7 @@ public struct StreamerOptions: Equatable {
           --runtime <control-file>
                         stream frames submitted by the BasaltVR OpenXR
                         runtime instead of capturing the desktop; writes
-                        "<port> <token>" to <control-file>, which the game
+                        "<port> <token> <width> <height>" to <control-file>, which the game
                         bottle receives as BASALT_CONTROL
           --audio-device <name>
                         capture 48 kHz stereo game audio from the matching
@@ -105,7 +105,7 @@ public struct StreamerOptions: Equatable {
             case "--latency":
                 let value = try nextValue(for: flag).lowercased()
                 guard let preset = StreamLatencyPreset(rawValue: value) else {
-                    throw BasaltError("--latency expects balanced or low")
+                    throw BasaltError("--latency expects balanced, low, or ultra")
                 }
                 options.latencyPreset = preset
             case "--bind":

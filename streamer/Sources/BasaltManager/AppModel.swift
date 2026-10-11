@@ -5,21 +5,22 @@ import BasaltBottleKit
 import BasaltCore
 import BasaltManagerKit
 
+/// Sidebar order; also the ⌘1…⌘5 order in the View menu.
 enum ManagerSection: String, CaseIterable, Identifiable {
-    case setup = "Setup"
-    case library = "Game Library"
-    case bottles = "Bottles"
+    case library = "Library"
     case stream = "Stream"
+    case bottles = "Bottles"
+    case setup = "Setup"
     case settings = "Settings"
 
     var id: Self { self }
 
     var symbol: String {
         switch self {
-        case .setup: return "checklist"
         case .library: return "gamecontroller"
+        case .stream: return "dot.radiowaves.left.and.right"
         case .bottles: return "shippingbox"
-        case .stream: return "waveform.path.ecg"
+        case .setup: return "checklist"
         case .settings: return "gearshape"
         }
     }
@@ -27,7 +28,7 @@ enum ManagerSection: String, CaseIterable, Identifiable {
 
 enum SessionState: Equatable {
     case stopped
-    case starting
+    case starting(profile: String)
     case streaming(profile: String)
     case utility(String)
     case failed(String)
@@ -48,11 +49,24 @@ enum SessionState: Equatable {
         case .stopped, .failed: return false
         }
     }
+
+    var isStreaming: Bool {
+        if case .streaming = self { return true }
+        return false
+    }
+
+    /// The game profile of a starting or streaming session.
+    var profileName: String? {
+        switch self {
+        case .starting(let profile), .streaming(let profile): return profile
+        case .stopped, .utility, .failed: return nil
+        }
+    }
 }
 
 @MainActor
 final class BasaltAppModel: ObservableObject {
-    @Published var selection = ManagerSection.setup
+    @Published var selection = ManagerSection.library
     @Published private(set) var setupChecks = [SetupCheck]()
     @Published private(set) var bottles = [ManagedBottle]()
     @Published private(set) var profiles = [LaunchProfile]()
@@ -63,17 +77,31 @@ final class BasaltAppModel: ObservableObject {
     @Published private(set) var bsManagerInstallations = [BSManagerInstallation]()
     @Published private(set) var engines = [BottleEngine]()
     @Published private(set) var audioDevices = [GameAudioDevice]()
-    @Published private(set) var metrics = [StreamMetricSample]()
     @Published private(set) var sessionState = SessionState.stopped
-    @Published private(set) var log = ""
+    /// The log and metric samples, observed separately from this model.
+    let console = SessionConsole()
     @Published var settings: StreamLaunchSettings {
         didSet { persistSettings() }
     }
     @Published private(set) var profileSettings = [String: StreamLaunchSettings]()
     @Published private(set) var dataRoot: URL
     @Published private(set) var bsManagerLocation: URL?
+    /// The profile the Stream page offers to play; follows the last launch.
+    @Published var preferredProfileName: String? {
+        didSet {
+            UserDefaults.standard.set(preferredProfileName, forKey: Self.preferredProfileKey)
+        }
+    }
     @Published var isBusy = false
     @Published var alertMessage: String?
+    /// Finished VR sessions, newest first, persisted in the data root.
+    @Published private(set) var sessionHistory = [SessionRecord]()
+    /// Presents the diagnostic report sheet from Settings or the Help menu.
+    @Published var showingDiagnostics = false
+
+    var missingRequiredSetupCount: Int {
+        setupChecks.filter { $0.required && $0.status != .ready }.count
+    }
 
     let repoRoot: URL
     private(set) var manager: BottleManager
@@ -83,8 +111,15 @@ final class BasaltAppModel: ObservableObject {
     private var steamProcess: Process?
     private var controlFile: URL?
     private var activeWineCommand: BottleLaunchCommand?
-    private var logRemainder = ""
+    /// Identifies the in-flight `launch`. `stop()` clears it, so a launch that
+    /// is still awaiting cleanup, Steam, or the streamer abandons quietly
+    /// instead of starting more processes or reporting a spurious failure.
+    private var activeLaunchID: UUID?
+    /// The session `launch` started; `finishSession` records it to history.
+    private var openSession: SessionRecord?
+    private var hasChosenInitialSection = false
     private static let streamSettingsKey = "BasaltVR.streamSettings.v1"
+    private static let preferredProfileKey = "BasaltVR.preferredProfile"
     private static let profileSettingsKey = "BasaltVR.profileSettings.v1"
     private static let dataRootKey = "BasaltVR.dataRoot"
     private static let bsManagerLocationKey = "BasaltVR.bsManagerLocation"
@@ -131,7 +166,9 @@ final class BasaltAppModel: ObservableObject {
         dataRoot = selectedRoot
         bsManagerLocation = defaults.string(forKey: Self.bsManagerLocationKey)
             .map { URL(fileURLWithPath: $0, isDirectory: true) }
+        preferredProfileName = defaults.string(forKey: Self.preferredProfileKey)
         manager = BottleManager(root: selectedRoot, repoRoot: discovered)
+        sessionHistory = SessionHistoryStore(dataRoot: selectedRoot).load()
         alertMessage = startupError
         Task { await refresh() }
     }
@@ -185,15 +222,24 @@ final class BasaltAppModel: ObservableObject {
                }) {
                 settings.audioDeviceName = blackHole.name
             }
+            // Open on the library once the Mac is ready; first-run users
+            // land on the checks they still need to finish.
+            if !hasChosenInitialSection {
+                hasChosenInitialSection = true
+                if selection == .library, missingRequiredSetupCount > 0 {
+                    selection = .setup
+                }
+            }
         case .failure(let error):
             alertMessage = error.localizedDescription
         }
         isBusy = false
     }
 
-    func createBottle(name: String, engineID: String) async {
+    @discardableResult
+    func createBottle(name: String, engineID: String) async -> Bool {
         let manager = manager
-        await runBottleTask {
+        return await runBottleTask {
             _ = try manager.createBottle(name: name, engineID: engineID)
         }
     }
@@ -388,6 +434,7 @@ final class BasaltAppModel: ObservableObject {
         dataRoot = standardized
         UserDefaults.standard.set(standardized.path, forKey: Self.dataRootKey)
         manager = BottleManager(root: standardized, repoRoot: repoRoot)
+        sessionHistory = SessionHistoryStore(dataRoot: standardized).load()
         await refresh()
     }
 
@@ -438,10 +485,14 @@ final class BasaltAppModel: ObservableObject {
             // Launching the executable directly leaves app.whenReady() pending.
             // Keeping GPU work in the main process also avoids a transparent
             // Chromium window caused by cross-process surface compositing.
+            // `/wait` keeps the launcher alive while BSManager runs: a bare
+            // `start` exits at once, and the utility's exit handler then
+            // stops every Wine process in the bottle, BSManager included.
             let command = try manager.applicationLaunchCommand(
                 bottleName: bottle.name,
                 executable: "start",
                 arguments: [
+                    "/wait",
                     "/unix",
                     installation.executable.path,
                     "--no-sandbox",
@@ -498,12 +549,40 @@ final class BasaltAppModel: ObservableObject {
 
     func launch(profileName: String) async {
         guard !sessionState.isActive else { return }
+        let launchID = UUID()
+        activeLaunchID = launchID
+        // Stop can run at any await below; never resume a stopped launch.
+        func ensureCurrent() throws {
+            guard activeLaunchID == launchID else { throw CancellationError() }
+        }
         do {
             let launchSettings = streamSettings(for: profileName)
-            sessionState = .starting
+            preferredProfileName = profileName
+            sessionState = .starting(profile: profileName)
             selection = .stream
-            log = "Preparing \(profileName)…\n"
-            metrics.removeAll()
+            console.restart(with: "Preparing \(profileName)…\n")
+            openSession = SessionRecord(profileName: profileName, settings: launchSettings)
+
+            appendLog("Stopping stale Wine processes in this bottle…\n")
+            let manager = manager
+            // A failure thrown after Stop is swallowed by the catch below.
+            try await Task.detached {
+                _ = try manager.terminateBottleProcesses(forProfile: profileName)
+            }.value
+            try ensureCurrent()
+            appendLog("Bottle process state is clean\n")
+
+            // Keep the bottle-side DLL in lockstep with the streamer build.
+            // A stale control-protocol version otherwise connects headlessly
+            // and presents as a completely black headset view. Registering
+            // (only when the bottle's registry no longer names this runtime)
+            // cold-starts the just-stopped prefix, so keep it off the main actor.
+            try await Task.detached {
+                let profile = try manager.loadProfile(profileName)
+                try manager.syncRuntime(in: profile.bottleName)
+            }.value
+            try ensureCurrent()
+            appendLog("OpenXR runtime is synchronized with this build\n")
 
             _ = try manager.installSteamWebHelperCompatibility(
                 forProfile: profileName)
@@ -533,6 +612,7 @@ final class BasaltAppModel: ObservableObject {
                 activeWineCommand = steamCommand
                 appendLog("Starting Steam prerequisite…\n")
                 try await Task.sleep(nanoseconds: 1_000_000_000)
+                try ensureCurrent()
                 // A cold start remains attached. Only accept a Logged On line
                 // written by this client; otherwise a historical line can race
                 // a new updater/login startup. A warm invocation exits quickly
@@ -541,7 +621,8 @@ final class BasaltAppModel: ObservableObject {
                 appendLog("Waiting for Steam sign-in and game IPC…\n")
                 try await waitForSteam(
                     connectionLog: connectionLog,
-                    after: requiredOffset)
+                    after: requiredOffset,
+                    launchID: launchID)
             }
 
             let streamer = try locateBuiltExecutable(named: "basalt-streamer")
@@ -555,12 +636,16 @@ final class BasaltAppModel: ObservableObject {
             process.terminationHandler = { [weak self] process in
                 Task { @MainActor in
                     guard let self, self.streamerProcess === process else { return }
+                    // While launch() is still starting up, it notices the exit
+                    // itself and reports the streamer's own diagnostic.
+                    guard self.activeLaunchID == nil else { return }
                     let sessionWasActive = self.sessionState.isActive
+                    let failure = "Streamer exited with status \(process.terminationStatus)"
                     self.streamerProcess = nil
+                    if sessionWasActive { self.finishSession(.failed, reason: failure) }
                     self.stop()
                     if sessionWasActive {
-                        self.sessionState = .failed(
-                            "Streamer exited with status \(process.terminationStatus)")
+                        self.sessionState = .failed(failure)
                     }
                 }
             }
@@ -572,13 +657,17 @@ final class BasaltAppModel: ObservableObject {
             for _ in 0..<300 where !FileManager.default.fileExists(atPath: control.path) {
                 if !process.isRunning { break }
                 try await Task.sleep(nanoseconds: 100_000_000)
+                try ensureCurrent()
             }
+            // A streamer terminated by Stop is not a startup failure.
+            try ensureCurrent()
             if !process.isRunning {
                 // Give the readability handler one turn to append the final
                 // stderr chunk emitted immediately before process exit.
                 try? await Task.sleep(nanoseconds: 100_000_000)
+                try ensureCurrent()
                 throw BottleToolError(
-                    StreamerLogFailure.message(in: log)
+                    StreamerLogFailure.message(in: console.log)
                         ?? "The streamer exited before the VR runtime became ready (status \(process.terminationStatus)).")
             }
             guard FileManager.default.fileExists(atPath: control.path) else {
@@ -601,15 +690,23 @@ final class BasaltAppModel: ObservableObject {
                     guard let self, self.gameProcess === game else { return }
                     self.appendLog("Game exited with status \(game.terminationStatus)\n")
                     self.gameProcess = nil
+                    self.finishSession(.ended)
                     self.stop()
                 }
             }
             try game.run()
             gameProcess = game
             activeWineCommand = command
+            activeLaunchID = nil
+            openSession?.streamingStartedAt = Date()
             sessionState = .streaming(profile: profileName)
             selection = .stream
         } catch {
+            // Stopped (or superseded by a newer launch): stop() already
+            // released everything this launch started, and calling it again
+            // here could tear down a session the user has since started.
+            guard activeLaunchID == launchID else { return }
+            finishSession(.failed, reason: error.localizedDescription)
             stop()
             sessionState = .failed(error.localizedDescription)
             alertMessage = error.localizedDescription
@@ -617,6 +714,8 @@ final class BasaltAppModel: ObservableObject {
     }
 
     func stop() {
+        activeLaunchID = nil
+        finishSession(.stopped)
         let game = gameProcess
         let steam = steamProcess
         let streamer = streamerProcess
@@ -643,13 +742,14 @@ final class BasaltAppModel: ObservableObject {
     }
 
     private func waitForSteam(
-        connectionLog: URL?, after offset: Int
+        connectionLog: URL?, after offset: Int, launchID: UUID
     ) async throws {
         guard let connectionLog else {
             throw BottleToolError(
                 "Steam did not create its connection log. Keep Steam open, finish setup, then try again.")
         }
         for _ in 0..<240 {
+            guard activeLaunchID == launchID else { throw CancellationError() }
             if let data = try? Data(contentsOf: connectionLog),
                SteamConnectionLog.state(in: data, after: offset) == .loggedOn {
                 appendLog("Steam is signed in; launching the game…\n")
@@ -669,19 +769,11 @@ final class BasaltAppModel: ObservableObject {
     @discardableResult
     private func runBottleTask(_ operation: @escaping @Sendable () throws -> Void) async -> Bool {
         isBusy = true
-        let result: Result<Void, Error> = await Task.detached {
-            do {
-                try operation()
-                return .success(())
-            } catch {
-                return .failure(error)
-            }
-        }.value
-        switch result {
-        case .success:
+        do {
+            try await Task.detached(operation: operation).value
             await refresh()
             return true
-        case .failure(let error):
+        } catch {
             alertMessage = error.localizedDescription
             isBusy = false
             return false
@@ -798,22 +890,80 @@ final class BasaltAppModel: ObservableObject {
         gameProcess = process
         activeWineCommand = command
         sessionState = .utility(label)
-        log = "Launching \(label)…\n"
+        console.restart(with: "Launching \(label)…\n", clearingSamples: false)
         selection = .stream
     }
 
+    func clearLog() {
+        guard !sessionState.isActive else { return }
+        console.restart()
+    }
+
+    /// Records the open session to history. The first outcome wins: the
+    /// `stop()` that follows a game exit or failure finds nothing open.
+    private func finishSession(_ outcome: SessionRecord.Outcome, reason: String? = nil) {
+        guard var record = openSession else { return }
+        openSession = nil
+        // A launch stopped before the game started is not a session.
+        guard record.streamingStartedAt != nil || outcome == .failed else { return }
+        record.endedAt = Date()
+        record.outcome = outcome
+        record.failureReason = reason
+        do {
+            sessionHistory = try SessionHistoryStore(dataRoot: dataRoot).append(record)
+        } catch {
+            appendLog("Could not save session history: \(error.localizedDescription)\n")
+        }
+    }
+
+    func clearSessionHistory() {
+        do {
+            try SessionHistoryStore(dataRoot: dataRoot).clear()
+            sessionHistory = []
+        } catch {
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    /// A snapshot for bug reports. Callers render it through a
+    /// `DiagnosticRedactor`; nothing here leaves the Mac by itself.
+    func makeDiagnosticReport(includeLog: Bool) -> DiagnosticReport {
+        DiagnosticReport(
+            application: .current(repoRoot: repoRoot),
+            system: .current(),
+            setupChecks: setupChecks,
+            engines: engines,
+            bottles: discoveredBottles,
+            profiles: profiles,
+            defaultStreamSettings: settings,
+            profileStreamSettings: profileSettings,
+            currentSession: .init(
+                state: sessionState.label,
+                profileName: openSession?.profileName,
+                metrics: openSession?.metrics),
+            recentSessions: sessionHistory,
+            log: includeLog ? console.log : nil)
+    }
+
+    func export(_ text: String, to url: URL) {
+        do {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            alertMessage = "Could not save \(url.lastPathComponent): \(error.localizedDescription)"
+        }
+    }
+
     private func appendLog(_ value: String) {
-        log += value
-        if log.count > 80_000 { log.removeFirst(log.count - 60_000) }
-        logRemainder += value
-        let lines = logRemainder.components(separatedBy: .newlines)
-        logRemainder = lines.last ?? ""
-        for line in lines.dropLast() {
+        for line in console.append(value) {
             if let metric = StreamLogMetricsParser.parse(line: line) {
-                metrics.append(metric)
+                console.record(metric)
+                if let target = openSession?.settings.fps {
+                    openSession?.metrics.add(metric, targetFPS: target)
+                }
+            } else if let refusal = RuntimeConnectionRefusal.message(in: line) {
+                alertMessage = refusal
             }
         }
-        if metrics.count > 360 { metrics.removeFirst(metrics.count - 300) }
     }
 
     private static func runUtility(_ executable: URL, arguments: [String]) async

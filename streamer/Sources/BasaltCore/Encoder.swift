@@ -143,11 +143,19 @@ public final class H264Encoder {
     /// Submits a frame if one of two bounded encoder slots is available.
     /// Callers should drop new frames when both are occupied rather than
     /// build a latency queue.
+    ///
+    /// `completion` runs exactly once: after VideoToolbox finishes with
+    /// `pixelBuffer`, or immediately when the frame is rejected.
     @discardableResult
-    public func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime) -> Bool {
+    public func encode(
+        _ pixelBuffer: CVPixelBuffer,
+        pts: CMTime,
+        completion: (@Sendable () -> Void)? = nil
+    ) -> Bool {
         lock.lock()
         guard framesInFlight < maximumFramesInFlight else {
             lock.unlock()
+            completion?()
             return false
         }
         framesInFlight += 1
@@ -167,17 +175,23 @@ public final class H264Encoder {
             duration: .invalid,
             frameProperties: frameProperties,
             infoFlagsOut: &infoFlags) { [weak self] status, infoFlags, sampleBuffer in
-                guard let self else { return }
+                guard let self else {
+                    completion?()
+                    return
+                }
                 self.lock.lock()
                 self.framesInFlight -= 1
                 self.lock.unlock()
 
-                guard status == noErr else {
+                if status != noErr {
                     self.reportError("VideoToolbox encode callback failed", status: status)
+                    completion?()
                     return
                 }
-                guard !infoFlags.contains(.frameDropped), let sampleBuffer else { return }
-                self.emit(sampleBuffer)
+                if !infoFlags.contains(.frameDropped), let sampleBuffer {
+                    self.emit(sampleBuffer)
+                }
+                completion?()
             }
         guard status == noErr else {
             lock.lock()
@@ -185,6 +199,7 @@ public final class H264Encoder {
             if force { forceKeyframeFlag = true }
             lock.unlock()
             reportError("VTCompressionSessionEncodeFrame failed", status: status)
+            completion?()
             return false
         }
         return true
@@ -262,6 +277,8 @@ public final class H264Encoder {
         // VideoToolbox emits AVCC framing; rewrite as Annex-B.
         guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
         let totalLength = CMBlockBufferGetDataLength(blockBuffer)
+        // Empty Data has no base address; the copy below would trap.
+        guard totalLength > 0 else { return }
         var raw = Data(count: totalLength)
         let copyStatus = raw.withUnsafeMutableBytes { buffer in
             CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: totalLength,

@@ -7,9 +7,13 @@
  * runtime and the native test daemon; C so both can include it.
  *
  * Transport: loopback TCP. The daemon listens on 127.0.0.1 on an ephemeral
- * port and writes "<port> <token>\n" to a file; the launcher passes that
+ * port and writes "<port> <token> <per_eye_width> <per_eye_height>\n" to a
+ * file; the launcher passes that
  * file's Windows-visible path to the game bottle as BASALT_CONTROL. The
  * token is 32 lowercase hex characters and must be echoed in Hello.
+ * Width and height are optional for compatibility; when absent or outside
+ * BASALT_CONTROL_{MIN_VIEW_DIMENSION,MAX_VIEW_WIDTH,MAX_VIEW_HEIGHT} (or
+ * odd), the runtime recommends its maximum per-eye size instead.
  *
  * Framing, all little-endian, no padding (fields are written sequentially,
  * not as C structs):
@@ -39,6 +43,8 @@
  *       s32 rect_x, s32 rect_y, s32 rect_width, s32 rect_height,
  *       f32 orientation[4] (xyzw), f32 position[3],
  *       f32 fov_left, f32 fov_right, f32 fov_up, f32 fov_down
+ *   FRAME_CONSUMED (daemon → runtime; sent after asynchronous Metal source read)
+ *     u64 frame_number
  *   HEAD_POSE (daemon → runtime; latest sample wins)
  *     u64 target_timestamp_ns,
  *     f32 orientation[4] (xyzw), f32 position[3]
@@ -64,9 +70,14 @@
  *     u32 reason (BASALT_TEARDOWN_*)
  */
 
-#define BASALT_CONTROL_PROTOCOL_VERSION 7u
+#define BASALT_CONTROL_PROTOCOL_VERSION 9u
 #define BASALT_CONTROL_TOKEN_LENGTH 32u
 #define BASALT_CONTROL_MAX_MESSAGE_LENGTH 4096u
+/* Per-eye view size bounds. The maximum is also the runtime's advertised and
+ * accepted swapchain limit. */
+#define BASALT_CONTROL_MIN_VIEW_DIMENSION 256u
+#define BASALT_CONTROL_MAX_VIEW_WIDTH 1680u
+#define BASALT_CONTROL_MAX_VIEW_HEIGHT 1760u
 
 enum {
     BASALT_MSG_HELLO = 1,
@@ -85,6 +96,7 @@ enum {
     BASALT_MSG_INPUT_RESET = 14,
     BASALT_MSG_VIEW_CONFIG = 15,
     BASALT_MSG_CONTROLLER_MASK = 16,
+    BASALT_MSG_FRAME_CONSUMED = 17,
 };
 
 enum {

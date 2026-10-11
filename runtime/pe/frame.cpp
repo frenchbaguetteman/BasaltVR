@@ -202,6 +202,25 @@ void queueInteractionProfileChanged(XrSession session) {
     ReleaseSRWLockExclusive(&gLifecycleLock);
 }
 
+void queueReferenceSpaceChange(
+    XrSession session,
+    XrTime changeTime,
+    const XrPosef& poseInPreviousSpace) {
+    AcquireSRWLockExclusive(&gLifecycleLock);
+    if (lifecycleMatchesLocked(session) && gSessionRunning && changeTime > 0) {
+        XrEventDataReferenceSpaceChangePending event{};
+        event.type = XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING;
+        event.next = nullptr;
+        event.session = session;
+        event.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        event.changeTime = changeTime;
+        event.poseValid = XR_TRUE;
+        event.poseInPreviousSpace = poseInPreviousSpace;
+        queueEventLocked(&event, sizeof(event));
+    }
+    ReleaseSRWLockExclusive(&gLifecycleLock);
+}
+
 }  // namespace basalt
 
 namespace {
@@ -480,6 +499,22 @@ XrResult XRAPI_CALL waitFrame(
         return XR_ERROR_HANDLE_INVALID;
     }
 
+    // Do not let the application's next frame enter the GPU/control/composer
+    // pipeline until the streamer has consumed the previous one. The control
+    // wait owns a separate lock and may disconnect, so never hold the frame
+    // lifecycle lock across it.
+    ReleaseSRWLockExclusive(&gLifecycleLock);
+    controlWaitForFrameBudget(session);
+    AcquireSRWLockExclusive(&gLifecycleLock);
+    if (!lifecycleMatchesLocked(session)) {
+        ReleaseSRWLockExclusive(&gLifecycleLock);
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    if (!gSessionRunning) {
+        ReleaseSRWLockExclusive(&gLifecycleLock);
+        return XR_ERROR_SESSION_NOT_RUNNING;
+    }
+
     const XrTime waitDeadline = gNextWaitDeadline;
     XrTime now = monotonicTime();
     if (waitDeadline > now) {
@@ -521,6 +556,7 @@ XrResult XRAPI_CALL waitFrame(
     // displayed; headless sessions keep telling the app not to render.
     frameState->shouldRender = controlActive(session) ? XR_TRUE : XR_FALSE;
     ReleaseSRWLockExclusive(&gLifecycleLock);
+    controlNotePredictedDisplayTime(session, predictedDisplayTime);
     return XR_SUCCESS;
 }
 

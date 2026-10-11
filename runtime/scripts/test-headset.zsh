@@ -165,6 +165,13 @@ if [[ ! -s ${control_file} ]]; then
     print -u2 "FAIL: timed out waiting for ALVR StreamReady/runtime control file."
     exit 1
 fi
+# The streamer advertises its selected per-eye size ("<port> <token> <w> <h>"),
+# and the runtime recommends exactly that size to the smoke.
+read -r _ _ view_width view_height < "${control_file}"
+if [[ ${view_width} != <-> || ${view_height} != <-> ]]; then
+    print -u2 "FAIL: the runtime control file does not carry a per-eye size."
+    exit 1
+fi
 
 control_windows="Z:${control_file//\//\\}"
 print ""
@@ -184,6 +191,7 @@ MVK_CONFIG_LOG_LEVEL=0 \
 DXMT_BASALT_IOSURFACE=1 \
 BASALT_EXPECT_IOSURFACE=1 \
 BASALT_REQUIRE_HEAD_POSE=1 BASALT_REQUIRE_CONTROLLER_INPUT=1 \
+BASALT_EXPECT_VIEW_WIDTH=${view_width} BASALT_EXPECT_VIEW_HEIGHT=${view_height} \
 BASALT_CONTROL="${control_windows}" \
     "${wine_root}/bin/wine" ./d3d11_runtime_smoke.exe \
         --render-frames "${frame_count}" --visual

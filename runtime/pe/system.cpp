@@ -2,10 +2,10 @@
 
 #include <cstring>
 
+#include "control.hpp"
+
 namespace {
 
-constexpr uint32_t kPerEyeWidth = 1680;
-constexpr uint32_t kPerEyeHeight = 1760;
 constexpr uint32_t kViewCount = 2;
 
 XrResult validateSystemQuery(
@@ -68,8 +68,8 @@ XrResult XRAPI_CALL getSystemProperties(
     properties->vendorId = 0;
     std::strncpy(properties->systemName, "BasaltVR ALVR HMD prototype", XR_MAX_SYSTEM_NAME_SIZE - 1);
     properties->systemName[XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
-    properties->graphicsProperties.maxSwapchainImageWidth = kPerEyeWidth;
-    properties->graphicsProperties.maxSwapchainImageHeight = kPerEyeHeight;
+    properties->graphicsProperties.maxSwapchainImageWidth = kMaxViewWidth;
+    properties->graphicsProperties.maxSwapchainImageHeight = kMaxViewHeight;
     properties->graphicsProperties.maxLayerCount = XR_MIN_COMPOSITION_LAYERS_SUPPORTED;
     properties->trackingProperties.orientationTracking = XR_TRUE;
     properties->trackingProperties.positionTracking = XR_TRUE;
@@ -184,11 +184,15 @@ XrResult XRAPI_CALL enumerateViewConfigurationViews(
             return XR_ERROR_VALIDATION_FAILURE;
         }
     }
+    // The streamer's configured per-eye size, else the full headset size.
+    uint32_t recommendedWidth = kMaxViewWidth;
+    uint32_t recommendedHeight = kMaxViewHeight;
+    controlConfiguredViewSize(&recommendedWidth, &recommendedHeight);
     for (uint32_t index = 0; index < kViewCount; ++index) {
-        views[index].recommendedImageRectWidth = kPerEyeWidth;
-        views[index].maxImageRectWidth = kPerEyeWidth;
-        views[index].recommendedImageRectHeight = kPerEyeHeight;
-        views[index].maxImageRectHeight = kPerEyeHeight;
+        views[index].recommendedImageRectWidth = recommendedWidth;
+        views[index].maxImageRectWidth = kMaxViewWidth;
+        views[index].recommendedImageRectHeight = recommendedHeight;
+        views[index].maxImageRectHeight = kMaxViewHeight;
         views[index].recommendedSwapchainSampleCount = 1;
         views[index].maxSwapchainSampleCount = 1;
     }

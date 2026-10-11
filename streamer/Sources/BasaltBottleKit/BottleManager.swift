@@ -60,6 +60,9 @@ public struct ManagedBottle: Codable, Equatable, Sendable {
         dxmtInstalled = false
         runtimeInstalled = false
     }
+
+    /// Both the DXMT handoff and the OpenXR runtime are installed.
+    public var isReadyForVR: Bool { dxmtInstalled && runtimeInstalled }
 }
 
 public enum LaunchSource: String, Codable, CaseIterable, Sendable {
@@ -103,6 +106,11 @@ public struct CommandOutput: Equatable, Sendable {
     public init(status: Int32, output: String) {
         self.status = status
         self.output = output
+    }
+
+    /// The combined output without surrounding whitespace, for error messages.
+    public var trimmedOutput: String {
+        output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -425,7 +433,7 @@ public final class BottleManager: @unchecked Sendable {
                 arguments: ["-cR", engine.root.path, isolated.path],
                 environment: [:], currentDirectory: nil)
             guard clone.status == 0 else {
-                throw BottleToolError("Could not clone the pinned Wine engine: \(clone.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+                throw BottleToolError("Could not clone the pinned Wine engine: \(clone.trimmedOutput)")
             }
             selectedEngineRoot = isolated
             selectedWine = isolated.appendingPathComponent("bin/wine")
@@ -454,7 +462,7 @@ public final class BottleManager: @unchecked Sendable {
                 extraEnvironment: [:])
         }
         guard boot.status == 0 else {
-            throw BottleToolError("wineboot failed for '\(name)': \(boot.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+            throw BottleToolError("wineboot failed for '\(name)': \(boot.trimmedOutput)")
         }
         bottle = try loadBottle(name)
         return bottle
@@ -487,7 +495,7 @@ public final class BottleManager: @unchecked Sendable {
         guard copy.status == 0 else {
             throw BottleToolError(
                 "Could not copy the external prefix: "
-                    + copy.output.trimmingCharacters(in: .whitespacesAndNewlines))
+                    + copy.trimmedOutput)
         }
         try suppressSteamAutoLaunch(in: destination)
         return try loadBottle(name)
@@ -602,7 +610,7 @@ public final class BottleManager: @unchecked Sendable {
             try? fileManager.removeItem(at: replacement)
             throw BottleToolError(
                 "Could not clone the DXMT-matched Wine engine: "
-                    + clone.output.trimmingCharacters(in: .whitespacesAndNewlines))
+                    + clone.trimmedOutput)
         }
 
         do {
@@ -627,6 +635,62 @@ public final class BottleManager: @unchecked Sendable {
     }
 
     public func installRuntime(in name: String) throws -> ManagedBottle {
+        try installRuntime(in: name, alwaysRegister: true)
+    }
+
+    /// Brings a stopped bottle's runtime in line with this build before a
+    /// launch. Unchanged files are left alone, and Wine runs to register the
+    /// runtime only when the bottle's registry hive does not already name it:
+    /// starting Wine cold-boots the prefix, which a launch otherwise pays for
+    /// on every Play. Call it only while the bottle's wineserver is stopped,
+    /// since a running server may not have flushed `system.reg` yet.
+    @discardableResult
+    public func syncRuntime(in name: String) throws -> ManagedBottle {
+        try installRuntime(in: name, alwaysRegister: false)
+    }
+
+    static let runtimeManifestWindowsPath = #"C:\basalt\runtime\basalt_openxr.json"#
+
+    /// The OpenXR `ActiveRuntime` recorded in a prefix's `system.reg`, read
+    /// without starting Wine; nil when the key or value is absent.
+    static func activeOpenXRRuntime(inHive hive: Data) -> String? {
+        // Hives are ASCII (Wine escapes everything else), relative to HKLM,
+        // and double each backslash. Keys are case-insensitive, so search a
+        // lowercased copy: a byte search stays fast on multi-megabyte hives.
+        let lowercased = Data(hive.map { (65...90).contains($0) ? $0 + 32 : $0 })
+        let header = Data("\n[software\\\\khronos\\\\openxr\\\\1]".utf8)
+        guard let section = lowercased.range(of: header) else { return nil }
+        let end = lowercased.range(
+            of: Data("\n[".utf8), in: section.upperBound..<lowercased.endIndex)?
+            .lowerBound ?? lowercased.endIndex
+        let body = String(decoding: hive[section.upperBound..<end], as: UTF8.self)
+        let name = #""activeruntime"=""#
+        for line in body.split(separator: "\n")
+        where line.count > name.count + 1 && line.hasSuffix("\"")
+            && line.prefix(name.count).lowercased() == name {
+            var value = ""
+            var escaped = false
+            for character in line.dropFirst(name.count).dropLast() {
+                if escaped || character != "\\" {
+                    value.append(character)
+                    escaped = false
+                } else {
+                    escaped = true
+                }
+            }
+            return value
+        }
+        return nil
+    }
+
+    private func hiveNamesBasaltRuntime(_ bottle: ManagedBottle) -> Bool {
+        let hive = URL(fileURLWithPath: bottle.prefixPath).appendingPathComponent("system.reg")
+        guard let data = try? Data(contentsOf: hive),
+              let active = Self.activeOpenXRRuntime(inHive: data) else { return false }
+        return active.caseInsensitiveCompare(Self.runtimeManifestWindowsPath) == .orderedSame
+    }
+
+    private func installRuntime(in name: String, alwaysRegister: Bool) throws -> ManagedBottle {
         var bottle = try loadBottle(name)
         let buildBin = repoRoot.appendingPathComponent("runtime/build/bin")
         let sourceDLL = buildBin.appendingPathComponent("basalt_openxr.dll")
@@ -642,19 +706,23 @@ public final class BottleManager: @unchecked Sendable {
         try copyFile(sourceDLL, to: destination.appendingPathComponent("basalt_openxr.dll"))
         try copyFile(sourceManifest, to: destination.appendingPathComponent("basalt_openxr.json"))
 
-        let registry = try wineCommand(
-            bottle: bottle,
-            arguments: [
-                "reg.exe", "add", #"HKLM\Software\Khronos\OpenXR\1"#,
-                "/v", "ActiveRuntime", "/t", "REG_SZ", "/d",
-                #"C:\basalt\runtime\basalt_openxr.json"#, "/f",
-            ],
-            extraEnvironment: [:])
-        guard registry.status == 0 else {
-            throw BottleToolError("OpenXR registration failed: \(registry.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+        if alwaysRegister || !bottle.runtimeInstalled || !hiveNamesBasaltRuntime(bottle) {
+            let registry = try wineCommand(
+                bottle: bottle,
+                arguments: [
+                    "reg.exe", "add", #"HKLM\Software\Khronos\OpenXR\1"#,
+                    "/v", "ActiveRuntime", "/t", "REG_SZ", "/d",
+                    Self.runtimeManifestWindowsPath, "/f",
+                ],
+                extraEnvironment: [:])
+            guard registry.status == 0 else {
+                throw BottleToolError("OpenXR registration failed: \(registry.trimmedOutput)")
+            }
         }
-        bottle.runtimeInstalled = true
-        try saveBottle(bottle)
+        if !bottle.runtimeInstalled {
+            bottle.runtimeInstalled = true
+            try saveBottle(bottle)
+        }
         return bottle
     }
 
@@ -683,7 +751,7 @@ public final class BottleManager: @unchecked Sendable {
             ], extraEnvironment: [:])
         guard query.status == 0,
               query.output.lowercased().contains(#"c:\basalt\runtime\basalt_openxr.json"#) else {
-            throw BottleToolError("Bottle verification could not confirm ActiveRuntime: \(query.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+            throw BottleToolError("Bottle verification could not confirm ActiveRuntime: \(query.trimmedOutput)")
         }
         let loaderSmoke = repoRoot.appendingPathComponent(
             "runtime/build/bin/loader_smoke.exe")
@@ -700,7 +768,7 @@ public final class BottleManager: @unchecked Sendable {
             currentDirectory: loaderSmoke.deletingLastPathComponent())
         guard smoke.status == 0 else {
             throw BottleToolError(
-                "OpenXR loader smoke failed in '\(name)': \(smoke.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+                "OpenXR loader smoke failed in '\(name)': \(smoke.trimmedOutput)")
         }
         return "PASS: \(name) has an isolated Basalt DXMT engine, registered OpenXR runtime, and working loader"
     }
@@ -890,6 +958,29 @@ public final class BottleManager: @unchecked Sendable {
             currentDirectory: workingDirectory)
     }
 
+    /// Stops every Wine process owned by the managed bottle for `profileName`.
+    ///
+    /// A previous manager process can exit without getting a chance to run its
+    /// termination handler. Resolving cleanup from persisted profile metadata
+    /// lets the next session remove those orphaned Wine processes before it
+    /// starts Steam or the game again.
+    @discardableResult
+    public func terminateBottleProcesses(
+        forProfile profileName: String
+    ) throws -> CommandOutput {
+        let profile = try loadProfile(profileName)
+        let bottle = try loadBottle(profile.bottleName)
+        return try terminateBottleProcesses(launchedWith: BottleLaunchCommand(
+            executable: URL(fileURLWithPath: bottle.wineBinaryPath),
+            arguments: [],
+            environment: [
+                "WINEPREFIX": bottle.prefixPath,
+                "WINEARCH": "win64",
+                "WINEDEBUG": "-all",
+            ],
+            currentDirectory: nil))
+    }
+
     /// Stops every Wine process owned by the prefix used for `command`.
     ///
     /// Terminating the direct `Process` returned by Foundation is not enough:
@@ -920,14 +1011,20 @@ public final class BottleManager: @unchecked Sendable {
             arguments: ["--kill", "--wait"],
             environment: environment,
             currentDirectory: nil)
-        guard result.status == 0 else {
-            let detail = result.output.trimmingCharacters(
-                in: .whitespacesAndNewlines)
-            throw BottleToolError(
-                "Could not stop Wine processes for \(prefixPath)"
-                    + (detail.isEmpty ? "" : ": \(detail)"))
+        let detail = result.trimmedOutput
+        if result.status == 0 {
+            return result
         }
-        return result
+        // Wine returns status 1 with no diagnostic when --kill finds no
+        // wineserver for the prefix. That is already the desired clean state,
+        // not a launch-blocking failure. Preserve nonempty diagnostics and all
+        // other statuses as real errors.
+        if result.status == 1 && detail.isEmpty {
+            return CommandOutput(status: 0, output: "")
+        }
+        throw BottleToolError(
+            "Could not stop Wine processes for \(prefixPath)"
+                + (detail.isEmpty ? "" : ": \(detail)"))
     }
 
     /// Resolves a normal Wine application without requiring an active VR
@@ -1133,9 +1230,12 @@ public final class BottleManager: @unchecked Sendable {
         try data.write(to: metadata, options: .atomic)
     }
 
+    /// Copies `source` over `destination` unless the bytes already match.
     private func copyFile(_ source: URL, to destination: URL) throws {
         let bytes = try Data(contentsOf: source)
-        try bytes.write(to: destination, options: .atomic)
+        if (try? Data(contentsOf: destination)) != bytes {
+            try bytes.write(to: destination, options: .atomic)
+        }
         if let attributes = try? fileManager.attributesOfItem(atPath: source.path),
            let permissions = attributes[.posixPermissions] {
             try? fileManager.setAttributes([.posixPermissions: permissions],

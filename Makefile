@@ -28,12 +28,10 @@ build: ## Build all native executables for Apple Silicon.
 	@swift build -c release --arch arm64 --package-path streamer
 
 app: build ## Run the management app from source.
-	@swift run --package-path streamer BasaltVR
+	@swift run -c release --skip-build --arch arm64 --package-path streamer BasaltVR
 
 runtime-build: ## Cross-build the Windows OpenXR runtime without running Wine.
-	@cmake -S runtime -B runtime/build \
-		-DCMAKE_TOOLCHAIN_FILE="$(REPO_DIR)/runtime/cmake/toolchains/mingw-x86_64.cmake" \
-		-DCMAKE_BUILD_TYPE=Release
+	@cmake -S runtime --preset mingw-release
 	@cmake --build runtime/build --parallel
 
 runtime-test: ## Run the Wine loader and ABI smoke suite.

@@ -7,8 +7,15 @@
 #include <cstdint>
 
 #include "control.hpp"
+#include "pose_math.hpp"
 
 namespace {
+
+using basalt::identityPose;
+using basalt::poseCompose;
+using basalt::poseInvert;
+using basalt::quaternionMultiply;
+using basalt::quaternionRotate;
 
 constexpr uintptr_t kFirstSpaceHandle = static_cast<uintptr_t>(0x40000);
 constexpr uintptr_t kSpaceHandleStride = static_cast<uintptr_t>(0x10);
@@ -83,57 +90,6 @@ bool poseValid(const XrPosef& pose) {
         static_cast<double>(orientation.z) * orientation.z +
         static_cast<double>(orientation.w) * orientation.w);
     return norm >= 0.99 && norm <= 1.01;
-}
-
-XrQuaternionf quaternionMultiply(const XrQuaternionf& a, const XrQuaternionf& b) {
-    return {
-        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-    };
-}
-
-XrVector3f quaternionRotate(const XrQuaternionf& q, const XrVector3f& v) {
-    const XrVector3f qv{q.x, q.y, q.z};
-    const XrVector3f uv{
-        qv.y * v.z - qv.z * v.y,
-        qv.z * v.x - qv.x * v.z,
-        qv.x * v.y - qv.y * v.x,
-    };
-    const XrVector3f uuv{
-        qv.y * uv.z - qv.z * uv.y,
-        qv.z * uv.x - qv.x * uv.z,
-        qv.x * uv.y - qv.y * uv.x,
-    };
-    return {
-        v.x + 2.0f * (q.w * uv.x + uuv.x),
-        v.y + 2.0f * (q.w * uv.y + uuv.y),
-        v.z + 2.0f * (q.w * uv.z + uuv.z),
-    };
-}
-
-XrPosef poseCompose(const XrPosef& a, const XrPosef& b) {
-    const XrVector3f rotated = quaternionRotate(a.orientation, b.position);
-    return {
-        quaternionMultiply(a.orientation, b.orientation),
-        {a.position.x + rotated.x, a.position.y + rotated.y, a.position.z + rotated.z},
-    };
-}
-
-XrPosef poseInvert(const XrPosef& pose) {
-    const XrQuaternionf conjugate{
-        -pose.orientation.x,
-        -pose.orientation.y,
-        -pose.orientation.z,
-        pose.orientation.w,
-    };
-    const XrVector3f rotated = quaternionRotate(conjugate, pose.position);
-    return {conjugate, {-rotated.x, -rotated.y, -rotated.z}};
-}
-
-XrPosef identityPose() {
-    return {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
 }
 
 SpaceRecord* findSpaceLocked(XrSpace space) {
@@ -403,9 +359,10 @@ XrResult XRAPI_CALL locateSpace(
                         XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
     } else {
         XrPosef headInLocal{};
-        const bool headTracked = controlHeadPose(target.session, nullptr, &headInLocal);
+        const bool headTracked = controlHeadPose(
+            target.session, time, nullptr, &headInLocal);
         ControlInputSnapshot input{};
-        controlInputSnapshot(target.session, &input);
+        controlInputSnapshot(target.session, &input, time);
 
         auto localFromSpace = [&](const SpaceRecord& record, bool actionResolved,
                                   uint32_t hand, XrPosef* pose) -> bool {
@@ -511,7 +468,8 @@ XrResult XRAPI_CALL locateViews(
     XrPosef headInLocal{};
     uint64_t headQuestTimestamp = 0;
     const bool headTracked = controlHeadPose(
-        session, &headQuestTimestamp, &headInLocal);
+        session, viewLocateInfo->displayTime,
+        &headQuestTimestamp, &headInLocal);
     XrPosef baseInLocal{};
     bool baseTracked = false;
     if (base.kind == SpaceKind::kReference) {
@@ -526,7 +484,7 @@ XrResult XRAPI_CALL locateViews(
         uint32_t hand = UINT32_MAX;
         bool aim = false;
         ControlInputSnapshot input{};
-        controlInputSnapshot(session, &input);
+        controlInputSnapshot(session, &input, viewLocateInfo->displayTime);
         if (getActionPoseSource(session, base.action, base.subactionPath, &hand, &aim) &&
             hand < 2 && input.controllers[hand].poseActive) {
             baseInLocal = poseCompose(input.controllers[hand].poseInLocal, base.pose);

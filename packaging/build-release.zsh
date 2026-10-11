@@ -38,8 +38,20 @@ for tool in swift cmake ditto codesign iconutil sips plutil shasum perl unzip; d
     fi
 done
 
-if [[ ! -f "${runtime_source_dir}/bin/basalt_openxr.dll" ||
-      ! -f "${runtime_source_dir}/bin/basalt_openxr.json" ]]; then
+if [[ -f "${runtime_source_dir}/CMakeCache.txt" ]]; then
+    runtime_build_type=$(sed -n 's/^CMAKE_BUILD_TYPE:STRING=//p' \
+        "${runtime_source_dir}/CMakeCache.txt")
+    if [[ "$runtime_build_type" != Release ]]; then
+        print -u2 "error: ${runtime_source_dir} is a ${runtime_build_type:-unset} build;" \
+            "run 'make runtime-build' (Release) or set BASALT_RUNTIME_BUILD_DIR"
+        exit 1
+    fi
+    # Never package a DLL that predates the sources: a stale control-protocol
+    # version connects headlessly (black headset) against the fresh streamer.
+    # Incremental, so this is a no-op when the tree is current.
+    cmake --build "$runtime_source_dir" --parallel
+elif [[ ! -f "${runtime_source_dir}/bin/basalt_openxr.dll" ||
+        ! -f "${runtime_source_dir}/bin/basalt_openxr.json" ]]; then
     readonly generated_runtime_dir="${repo_dir}/runtime/build-release"
     cmake \
         -S "${repo_dir}/runtime" \

@@ -58,6 +58,17 @@ bool requireControllerInput() {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+uint32_t expectedViewDimension(const char* name, uint32_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    return end != value && *end == '\0' && parsed <= UINT32_MAX
+        ? static_cast<uint32_t>(parsed) : fallback;
+}
+
 bool nearlyEqual(float a, float b, float tolerance = 0.0001f) {
     return std::fabs(a - b) <= tolerance;
 }
@@ -465,6 +476,33 @@ int main(int argc, char** argv) {
     if (XR_FAILED(result)) {
         xrDestroyInstance(instance);
         return fail("xrGetSystem", result);
+    }
+
+    uint32_t configurationViewCount = 0;
+    result = xrEnumerateViewConfigurationViews(
+        instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+        0, &configurationViewCount, nullptr);
+    XrViewConfigurationView configurationViews[2]{};
+    configurationViews[0].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+    configurationViews[1].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+    if (XR_SUCCEEDED(result) && configurationViewCount == 2) {
+        result = xrEnumerateViewConfigurationViews(
+            instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+            2, &configurationViewCount, configurationViews);
+    }
+    const uint32_t expectedWidth = expectedViewDimension(
+        "BASALT_EXPECT_VIEW_WIDTH", 1680);
+    const uint32_t expectedHeight = expectedViewDimension(
+        "BASALT_EXPECT_VIEW_HEIGHT", 1760);
+    if (XR_FAILED(result) || configurationViewCount != 2 ||
+        configurationViews[0].recommendedImageRectWidth != expectedWidth ||
+        configurationViews[1].recommendedImageRectWidth != expectedWidth ||
+        configurationViews[0].recommendedImageRectHeight != expectedHeight ||
+        configurationViews[1].recommendedImageRectHeight != expectedHeight ||
+        configurationViews[0].maxImageRectWidth != 1680 ||
+        configurationViews[0].maxImageRectHeight != 1760) {
+        xrDestroyInstance(instance);
+        return fail("xrEnumerateViewConfigurationViews dimensions", result);
     }
 
     PFN_xrVoidFunction requirementsVoid = nullptr;
@@ -1017,14 +1055,20 @@ int main(int argc, char** argv) {
     result = xrGetActionStateFloat(session, &getInfo, &floatState);
     const bool injectedController = expectInjectedHeadPose();
     const bool requireController = injectedController || requireControllerInput();
-    if (XR_SUCCEEDED(result) && requireControllerInput() &&
+    if (XR_SUCCEEDED(result) && requireController &&
         floatState.isActive != XR_TRUE) {
         // StreamReady only proves that ALVR's sockets are live. A Touch
         // controller can legitimately remain inactive for a short interval
-        // while the user wakes or picks it up. Keep the acceptance gate strict,
-        // but do not race that asynchronous acquisition at session startup.
-        std::printf("INFO: waiting up to 30 seconds for the left Touch controller; move it now\n");
-        for (int attempt = 0; attempt < 3000 && floatState.isActive != XR_TRUE;
+        // while the user wakes or picks it up. The native daemon's injected
+        // input is likewise asynchronous: it follows HelloAck, while this first
+        // sync runs ~3 ms after session creation. Keep the acceptance gate
+        // strict, but do not race that asynchronous acquisition at startup.
+        // The injected wait stays well inside the 500 ms pose-freshness window.
+        const int attempts = requireControllerInput() ? 3000 : 25;
+        if (requireControllerInput()) {
+            std::printf("INFO: waiting up to 30 seconds for the left Touch controller; move it now\n");
+        }
+        for (int attempt = 0; attempt < attempts && floatState.isActive != XR_TRUE;
              ++attempt) {
             result = xrSyncActions(session, &syncInfo);
             if (XR_SUCCEEDED(result)) {
@@ -1043,6 +1087,14 @@ int main(int argc, char** argv) {
           floatState.currentState > 1.0f)) ||
         (injectedController && floatState.lastChangeTime <= 0) ||
         floatState.changedSinceLastSync != XR_FALSE) {
+        std::fprintf(
+            stderr,
+            "INFO: initial float state active=%u current=%.3f changed=%u "
+            "changeTime=%lld requireController=%u injected=%u\n",
+            floatState.isActive, floatState.currentState,
+            floatState.changedSinceLastSync,
+            static_cast<long long>(floatState.lastChangeTime),
+            requireController ? 1u : 0u, injectedController ? 1u : 0u);
         xrDestroySession(session);
         release(context);
         release(device);
@@ -1408,15 +1460,15 @@ int main(int argc, char** argv) {
         requireController ? kControllerTrackedFlags : 0;
     if (XR_FAILED(result) || location.locationFlags != expectedControllerFlags ||
         (injectedController &&
-         (!nearlyEqual(location.pose.position.x, -0.45f) ||
+         (!nearlyEqual(location.pose.position.x, -0.1f) ||
           !nearlyEqual(location.pose.position.y, 1.2f) ||
-          !nearlyEqual(location.pose.position.z, 0.1f) ||
+          !nearlyEqual(location.pose.position.z, -0.45f) ||
           controllerVelocity.velocityFlags !=
               (XR_SPACE_VELOCITY_LINEAR_VALID_BIT |
                XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) ||
-          !nearlyEqual(controllerVelocity.linearVelocity.x, 0.1f) ||
+          !nearlyEqual(controllerVelocity.linearVelocity.x, -0.3f) ||
           !nearlyEqual(controllerVelocity.linearVelocity.y, 0.2f) ||
-          !nearlyEqual(controllerVelocity.linearVelocity.z, 0.3f) ||
+          !nearlyEqual(controllerVelocity.linearVelocity.z, 0.1f) ||
           !nearlyEqual(controllerVelocity.angularVelocity.x, 0.0f) ||
           !nearlyEqual(controllerVelocity.angularVelocity.y, 0.5f) ||
           !nearlyEqual(controllerVelocity.angularVelocity.z, 0.0f)))) {
@@ -1494,9 +1546,9 @@ int main(int argc, char** argv) {
             controllerVelocity.velocityFlags !=
                 (XR_SPACE_VELOCITY_LINEAR_VALID_BIT |
                  XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) ||
-            !nearlyEqual(controllerVelocity.linearVelocity.x, 0.1f) ||
+            !nearlyEqual(controllerVelocity.linearVelocity.x, -0.3f) ||
             !nearlyEqual(controllerVelocity.linearVelocity.y, 0.2f) ||
-            !nearlyEqual(controllerVelocity.linearVelocity.z, 0.3f) ||
+            !nearlyEqual(controllerVelocity.linearVelocity.z, 0.1f) ||
             !nearlyEqual(controllerVelocity.angularVelocity.y, 0.5f)) {
             xrDestroySession(session);
             release(context);
@@ -1624,19 +1676,19 @@ int main(int argc, char** argv) {
     }
     if (expectInjectedHeadPose()) {
         // The native daemon injects a nonzero guardian-stage position and a
-        // 90-degree yaw. LOCAL recenters only X/Z: floor height, orientation,
-        // eye rotation, and all relative tracking deltas remain unchanged.
-        if (!nearlyEqual(locatedViews[0].pose.position.x, 0.0f) ||
-            !nearlyEqual(locatedViews[1].pose.position.x, 0.0f) ||
+        // 90-degree yaw. The initial LOCAL origin centers both horizontal
+        // position and yaw while preserving Quest floor height.
+        if (!nearlyEqual(locatedViews[0].pose.position.x, -0.032f) ||
+            !nearlyEqual(locatedViews[1].pose.position.x, 0.032f) ||
             !nearlyEqual(locatedViews[0].fov.angleLeft, -0.85f) ||
             !nearlyEqual(locatedViews[0].fov.angleRight, 0.75f) ||
             !nearlyEqual(locatedViews[1].fov.angleLeft, -0.75f) ||
             !nearlyEqual(locatedViews[1].fov.angleRight, 0.85f) ||
             !nearlyEqual(locatedViews[0].pose.position.y, 1.5f) ||
-            !nearlyEqual(locatedViews[0].pose.position.z, 0.032f) ||
-            !nearlyEqual(locatedViews[1].pose.position.z, -0.032f) ||
-            !nearlyEqual(locatedViews[0].pose.orientation.y, 0.707106781f) ||
-            !nearlyEqual(locatedViews[0].pose.orientation.w, 0.707106781f)) {
+            !nearlyEqual(locatedViews[0].pose.position.z, 0.0f) ||
+            !nearlyEqual(locatedViews[1].pose.position.z, 0.0f) ||
+            !nearlyEqual(locatedViews[0].pose.orientation.y, 0.0f) ||
+            !nearlyEqual(locatedViews[0].pose.orientation.w, 1.0f)) {
             xrDestroySession(session);
             release(context);
             release(device);
@@ -1644,11 +1696,95 @@ int main(int argc, char** argv) {
             return fail("xrLocateViews(live head pose)", XR_ERROR_VALIDATION_FAILURE);
         }
 
+        // Ask the native daemon to turn the injected head another 90 degrees
+        // and hold the Quest right-system button. Basalt must recenter LOCAL,
+        // notify the application, and expose the current leveled head as the
+        // new forward origin without losing floor height.
+        vibration.amplitude = 0.375f;
+        result = xrApplyHapticFeedback(
+            session, &hapticInfo,
+            reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+        XrEventDataReferenceSpaceChangePending recenterEvent{};
+        bool receivedRecenter = false;
+        for (int attempt = 0; XR_SUCCEEDED(result) && attempt < 100; ++attempt) {
+            XrEventDataBuffer eventData{};
+            eventData.type = XR_TYPE_EVENT_DATA_BUFFER;
+            const XrResult eventResult = xrPollEvent(instance, &eventData);
+            if (eventResult == XR_EVENT_UNAVAILABLE) {
+                Sleep(20);
+                continue;
+            }
+            if (XR_FAILED(eventResult) ||
+                eventData.type != XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+                result = XR_ERROR_RUNTIME_FAILURE;
+                break;
+            }
+            recenterEvent = *reinterpret_cast<
+                const XrEventDataReferenceSpaceChangePending*>(&eventData);
+            receivedRecenter = true;
+            break;
+        }
+        if (XR_FAILED(result) || !receivedRecenter ||
+            recenterEvent.session != session ||
+            recenterEvent.referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL ||
+            recenterEvent.changeTime <= 0 || recenterEvent.poseValid != XR_TRUE ||
+            !nearlyEqual(recenterEvent.poseInPreviousSpace.position.x, -0.25f) ||
+            !nearlyEqual(recenterEvent.poseInPreviousSpace.position.y, 0.0f) ||
+            !nearlyEqual(recenterEvent.poseInPreviousSpace.position.z, 0.25f) ||
+            !nearlyEqual(recenterEvent.poseInPreviousSpace.orientation.y, 0.707106781f) ||
+            !nearlyEqual(recenterEvent.poseInPreviousSpace.orientation.w, 0.707106781f)) {
+            xrDestroySession(session);
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            return fail("Quest reset-view reference-space event", result);
+        }
+
+        // The change is time-bounded: an in-flight locate from just before
+        // changeTime must still use the previous LOCAL definition.
+        viewLocateInfo.displayTime = recenterEvent.changeTime - 1;
+        result = xrLocateViews(
+            session, &viewLocateInfo, &viewState, 2, &viewCount, locatedViews);
+        if (XR_FAILED(result) || viewState.viewStateFlags != kTrackedViewFlags ||
+            !nearlyEqual(locatedViews[0].pose.position.x, -0.25f) ||
+            !nearlyEqual(locatedViews[1].pose.position.x, -0.25f) ||
+            !nearlyEqual(locatedViews[0].pose.position.y, 1.5f) ||
+            !nearlyEqual(locatedViews[0].pose.position.z, 0.282f) ||
+            !nearlyEqual(locatedViews[1].pose.position.z, 0.218f) ||
+            !nearlyEqual(locatedViews[0].pose.orientation.y, 0.707106781f) ||
+            !nearlyEqual(locatedViews[0].pose.orientation.w, 0.707106781f)) {
+            xrDestroySession(session);
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            return fail("xrLocateViews(before Quest reset changeTime)", result);
+        }
+
+        viewLocateInfo.displayTime = recenterEvent.changeTime + 1;
+        result = xrLocateViews(
+            session, &viewLocateInfo, &viewState, 2, &viewCount, locatedViews);
+        if (XR_FAILED(result) || viewState.viewStateFlags != kTrackedViewFlags ||
+            !nearlyEqual(locatedViews[0].pose.position.x, -0.032f) ||
+            !nearlyEqual(locatedViews[1].pose.position.x, 0.032f) ||
+            !nearlyEqual(locatedViews[0].pose.position.y, 1.5f) ||
+            !nearlyEqual(locatedViews[0].pose.position.z, 0.0f) ||
+            !nearlyEqual(locatedViews[0].pose.orientation.y, 0.0f) ||
+            !nearlyEqual(locatedViews[0].pose.orientation.w, 1.0f)) {
+            xrDestroySession(session);
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            return fail("xrLocateViews(after Quest reset)", result);
+        }
+        std::puts("PASS: Quest reset view recenters LOCAL yaw/position and emits event");
+
         referenceSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
         XrSpace trackedViewSpace = XR_NULL_HANDLE;
         result = xrCreateReferenceSpace(session, &referenceSpaceInfo, &trackedViewSpace);
         if (XR_SUCCEEDED(result)) {
-            result = xrLocateSpace(trackedViewSpace, localSpace, locateTime, &location);
+            result = xrLocateSpace(
+                trackedViewSpace, localSpace,
+                recenterEvent.changeTime + 1, &location);
         }
         constexpr XrSpaceLocationFlags kTrackedSpaceFlags =
             XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
@@ -1659,8 +1795,8 @@ int main(int argc, char** argv) {
             !nearlyEqual(location.pose.position.x, 0.0f) ||
             !nearlyEqual(location.pose.position.y, 1.5f) ||
             !nearlyEqual(location.pose.position.z, 0.0f) ||
-            !nearlyEqual(location.pose.orientation.y, 0.707106781f) ||
-            !nearlyEqual(location.pose.orientation.w, 0.707106781f)) {
+            !nearlyEqual(location.pose.orientation.y, 0.0f) ||
+            !nearlyEqual(location.pose.orientation.w, 1.0f)) {
             xrDestroySession(session);
             release(context);
             release(device);
@@ -1675,11 +1811,21 @@ int main(int argc, char** argv) {
             xrDestroyInstance(instance);
             return fail("xrDestroySpace(tracked VIEW)", result);
         }
-        Sleep(600);
-        viewState.viewStateFlags = kTrackedViewFlags;
-        result = xrLocateViews(
-            session, &viewLocateInfo, &viewState, 0, &viewCount, nullptr);
-        if (XR_FAILED(result) || viewState.viewStateFlags != 0) {
+        // The daemon keeps publishing head poses until it releases the reset
+        // button, so poll for the 500 ms freshness window to lapse after that
+        // instead of assuming how long the hold outlasts the recenter event.
+        bool headPoseStale = false;
+        for (int attempt = 0; XR_SUCCEEDED(result) && attempt < 100; ++attempt) {
+            Sleep(20);
+            viewState.viewStateFlags = kTrackedViewFlags;
+            result = xrLocateViews(
+                session, &viewLocateInfo, &viewState, 0, &viewCount, nullptr);
+            if (XR_SUCCEEDED(result) && viewState.viewStateFlags == 0) {
+                headPoseStale = true;
+                break;
+            }
+        }
+        if (XR_FAILED(result) || !headPoseStale) {
             xrDestroySession(session);
             release(context);
             release(device);

@@ -48,6 +48,62 @@ final class BottleManagerTests: XCTestCase {
 
         XCTAssertEqual(result.status, 0)
         XCTAssertEqual(result.output, "\(prefix.path)|--kill|--wait")
+
+        try manager.prepare()
+        let bottleDirectory = try manager.paths.bottleDirectory("Test")
+        let managedPrefix = bottleDirectory.appendingPathComponent(
+            "prefix", isDirectory: true)
+        let managedEngine = bottleDirectory.appendingPathComponent(
+            "engine", isDirectory: true)
+        let managedBin = managedEngine.appendingPathComponent(
+            "bin", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: managedPrefix, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: managedBin, withIntermediateDirectories: true)
+        let managedWine = managedBin.appendingPathComponent("wine")
+        let managedWineserver = managedBin.appendingPathComponent("wineserver")
+        try FileManager.default.copyItem(at: wine, to: managedWine)
+        try FileManager.default.copyItem(at: wineserver, to: managedWineserver)
+        let engine = BottleEngine(
+            id: "test", kind: .pinned,
+            wineBinary: managedWine, wineserverBinary: managedWineserver,
+            root: managedEngine,
+            supportsBasaltDXMT: true)
+        let bottle = ManagedBottle(
+            name: "Test", engine: engine, prefix: managedPrefix,
+            engineRoot: managedEngine,
+            wineBinary: managedWine)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(bottle).write(
+            to: bottleDirectory.appendingPathComponent("bottle.json"))
+        try manager.saveProfile(LaunchProfile(
+            name: "game", bottleName: "Test", source: .direct,
+            executable: #"C:\Games\Game.exe"#))
+
+        let profileResult = try manager.terminateBottleProcesses(
+            forProfile: "game")
+
+        XCTAssertEqual(profileResult.status, 0)
+        XCTAssertEqual(profileResult.output, "\(managedPrefix.path)|--kill|--wait")
+
+        // Wine reports "no server for this prefix" as status 1 with no
+        // diagnostic. Cleanup is already complete in that case.
+        try Data("#!/bin/sh\nexit 1\n".utf8).write(to: wineserver)
+        let inactiveResult = try manager.terminateBottleProcesses(
+            launchedWith: command)
+        XCTAssertEqual(inactiveResult, CommandOutput(status: 0, output: ""))
+
+        try Data("#!/bin/sh\nprintf 'permission denied\\n' >&2\nexit 1\n".utf8)
+            .write(to: wineserver)
+        XCTAssertThrowsError(try manager.terminateBottleProcesses(
+            launchedWith: command)) { error in
+            XCTAssertEqual(
+                error as? BottleToolError,
+                BottleToolError(
+                    "Could not stop Wine processes for \(prefix.path): permission denied"))
+        }
     }
 
     func testBottleNamesRejectTraversalAndWhitespace() throws {
@@ -553,5 +609,112 @@ final class BottleManagerTests: XCTestCase {
             bottleName: "Test", executable: #"C:\steam.exe"#, arguments: ["-silent"])
         XCTAssertEqual(command.arguments, [#"C:\steam.exe"#, "-silent"])
         XCTAssertEqual(command.environment["WINEPREFIX"], prefix.path)
+    }
+
+    func testReadsActiveOpenXRRuntimeFromWineHive() {
+        let hive = #"""
+            WINE REGISTRY Version 2
+            ;; All keys relative to REGISTRY\\Machine
+
+            [Software\\Khronos\\OpenXR\\1] 1784710400
+            #time=1dd19b78b874098
+            "ActiveRuntime"="C:\\basalt\\runtime\\basalt_openxr.json"
+
+            [Software\\Khronos\\Vulkan\\Drivers] 1749700164
+            "C:\\windows\\system32\\winevulkan.json"=dword:00000000
+            """#
+        XCTAssertEqual(
+            BottleManager.activeOpenXRRuntime(inHive: Data(hive.utf8)),
+            BottleManager.runtimeManifestWindowsPath)
+        XCTAssertEqual(
+            BottleManager.activeOpenXRRuntime(inHive: Data(hive.replacingOccurrences(
+                of: #"C:\\basalt\\runtime\\basalt_openxr.json"#,
+                with: #"C:\\Program Files\\SteamVR\\steamxr_win64.json"#).utf8)),
+            #"C:\Program Files\SteamVR\steamxr_win64.json"#)
+        XCTAssertNil(BottleManager.activeOpenXRRuntime(inHive: Data(hive.replacingOccurrences(
+            of: "OpenXR", with: "OpenVR").utf8)))
+        // Key names are case-insensitive.
+        XCTAssertEqual(
+            BottleManager.activeOpenXRRuntime(inHive: Data(hive.replacingOccurrences(
+                of: "Software", with: "SOFTWARE").utf8)),
+            BottleManager.runtimeManifestWindowsPath)
+    }
+
+    func testRuntimeSyncSkipsWineWhenTheBottleIsCurrent() throws {
+        let temporary = try temporaryDirectory()
+        let bin = temporary.appendingPathComponent("runtime/build/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        try Data("dll-v1".utf8).write(to: bin.appendingPathComponent("basalt_openxr.dll"))
+        try Data("{}".utf8).write(to: bin.appendingPathComponent("basalt_openxr.json"))
+
+        let manager = BottleManager(
+            root: temporary.appendingPathComponent("data"), repoRoot: temporary)
+        try manager.prepare()
+        let directory = try manager.paths.bottleDirectory("Test")
+        let prefix = directory.appendingPathComponent("prefix", isDirectory: true)
+        let engine = directory.appendingPathComponent("engine", isDirectory: true)
+        let wine = engine.appendingPathComponent("bin/wine")
+        try FileManager.default.createDirectory(at: prefix, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: wine.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // Records each Wine start; registration is the only one here.
+        try Data("#!/bin/sh\necho \"$@\" >> \"$WINEPREFIX/wine-calls\"\n".utf8).write(to: wine)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: wine.path)
+        let bottle = ManagedBottle(
+            name: "Test",
+            engine: BottleEngine(
+                id: "test", kind: .pinned, wineBinary: wine,
+                wineserverBinary: engine.appendingPathComponent("bin/wineserver"),
+                root: engine, supportsBasaltDXMT: true),
+            prefix: prefix, engineRoot: engine, wineBinary: wine)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(bottle).write(to: directory.appendingPathComponent("bottle.json"))
+        func wineStarts() -> Int {
+            ((try? String(contentsOf: prefix.appendingPathComponent("wine-calls")))?
+                .split(separator: "\n").count) ?? 0
+        }
+
+        // A first sync registers even without a hive.
+        XCTAssertTrue(try manager.syncRuntime(in: "Test").runtimeInstalled)
+        XCTAssertEqual(wineStarts(), 1)
+
+        // Wine flushed the registration; an unchanged bottle needs no Wine.
+        try Data(#"""
+
+            [Software\\Khronos\\OpenXR\\1] 1784710400
+            "ActiveRuntime"="C:\\basalt\\runtime\\basalt_openxr.json"
+
+            """#.utf8).write(to: prefix.appendingPathComponent("system.reg"))
+        try manager.syncRuntime(in: "Test")
+        XCTAssertEqual(wineStarts(), 1)
+
+        // A rebuilt DLL is still copied without re-registering.
+        try Data("dll-v2".utf8).write(to: bin.appendingPathComponent("basalt_openxr.dll"))
+        try manager.syncRuntime(in: "Test")
+        XCTAssertEqual(wineStarts(), 1)
+        XCTAssertEqual(try String(contentsOf: prefix.appendingPathComponent(
+            "drive_c/basalt/runtime/basalt_openxr.dll")), "dll-v2")
+
+        // Another runtime took over, and Prepare always re-registers.
+        try Data(#"""
+
+            [Software\\Khronos\\OpenXR\\1] 1784710400
+            "ActiveRuntime"="C:\\SteamVR\\steamxr_win64.json"
+
+            """#.utf8).write(to: prefix.appendingPathComponent("system.reg"))
+        try manager.syncRuntime(in: "Test")
+        XCTAssertEqual(wineStarts(), 2)
+        _ = try manager.installRuntime(in: "Test")
+        XCTAssertEqual(wineStarts(), 3)
+    }
+
+    private func temporaryDirectory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "BasaltBottleKitTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
     }
 }

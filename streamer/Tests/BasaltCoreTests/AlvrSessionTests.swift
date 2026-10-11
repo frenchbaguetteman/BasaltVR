@@ -88,6 +88,15 @@ final class AlvrSessionTests: XCTestCase {
         XCTAssertEqual(settings.bufferingHistoryWeight, 0.8)
     }
 
+    func testUltraLatencyPresetMinimizesBufferAndHistory() throws {
+        let settings = try AlvrNegotiatedSettings.desktopPreviewDefaults(
+            for: quest, requestedWidth: 1_152, requestedHeight: 1_216,
+            preferredRefreshRate: 90, latencyPreset: .ultra)
+        XCTAssertEqual(settings.refreshRate, 90)
+        XCTAssertEqual(settings.maximumBufferingFrames, 1.0)
+        XCTAssertEqual(settings.bufferingHistoryWeight, 0.5)
+    }
+
     func testRejectsResolutionAboveHeadsetCapabilitiesOrOddDimensions() throws {
         XCTAssertNoThrow(try AlvrNegotiatedSettings.desktopPreviewDefaults(
             for: quest, requestedWidth: 1_680, requestedHeight: 1_760,

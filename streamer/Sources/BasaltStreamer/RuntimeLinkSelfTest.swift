@@ -99,7 +99,8 @@ enum RuntimeLinkSelfTest {
                       "(\(swapchain.width)x\(swapchain.height), " +
                       "\(swapchain.surfaces.count) IOSurfaces)")
             }
-            link.onFrame = { frame in
+            link.onFrame = { frame, consumption in
+                defer { consumption.complete() }
                 guard let view = frame.views.first else { return }
                 let width = IOSurfaceGetWidth(view.surface)
                 let height = IOSurfaceGetHeight(view.surface)
@@ -134,6 +135,9 @@ enum RuntimeLinkSelfTest {
             }
             link.onTeardown = {
                 state.withLock { $0.tornDown = true }
+            }
+            link.onProtocolError = { reason in
+                state.withLock { $0.failure = "runtime connection refused: \(reason)" }
             }
             try await link.start()
             print("runtime-link: control file ready at \(controlFile)")

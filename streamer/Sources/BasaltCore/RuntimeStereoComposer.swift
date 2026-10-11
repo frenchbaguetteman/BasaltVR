@@ -7,6 +7,32 @@ import Metal
 /// desktop using IPD/FOV calibration), each game image already bakes its
 /// eye's projection, so each one simply fills its half of the output.
 public final class RuntimeStereoComposer: @unchecked Sendable {
+    /// Keeps a preallocated compositor output unavailable until its downstream
+    /// consumer (VideoToolbox in production) has finished with it.
+    public final class ComposedFrame: @unchecked Sendable {
+        fileprivate let output: Output
+        private weak var composer: RuntimeStereoComposer?
+
+        public var pixelBuffer: CVPixelBuffer { output.pixelBuffer }
+
+        fileprivate init(output: Output, composer: RuntimeStereoComposer) {
+            self.output = output
+            self.composer = composer
+        }
+
+        deinit { composer?.recycle(output) }
+    }
+
+    /// A preallocated output and its Metal view, both made once at init.
+    fileprivate struct Output {
+        let pixelBuffer: CVPixelBuffer
+        /// Keeps `texture` valid; the texture cache does not retain it.
+        let cvTexture: CVMetalTexture
+        let texture: MTLTexture
+    }
+
+    public static let maximumFramesInFlight = 2
+
     public let perEyeWidth: Int
     public let height: Int
     public var outputWidth: Int { perEyeWidth * 2 }
@@ -14,7 +40,11 @@ public final class RuntimeStereoComposer: @unchecked Sendable {
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
     private let textureCache: CVMetalTextureCache
-    private let pool: CVPixelBufferPool
+    private let completionQueue = DispatchQueue(
+        label: "basalt.runtime-stereo-composer.completions")
+    private let outputLock = NSLock()
+    /// Preallocated outputs not currently in composition or downstream use.
+    private var availableOutputs: [Output] = []
 
     public init(perEyeWidth: Int, height: Int) throws {
         guard perEyeWidth > 0, height > 0 else {
@@ -78,53 +108,72 @@ public final class RuntimeStereoComposer: @unchecked Sendable {
         }
         self.textureCache = textureCache
 
+        // The fixed outputs below are the reuse mechanism, so they are
+        // created directly rather than drawn from a pixel-buffer pool.
         let attributes: [CFString: Any] = [
-            kCVPixelBufferWidthKey: perEyeWidth * 2,
-            kCVPixelBufferHeightKey: height,
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
             kCVPixelBufferMetalCompatibilityKey: true,
             kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
         ]
-        var maybePool: CVPixelBufferPool?
-        let status = CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &maybePool)
-        guard status == kCVReturnSuccess, let pool = maybePool else {
-            throw BasaltError("CVPixelBufferPoolCreate failed (\(status))")
+        for _ in 0..<Self.maximumFramesInFlight {
+            var maybeOutput: CVPixelBuffer?
+            let outputStatus = CVPixelBufferCreate(
+                nil, perEyeWidth * 2, height, kCVPixelFormatType_32BGRA,
+                attributes as CFDictionary, &maybeOutput)
+            guard outputStatus == kCVReturnSuccess, let output = maybeOutput else {
+                throw BasaltError(
+                    "Could not preallocate stereo compositor output (\(outputStatus))")
+            }
+            guard let (cvTexture, texture) = Self.metalTexture(for: output, in: textureCache) else {
+                throw BasaltError("Could not create a Metal view of the compositor output")
+            }
+            availableOutputs.append(
+                Output(pixelBuffer: output, cvTexture: cvTexture, texture: texture))
         }
-        self.pool = pool
     }
 
-    /// Scales each eye to fill its half. Source dimensions may vary per call
-    /// (they follow the game's swapchain size).
-    public func compose(left: CVPixelBuffer, right: CVPixelBuffer) -> CVPixelBuffer? {
-        var maybeOutput: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &maybeOutput) == kCVReturnSuccess,
-              let output = maybeOutput else { return nil }
-
-        func metalTexture(_ buffer: CVPixelBuffer) -> (CVMetalTexture, MTLTexture)? {
-            var maybeTexture: CVMetalTexture?
-            let status = CVMetalTextureCacheCreateTextureFromImage(
-                nil, textureCache, buffer, nil, .bgra8Unorm,
-                CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer),
-                0, &maybeTexture)
-            guard status == kCVReturnSuccess,
-                  let cvTexture = maybeTexture,
-                  let texture = CVMetalTextureGetTexture(cvTexture) else {
-                return nil
-            }
-            return (cvTexture, texture)
+    private static func metalTexture(
+        for buffer: CVPixelBuffer, in cache: CVMetalTextureCache
+    ) -> (CVMetalTexture, MTLTexture)? {
+        var maybeTexture: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(
+            nil, cache, buffer, nil, .bgra8Unorm,
+            CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer),
+            0, &maybeTexture)
+        guard status == kCVReturnSuccess,
+              let cvTexture = maybeTexture,
+              let texture = CVMetalTextureGetTexture(cvTexture) else {
+            return nil
         }
+        return (cvTexture, texture)
+    }
 
-        guard let leftTexture = metalTexture(left),
-              let rightTexture = metalTexture(right),
-              let outputTexture = metalTexture(output),
+    /// Scales each eye to fill its half without blocking the runtime-link
+    /// receive queue. At most two output surfaces can be in composition or
+    /// downstream encoding at once; callers drop a new frame when this method
+    /// returns false instead of extending latency.
+    ///
+    /// `completion` runs in command-buffer order after Metal has finished
+    /// reading both source IOSurfaces. Retain the returned `ComposedFrame`
+    /// until the encoder callback fires so its preallocated output slot cannot
+    /// be overwritten while VideoToolbox is still consuming it.
+    @discardableResult
+    public func composeAsync(
+        left: CVPixelBuffer,
+        right: CVPixelBuffer,
+        completion: @escaping @Sendable (ComposedFrame?) -> Void
+    ) -> Bool {
+        guard let output = reserveOutput() else { return false }
+        guard let leftTexture = Self.metalTexture(for: left, in: textureCache),
+              let rightTexture = Self.metalTexture(for: right, in: textureCache),
               let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
-            return nil
+            recycle(output)
+            return false
         }
         encoder.setComputePipelineState(pipeline)
         encoder.setTexture(leftTexture.1, index: 0)
         encoder.setTexture(rightTexture.1, index: 1)
-        encoder.setTexture(outputTexture.1, index: 2)
+        encoder.setTexture(output.texture, index: 2)
         let threadWidth = pipeline.threadExecutionWidth
         let threadHeight = max(
             1, pipeline.maxTotalThreadsPerThreadgroup / threadWidth)
@@ -133,9 +182,39 @@ public final class RuntimeStereoComposer: @unchecked Sendable {
             threadsPerThreadgroup: MTLSize(
                 width: threadWidth, height: threadHeight, depth: 1))
         encoder.endEncoding()
+        // CVMetalTextureCacheCreateTextureFromImage requires callers to keep
+        // each CVMetalTexture alive until the GPU finishes with it; the system
+        // does not retain it. Hold the source wrappers and buffers until then;
+        // the reserved output stays alive through `output`.
+        let gpuResources = (left, right, leftTexture.0, rightTexture.0)
+        commandBuffer.addCompletedHandler { [weak self] buffer in
+            withExtendedLifetime(gpuResources) {}
+            guard let self else {
+                completion(nil)
+                return
+            }
+            self.completionQueue.async {
+                guard buffer.status == .completed else {
+                    self.recycle(output)
+                    completion(nil)
+                    return
+                }
+                completion(ComposedFrame(output: output, composer: self))
+            }
+        }
         commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        guard commandBuffer.status == .completed else { return nil }
-        return output
+        return true
+    }
+
+    private func reserveOutput() -> Output? {
+        outputLock.lock()
+        defer { outputLock.unlock() }
+        return availableOutputs.popLast()
+    }
+
+    fileprivate func recycle(_ output: Output) {
+        outputLock.lock()
+        availableOutputs.append(output)
+        outputLock.unlock()
     }
 }

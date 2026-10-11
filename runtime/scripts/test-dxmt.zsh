@@ -4,6 +4,7 @@ set -euo pipefail
 
 script_dir=${0:A:h}
 runtime_dir=${script_dir:h}
+repo_dir=${runtime_dir:h}
 build_dir=${BUILD_DIR:-${runtime_dir}/build}
 toolchain_file=${runtime_dir}/cmake/toolchains/mingw-x86_64.cmake
 
@@ -150,10 +151,63 @@ if [[ -d ${system32} ]]; then
     done
 fi
 
+fork_overlay_active=false
 cleanup() {
+    if [[ -n ${control_peer_pid:-} ]]; then
+        kill ${control_peer_pid} 2>/dev/null || true
+    fi
     WINEPREFIX=${wine_prefix} "${wine_root}/bin/wineserver" -k >/dev/null 2>&1 || true
+    # A failing fork-phase step exits under `set -e`; never leave the shared
+    # Wine tree and prefix on the fork overlay.
+    if [[ ${fork_overlay_active} == true ]]; then
+        overlay_dxmt "${dxmt_root}/x86_64-windows" "${dxmt_root}/x86_64-unix"
+        fork_overlay_active=false
+    fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+# One control-socket gate: start a native peer that publishes a control file,
+# run the OpenXR smoke against it, and fail with the peer's log if either side
+# fails. Usage: run_control_gate <label> [SMOKE_ENV=value...] -- <peer command>
+# The peer receives --control-file <path> after its own arguments.
+run_control_gate() {
+    local label=$1
+    shift
+    local -a smoke_env
+    while [[ $1 != -- ]]; do
+        smoke_env+=("$1")
+        shift
+    done
+    shift
+    local control_file=${probe_dir}/control-file.$$
+    local peer_out=${probe_dir}/control-peer-out.$$
+    rm -f "${control_file}" "${peer_out}"
+    "$@" --control-file "${control_file}" > "${peer_out}" 2>&1 &
+    control_peer_pid=$!
+    for _ in {1..100}; do
+        if [[ -s ${control_file} ]]; then
+            break
+        fi
+        sleep 0.1
+    done
+    local smoke_status=0 peer_status=0
+    env WINEPREFIX=${wine_prefix} WINEDEBUG=-all MVK_CONFIG_LOG_LEVEL=0 \
+        DXMT_BASALT_IOSURFACE=1 BASALT_EXPECT_IOSURFACE=1 "${smoke_env[@]}" \
+        BASALT_CONTROL="Z:${control_file//\//\\}" \
+        "${wine_root}/bin/wine" ./d3d11_runtime_smoke.exe || smoke_status=$?
+    # Report the peer's side too: a smoke failure alone hides whether the
+    # peer saw the handshake, frames, or teardown.
+    wait ${control_peer_pid} || peer_status=$?
+    control_peer_pid=
+    if (( smoke_status != 0 || peer_status != 0 )); then
+        print -u2 "FAIL: ${label} gate (smoke ${smoke_status}, peer ${peer_status})"
+        cat "${peer_out}" >&2 || true
+        exit 1
+    fi
+    grep '^PASS' "${peer_out}"
+    rm -f "${control_file}" "${peer_out}"
+}
 
 pushd "${probe_dir}" >/dev/null
 WINEPREFIX=${wine_prefix} \
@@ -203,7 +257,13 @@ if [[ -f ${fork_install}/x86_64-windows/d3d11.dll && -f ${fork_install}/x86_64-u
         done
         cp "${source_unix}/winemetal.so" "${wine_root}/lib/wine/x86_64-unix/winemetal.so"
     }
+    # Build the production streamer before touching the Wine tree so a Swift
+    # failure cannot strand the fork overlay.
+    swift build --package-path "${repo_dir}/streamer" --product basalt-streamer
+    streamer_bin=$(swift build --package-path "${repo_dir}/streamer" --show-bin-path)/basalt-streamer
+
     system32=${wine_prefix}/drive_c/windows/system32
+    fork_overlay_active=true
     overlay_dxmt "${fork_install}/x86_64-windows" "${fork_install}/x86_64-unix"
 
     # Fork with the gate off must be indistinguishable from stock.
@@ -275,33 +335,23 @@ if [[ -f ${fork_install}/x86_64-windows/d3d11.dll && -f ${fork_install}/x86_64-u
     cc -O2 -Wall -Wextra -framework IOSurface -framework CoreFoundation \
         -o "${probe_dir}/basalt_control_test_daemon" \
         "${runtime_dir}/tests/native/basalt_control_test_daemon.c"
-    control_file=${probe_dir}/control-file.$$
-    daemon_out=${probe_dir}/daemon-out.$$
-    rm -f "${control_file}" "${daemon_out}"
-    "${probe_dir}/basalt_control_test_daemon" --control-file "${control_file}" \
-        --expect-frames 21 --verify-clears > "${daemon_out}" 2>&1 &
-    control_daemon_pid=$!
-    for _ in {1..100}; do
-        if [[ -s ${control_file} ]]; then
-            break
-        fi
-        sleep 0.1
-    done
-    WINEPREFIX=${wine_prefix} WINEDEBUG=-all MVK_CONFIG_LOG_LEVEL=0 \
-    DXMT_BASALT_IOSURFACE=1 BASALT_EXPECT_IOSURFACE=1 BASALT_EXPECT_HEAD_POSE=1 \
-    BASALT_CONTROL="Z:${control_file//\//\\}" \
-        "${wine_root}/bin/wine" ./d3d11_runtime_smoke.exe
-    if ! wait ${control_daemon_pid}; then
-        print -u2 "FAIL: control daemon validation failed"
-        cat "${daemon_out}" >&2 || true
-        exit 1
-    fi
-    grep '^PASS' "${daemon_out}"
-    rm -f "${control_file}" "${daemon_out}"
+    run_control_gate "control-socket" \
+        BASALT_EXPECT_HEAD_POSE=1 \
+        BASALT_EXPECT_VIEW_WIDTH=1152 BASALT_EXPECT_VIEW_HEIGHT=1216 -- \
+        "${probe_dir}/basalt_control_test_daemon" \
+        --expect-frames 21 --verify-clears --frame-delay-ms 25 \
+        --view-width 1152 --view-height 1216
+
+    # The production streamer's RuntimeLink, not just the C test daemon, must
+    # complete the same handshake, swapchain registration, ordered
+    # FrameConsumed acknowledgements, and H.264 encode against this runtime.
+    run_control_gate "streamer RuntimeLink" -- \
+        "${streamer_bin}" runtime-link-selftest --frames 21 --timeout 90
 
     # Leave the generated Wine tree and prefix on the pinned stock overlay.
     overlay_dxmt "${dxmt_root}/x86_64-windows" "${dxmt_root}/x86_64-unix"
-    print "PASS: Basalt DXMT fork gate (IOSurface IDs, native readback, control-socket FrameReady)"
+    fork_overlay_active=false
+    print "PASS: Basalt DXMT fork gate (IOSurface IDs, native readback, control-socket FrameReady, streamer RuntimeLink)"
 else
     print "NOTE: fork phase skipped; run runtime/scripts/build-dxmt-fork.zsh to enable it"
 fi

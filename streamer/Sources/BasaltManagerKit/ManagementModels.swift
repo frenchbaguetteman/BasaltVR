@@ -551,9 +551,7 @@ public struct DiscoveredBottle: Identifiable, Equatable, Sendable {
     }
 
     public var isManaged: Bool { managed != nil }
-    public var isReadyForVR: Bool {
-        managed?.dxmtInstalled == true && managed?.runtimeInstalled == true
-    }
+    public var isReadyForVR: Bool { managed?.isReadyForVR == true }
 }
 
 public struct ExternalBottleDiscovery: @unchecked Sendable {
@@ -787,12 +785,23 @@ public enum ResolutionSelection: String, Codable, CaseIterable, Sendable {
     case balanced
     case quality
 
-    public var label: String {
+    /// The per-eye size `basalt-streamer --resolution <rawValue>` uses.
+    public var perEyeResolution: PerEyeResolution {
         switch self {
-        case .performance: return "Performance · 896 × 944"
-        case .balanced: return "Balanced · 1152 × 1216"
-        case .quality: return "Quality · 1344 × 1408"
+        case .performance: return .performance
+        case .balanced: return .balanced
+        case .quality: return .quality
         }
+    }
+
+    /// "1344 × 1408"
+    public var dimensions: String {
+        "\(perEyeResolution.width) × \(perEyeResolution.height)"
+    }
+
+    /// "Quality · 1344 × 1408"
+    public var label: String {
+        "\(rawValue.prefix(1).uppercased())\(rawValue.dropFirst()) · \(dimensions)"
     }
 }
 
@@ -849,30 +858,24 @@ public struct StreamMetricSample: Identifiable, Equatable, Sendable {
 }
 
 public enum StreamLogMetricsParser {
+    /// A dashboard sample from one streamer report line (`StreamReport`).
     public static func parse(line: String, date: Date = Date()) -> StreamMetricSample? {
-        // The dashboard card is explicitly Quest FPS. Transport and local
-        // encoder reports also contain "fps", but mixing those independent
-        // series made a healthy sender obscure a slowing headset (and drew
-        // artificial sawteeth in the chart).
-        let fps = line.contains("Quest ")
-            ? capture(#"([0-9]+(?:\.[0-9]+)?) fps"#, in: line) : nil
-        let megabits = capture(#"([0-9]+(?:\.[0-9]+)?) Mbps"#, in: line)
-        var latency: Double?
-        if line.contains("input→display latency") {
-            latency = capture(#"latency: ([0-9]+(?:\.[0-9]+)?) ms"#, in: line)
-        }
-        guard fps != nil || megabits != nil || latency != nil else { return nil }
+        guard let values = StreamReport.parse(line) else { return nil }
         return StreamMetricSample(
-            date: date, fps: fps, megabits: megabits,
-            latencyMilliseconds: latency)
+            date: date, fps: values.questFPS, megabits: values.videoMegabits,
+            latencyMilliseconds: values.latencyMilliseconds)
     }
+}
 
-    private static func capture(_ pattern: String, in value: String) -> Double? {
-        guard let expression = try? NSRegularExpression(pattern: pattern),
-              let match = expression.firstMatch(
-                in: value, range: NSRange(value.startIndex..., in: value)),
-              let range = Range(match.range(at: 1), in: value) else { return nil }
-        return Double(value[range])
+/// Recognizes the streamer's report that it refused the game's OpenXR runtime
+/// (typically a stale bottle DLL speaking another control protocol). The game
+/// keeps running headless, so the manager must say why the headset is black.
+public enum RuntimeConnectionRefusal {
+    public static func message(in line: some StringProtocol) -> String? {
+        let value = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value.hasPrefix(RuntimeLink.connectionRefusedLogPrefix) else { return nil }
+        let reason = value.dropFirst(RuntimeLink.connectionRefusedLogPrefix.count)
+        return reason.isEmpty ? nil : "The game's OpenXR runtime was refused: \(reason)"
     }
 }
 

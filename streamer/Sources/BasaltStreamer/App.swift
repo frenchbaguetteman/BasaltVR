@@ -4,6 +4,27 @@ import CoreVideo
 import IOSurface
 import BasaltCore
 
+/// Counts a recurring event and logs only its first and every 120th
+/// occurrence, so a sustained stall cannot flood stderr.
+private final class ThrottledEventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func record(_ message: (_ count: Int) -> String) {
+        lock.lock()
+        count += 1
+        let current = count
+        lock.unlock()
+        if current == 1 || current.isMultiple(of: 120) {
+            fputs(message(current) + "\n", stderr)
+        }
+    }
+
+    func recordDroppedFrame(stage: String) {
+        record { "\(stage): dropped \($0) frame(s) to bound latency" }
+    }
+}
+
 private struct AlvrTrackingTimeoutError: LocalizedError {
     var errorDescription: String? {
         "Quest reported StreamReady but sent no tracking timestamps; "
@@ -160,18 +181,14 @@ struct BasaltStreamerApp {
         // A client joining mid-stream needs an IDR frame before it can
         // decode anything.
         server.onClientConnected = { encoder.forceKeyframe() }
-        var droppedFrames = 0
-        var runtimeWrapFailures = 0
+        let droppedFrames = ThrottledEventLog()
+        let runtimeWrapFailures = ThrottledEventLog()
         capture.onFrame = { pixelBuffer, pts in
             // Avoid spending GPU time composing a stereo frame that the
             // bounded encoder cannot accept. `encode` repeats this check
             // atomically in case a slot changes between here and submission.
             guard encoder.canAcceptFrame else {
-                droppedFrames += 1
-                if droppedFrames == 1 || droppedFrames.isMultiple(of: 120) {
-                    fputs("encoder busy: dropped \(droppedFrames) capture frame(s) to bound latency\n",
-                          stderr)
-                }
+                droppedFrames.recordDroppedFrame(stage: "encoder busy (capture)")
                 return
             }
 
@@ -183,11 +200,7 @@ struct BasaltStreamerApp {
                 frame = pixelBuffer
             }
             guard encoder.encode(frame, pts: pts) else {
-                droppedFrames += 1
-                if droppedFrames == 1 || droppedFrames.isMultiple(of: 120) {
-                    fputs("encoder busy: dropped \(droppedFrames) capture frame(s) to bound latency\n",
-                          stderr)
-                }
+                droppedFrames.recordDroppedFrame(stage: "encoder busy (capture)")
                 return
             }
         }
@@ -200,7 +213,9 @@ struct BasaltStreamerApp {
         if let controlFile = options.runtimeControlFile {
             let runtimeComposer = try RuntimeStereoComposer(
                 perEyeWidth: previewPerEyeWidth, height: previewPerEyeHeight)
-            let link = try RuntimeLink(controlFilePath: controlFile)
+            let link = try RuntimeLink(
+                controlFilePath: controlFile,
+                recommendedViewSize: options.perEyeResolution)
             link.onHello = { sessionId, renderer in
                 print("OpenXR runtime connected (session \(sessionId), \(renderer))")
                 encoder.forceKeyframe()
@@ -208,13 +223,13 @@ struct BasaltStreamerApp {
             link.onTeardown = {
                 print("OpenXR runtime disconnected")
             }
-            link.onFrame = { frame in
+            link.onProtocolError = { reason in
+                fputs(RuntimeLink.connectionRefusedLogPrefix + reason + "\n", stderr)
+            }
+            link.onFrame = { frame, consumption in
                 guard encoder.canAcceptFrame else {
-                    droppedFrames += 1
-                    if droppedFrames == 1 || droppedFrames.isMultiple(of: 120) {
-                        fputs("encoder busy: dropped \(droppedFrames) runtime frame(s) to bound latency\n",
-                              stderr)
-                    }
+                    droppedFrames.recordDroppedFrame(stage: "encoder busy (runtime)")
+                    consumption.complete()
                     return
                 }
                 func wrap(_ view: RuntimeLink.FrameView) -> CVPixelBuffer? {
@@ -222,13 +237,10 @@ struct BasaltStreamerApp {
                     let status = CVPixelBufferCreateWithIOSurface(
                         kCFAllocatorDefault, view.surface, nil, &maybeBuffer)
                     guard status == kCVReturnSuccess else {
-                        runtimeWrapFailures += 1
-                        if runtimeWrapFailures == 1 ||
-                                runtimeWrapFailures.isMultiple(of: 120) {
-                            let fourCC = IOSurfaceGetPixelFormat(view.surface)
-                            fputs("runtime IOSurface wrap failed: CVPixelBuffer status \(status), "
+                        runtimeWrapFailures.record { _ in
+                            "runtime IOSurface wrap failed: CVPixelBuffer status \(status), "
                                 + "DXGI format \(view.dxgiFormat), IOSurface fourcc "
-                                + String(format: "0x%08x", fourCC) + "\n", stderr)
+                                + String(format: "0x%08x", IOSurfaceGetPixelFormat(view.surface))
                         }
                         return nil
                     }
@@ -237,22 +249,34 @@ struct BasaltStreamerApp {
                 guard let firstView = frame.views.first,
                       let lastView = frame.views.last,
                       let left = wrap(firstView),
-                      let right = wrap(lastView),
-                      let composed = runtimeComposer.compose(left: left, right: right) else {
+                      let right = wrap(lastView) else {
+                    consumption.complete()
                     return
                 }
                 guard let pts = H264Encoder.presentationTime(
                         questTrackingTimestampNanoseconds:
                             frame.questTrackingTimestampNanoseconds) else {
                     fputs("runtime supplied an invalid Quest tracking timestamp\n", stderr)
+                    consumption.complete()
                     return
                 }
-                guard encoder.encode(composed, pts: pts) else {
-                    droppedFrames += 1
-                    if droppedFrames == 1 || droppedFrames.isMultiple(of: 120) {
-                        fputs("encoder busy: dropped \(droppedFrames) runtime frame(s) to bound latency\n",
-                              stderr)
+                let scheduled = runtimeComposer.composeAsync(left: left, right: right) {
+                    composed in
+                    // Metal has finished reading the runtime swapchains. Let
+                    // Beat Saber render its next frame before VideoToolbox
+                    // finishes with this compositor output.
+                    consumption.complete()
+                    guard let composed else { return }
+                    guard encoder.encode(
+                            composed.pixelBuffer, pts: pts,
+                            completion: { _ = composed }) else {
+                        droppedFrames.recordDroppedFrame(stage: "encoder busy (runtime)")
+                        return
                     }
+                }
+                guard scheduled else {
+                    droppedFrames.recordDroppedFrame(stage: "compositor busy (runtime)")
+                    consumption.complete()
                     return
                 }
             }
@@ -477,12 +501,9 @@ struct BasaltStreamerApp {
         videoSender.onAudioSent = { report in
             audioReporter.record(report)
         }
-        var networkDrops = 0
+        let networkDrops = ThrottledEventLog()
         videoSender.onFrameDropped = {
-            networkDrops += 1
-            if networkDrops == 1 || networkDrops.isMultiple(of: 120) {
-                fputs("ALVR network busy: dropped \(networkDrops) stale video frame(s)\n", stderr)
-            }
+            networkDrops.record { "ALVR network busy: dropped \($0) stale video frame(s)" }
         }
         videoSender.onAudioDropped = {
             audioReporter.recordDrop()
@@ -664,11 +685,13 @@ private final class HeadsetLatencyReporter: @unchecked Sendable {
         self.nextReport = .now() + .seconds(2)
         lock.unlock()
 
-        let frameRate = framesPerSecond.map { String(format: "%.1f fps; ", $0) } ?? ""
-        print("  Quest " + frameRate + "input→display latency: "
-              + String(format: "%.1f ms average, %.1f ms max", average, maximum)
-              + String(format: " (decode %.1f, decoder queue %.1f, vsync %.1f ms)",
-                       decode, decoderQueue, vsyncQueue))
+        print(StreamReport.questLine(
+            framesPerSecond: framesPerSecond,
+            averageLatencyMilliseconds: average,
+            maximumLatencyMilliseconds: maximum,
+            decodeMilliseconds: decode,
+            decoderQueueMilliseconds: decoderQueue,
+            vsyncQueueMilliseconds: vsyncQueue))
     }
 }
 
@@ -732,12 +755,14 @@ private final class VideoTransportReporter: @unchecked Sendable {
         self.nextReport = now + .seconds(2)
         lock.unlock()
 
-        print("  \(name) video send: "
-              + String(format: "%.1f fps, %.1f Mbps on wire, ",
-                       framesPerSecond, megabitsPerSecond)
-              + String(format: "%.1f ms max write, %.0f KiB largest frame, %d IDR",
-                       maximumSend, largestKilobytes, idrs)
-              + ", \(repeatedTimestamps) repeated timestamp(s)")
+        print(StreamReport.videoSendLine(
+            transport: name,
+            framesPerSecond: framesPerSecond,
+            megabitsPerSecond: megabitsPerSecond,
+            maximumWriteMilliseconds: maximumSend,
+            largestFrameKibibytes: largestKilobytes,
+            idrCount: idrs,
+            repeatedTimestamps: repeatedTimestamps))
     }
 }
 
@@ -787,10 +812,13 @@ private final class AudioTransportReporter: @unchecked Sendable {
         self.nextReport = now + .seconds(2)
         lock.unlock()
 
-        print("  \(name) audio send: "
-              + String(format: "%.1f blocks/s, %.3f Mbps PCM, %.3f Mbps wire, ",
-                       blocksPerSecond, pcmMegabits, wireMegabits)
-              + String(format: "%.1f ms max write, %d drop(s)", maximumSend, dropped))
+        print(StreamReport.audioSendLine(
+            transport: name,
+            blocksPerSecond: blocksPerSecond,
+            pcmMegabits: pcmMegabits,
+            wireMegabits: wireMegabits,
+            maximumWriteMilliseconds: maximumSend,
+            drops: dropped))
     }
 
     func recordDrop() {

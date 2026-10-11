@@ -51,17 +51,26 @@ public struct PerEyeResolution: Equatable, Codable, Sendable {
 }
 
 /// Quest decoder buffering profiles. Balanced preserves the validated
-/// baseline; low trims only 0.2 frame while retaining the same smoothing.
+/// baseline, low trims 0.2 frame, and ultra minimizes both the target and
+/// history used by the headset's decoder queue. Ultra favors latency over
+/// tolerance for uneven frame delivery.
 public enum StreamLatencyPreset: String, Codable, CaseIterable, Sendable {
+    case ultra
     case low
     case balanced
 
     public var maximumBufferingFrames: Float {
         switch self {
+        case .ultra: return 1.0
         case .low: return 1.3
         case .balanced: return 1.5
         }
     }
 
-    public var bufferingHistoryWeight: Float { 0.8 }
+    public var bufferingHistoryWeight: Float {
+        switch self {
+        case .ultra: return 0.5
+        case .low, .balanced: return 0.8
+        }
+    }
 }

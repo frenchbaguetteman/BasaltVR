@@ -115,8 +115,13 @@ Phase 1 — **CPU-confirmed, no fork sync changes, no SPI**: the runtime creates
 `encodeSignalEvent` on DXMT's queue and flushes — `d3d11_context_imm.cpp:595-605`), then
 `SetEventOnCompletion(frameNumber, event)` (bridged to a Win32 event via DXMT's existing
 `MTLSharedEventListener` machinery, `winemetal_unix.c:2439-2530`). A runtime thread waits the
-event and only then sends `FrameReady` over the control socket. Costs one CPU wakeup
-(~sub-millisecond) of added signal latency; correct by construction.
+event and only then sends `FrameReady` over the control socket. The daemon schedules Metal
+composition asynchronously and replies `FrameConsumed` in order after Metal finishes reading
+the source IOSurfaces. A two-frame window overlaps game rendering with compose/encode
+without allowing latency to accumulate: `xrWaitFrame` blocks while two submitted frames are
+unconsumed (an app that calls `xrWaitFrame` ahead of the previous `xrEndFrame` can have a third in
+flight, which the runtime's pending-frame ring accommodates). Costs one CPU
+wakeup (~sub-millisecond) of added signal latency; correct by construction.
 
 Verified 2026-07-18 by `dxmt_fence_probe` (now part of `test-dxmt.zsh`) under the pinned
 Wine 11.10 + DXMT v0.80 stack: the event never fires before `Signal`, fires after queued GPU
@@ -137,11 +142,15 @@ already DXMT's own mechanism, and it stays out of Phase 1.
 
 Transport: **loopback TCP** from the PE runtime (winsock) to the daemon. Wine's AF_UNIX
 support is not something the runtime should depend on; the daemon listens on `127.0.0.1`, an
-ephemeral port, and writes `<port> <token>` to a file the launcher passes to the bottle via
-environment (`BASALT_CONTROL=path`). The token (random 16 bytes, hex) must be echoed in
-`Hello` so a stray local process cannot impersonate the game.
+ephemeral port, and writes `<port> <token> <per-eye width> <per-eye height>` to a file the
+launcher passes to the bottle via environment (`BASALT_CONTROL=path`). The dimensions make
+the runtime advertise the selected stream resolution as OpenXR's recommended swapchain size,
+avoiding an expensive render-then-downscale step. Legacy two-field files fall back to
+1680×1760, which is also the maximum (`BASALT_CONTROL_MAX_VIEW_*`); `RuntimeLink` refuses a
+larger stream resolution rather than let the game render at a size the streamer does not encode. The token (random 16 bytes, hex) must be echoed in `Hello` so a stray local process
+cannot impersonate the game.
 
-Framing: little-endian, `u32 length` + `u16 message type` + payload; strict protocol version 7 in
+Framing: little-endian, `u32 length` + `u16 message type` + payload; strict protocol version 9 in
 `Hello`. Messages (runtime → daemon unless noted):
 
 | Type | Payload | Notes |
@@ -150,6 +159,7 @@ Framing: little-endian, `u32 length` + `u16 message type` + payload; strict prot
 | `CreateSwapchain` | swapchain id, width, height, DXGI format, image count, per-image `IOSurfaceID` | daemon: `IOSurfaceLookup` each ID, validate dimensions/format/plane count against the message, `CFRetain` + `IOSurfaceIncrementUseCount`, reply `SwapchainAck {generation}` |
 | `DestroySwapchain` | swapchain id | daemon releases retains, replies ack; runtime keeps D3D11 textures alive until the ack |
 | `FrameReady` | frame number, display time, exact Quest tracking timestamp used by `xrLocateViews`, layer list: {swapchain id, image index, image rect, pose, fov} per eye | sent only after the Phase-1 fence wait; daemon wraps the IOSurface in a `CVPixelBuffer`, preserves the tracking timestamp through VideoToolbox, and feeds compose→encode→ALVR |
+| `FrameConsumed` (daemon → runtime) | frame number | sent in order after asynchronous Metal composition finishes reading the source IOSurfaces; maintains a two-frame overlap window and end-to-end backpressure |
 | `HeadPose` (daemon → runtime) | Quest timestamp, quaternion xyzw, position xyz | latest normalized ALVR HMD sample; Quest timestamp orders samples but is not compared with runtime `XrTime` |
 | `ControllerMotion` (daemon → runtime) | Quest timestamp, hand, quaternion/position, linear/angular velocity | latest ALVR-corrected Touch grip sample; runtime-local receipt time gates freshness |
 | `ButtonState` (daemon → runtime) | ALVR path id, binary/scalar tag, value | sparse retained delta; `xrSyncActions` snapshots it into resolved Touch actions |
@@ -159,6 +169,11 @@ Framing: little-endian, `u32 length` + `u16 message type` + payload; strict prot
 | `ControllerMask` (daemon → runtime) | Quest tracking timestamp, active-hand bit mask (bit 0 left, bit 1 right), zero reserved field | authoritative per-packet presence; a newer missing-hand bit immediately clears that hand's pose and velocity, and only newer presence/motion can recover it |
 | `Haptic` | hand, duration, frequency, amplitude | runtime→daemon; daemon packetizes this as ALVR stream ID 1 on the serialized video socket |
 | `Teardown` | reason | either direction; daemon then drops all retains |
+
+The runtime derives its natural LOCAL origin from the first fresh `HeadPose`, centering both X/Z
+and leveled yaw while retaining Quest floor height. A 600 ms hold of the right system/Meta click
+repeats that operation and emits `XrEventDataReferenceSpaceChangePending` for LOCAL. The previous
+and new transforms straddle the event's `changeTime`, preserving frames already in flight.
 
 Lifetime rules:
 
@@ -174,7 +189,7 @@ Lifetime rules:
   swapchain ids (races with teardown are benign).
 - One runtime receiver thread owns all socket reads, publishes
   head/controller/mask/button/profile/view/reset state, and demultiplexes
-  swapchain acknowledgements to condition-variable waiters. A separate send lock keeps messages
+  swapchain/frame acknowledgements to condition-variable waiters. A separate send lock keeps messages
   from the frame waiter and request threads byte-stream atomic. This permits asynchronous tracking
   to arrive before an expected acknowledgement without corrupting protocol state.
 - OpenXR action resolution validates the exact allowlists for all nine core interaction profiles.

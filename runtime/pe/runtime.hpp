@@ -4,14 +4,26 @@
 
 #include <d3d11.h>
 
+#include <cstdint>
+
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+
+#include "basalt_control_protocol.h"
 
 namespace basalt {
 
 constexpr XrVersion kRuntimeApiVersion = XR_MAKE_VERSION(1, 0, 0);
 constexpr XrVersion kRuntimeVersion = XR_MAKE_VERSION(0, 1, 0);
 constexpr XrSystemId kSystemId = 1;
+
+// Largest per-eye render target the runtime advertises, accepts for a
+// swapchain, or takes from the streamer's configured view size.
+constexpr uint32_t kMaxViewWidth = BASALT_CONTROL_MAX_VIEW_WIDTH;
+constexpr uint32_t kMaxViewHeight = BASALT_CONTROL_MAX_VIEW_HEIGHT;
+
+// ALVR's hashed path ID for /user/hand/right/input/system/click.
+constexpr uint64_t kAlvrRightSystemClickPathId = 0x19729bd97073d474ULL;
 
 bool isValidInstance(XrInstance instance);
 bool isD3D11ExtensionEnabled(XrInstance instance);
@@ -41,6 +53,10 @@ void invalidateInputForInstance(XrInstance instance);
 
 bool isSessionFocused(XrSession session);
 void queueInteractionProfileChanged(XrSession session);
+void queueReferenceSpaceChange(
+    XrSession session,
+    XrTime changeTime,
+    const XrPosef& poseInPreviousSpace);
 bool isSpaceForSession(XrSpace space, XrSession session);
 bool isPoseWellFormed(const XrPosef& pose);
 bool getSwapchainSubmitState(

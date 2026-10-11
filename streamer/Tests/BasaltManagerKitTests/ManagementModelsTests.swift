@@ -1,6 +1,7 @@
 import XCTest
 @testable import BasaltManagerKit
 import BasaltBottleKit
+import BasaltCore
 
 final class ManagementModelsTests: XCTestCase {
     func testSteamConnectionLogUsesLatestStateAfterSnapshot() {
@@ -173,11 +174,11 @@ final class ManagementModelsTests: XCTestCase {
         settings.fps = 80
         settings.megabits = 18
         settings.resolution = .quality
-        settings.latency = .low
+        settings.latency = .ultra
         settings.audioDeviceName = "BlackHole 2ch"
         XCTAssertEqual(settings.arguments, [
             "--wired", "--fps", "80", "--mbps", "18",
-            "--resolution", "quality", "--latency", "low",
+            "--resolution", "quality", "--latency", "ultra",
             "--audio-device", "BlackHole 2ch", "--route-audio",
         ])
         settings.connection = .wifi
@@ -189,11 +190,21 @@ final class ManagementModelsTests: XCTestCase {
             line: "  USB video send: 71.9 fps, 12.4 Mbps on wire", date: date)
         XCTAssertNil(transport?.fps)
         XCTAssertEqual(transport?.megabits, 12.4)
+        XCTAssertNil(StreamLogMetricsParser.parse(
+            line: "  USB audio send: 50 packets, 1.5 Mbps on wire", date: date))
         let quest = StreamLogMetricsParser.parse(
             line: "  Quest 72.0 fps; input→display latency: 49.2 ms average", date: date)
         XCTAssertEqual(quest?.fps, 72)
         XCTAssertEqual(quest?.latencyMilliseconds, 49.2)
         XCTAssertNil(StreamLogMetricsParser.parse(line: "tracking ready", date: date))
+    }
+
+    func testResolutionPresetsMatchTheStreamerParser() throws {
+        for preset in ResolutionSelection.allCases {
+            XCTAssertEqual(preset.perEyeResolution, try PerEyeResolution.parse(preset.rawValue))
+        }
+        XCTAssertEqual(ResolutionSelection.quality.dimensions, "1344 × 1408")
+        XCTAssertEqual(ResolutionSelection.performance.label, "Performance · 896 × 944")
     }
 
     func testExtractsLastActionableStreamerError() {
@@ -207,6 +218,17 @@ final class ManagementModelsTests: XCTestCase {
             StreamerLogFailure.message(in: log),
             "ALVR is paused behind the Quest lock screen. Put on the headset.")
         XCTAssertNil(StreamerLogFailure.message(in: "Starting…\n"))
+    }
+
+    func testSurfacesRefusedRuntimeConnection() {
+        let line = RuntimeLink.connectionRefusedLogPrefix
+            + "OpenXR runtime speaks control protocol v7, but this streamer speaks v9"
+        XCTAssertEqual(
+            RuntimeConnectionRefusal.message(in: line + "\n"),
+            "The game's OpenXR runtime was refused: "
+                + "OpenXR runtime speaks control protocol v7, but this streamer speaks v9")
+        XCTAssertNil(RuntimeConnectionRefusal.message(in: RuntimeLink.connectionRefusedLogPrefix))
+        XCTAssertNil(RuntimeConnectionRefusal.message(in: "OpenXR runtime disconnected"))
     }
 
     func testDiscoversWhiskyAndCrossOverBottlesWithFriendlyNames() throws {
@@ -292,13 +314,5 @@ final class ManagementModelsTests: XCTestCase {
         return ManagedBottle(
             name: name, engine: engine, prefix: prefix,
             engineRoot: root, wineBinary: root.appendingPathComponent("bin/wine"))
-    }
-
-    private func temporaryDirectory() throws -> URL {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "BasaltManagerTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
-        return directory
     }
 }

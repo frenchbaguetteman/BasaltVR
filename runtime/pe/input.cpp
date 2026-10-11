@@ -322,7 +322,7 @@ constexpr TouchSourceDefinition kTouchSources[] = {
     {"/user/hand/right/input/a/touch", 1, BindingKind::kBinary, 0x07aedc78fdf1bf2aULL, 0, kSourceA, "A Button"},
     {"/user/hand/right/input/b/click", 1, BindingKind::kBinary, 0x955047466e34669bULL, 0, kSourceB, "B Button"},
     {"/user/hand/right/input/b/touch", 1, BindingKind::kBinary, 0xdd8323caa5e48729ULL, 0, kSourceB, "B Button"},
-    {"/user/hand/right/input/system/click", 1, BindingKind::kBinary, 0x19729bd97073d474ULL, 0, kSourceSystem, "System Button"},
+    {"/user/hand/right/input/system/click", 1, BindingKind::kBinary, basalt::kAlvrRightSystemClickPathId, 0, kSourceSystem, "System Button"},
     {"/user/hand/right/input/squeeze/value", 1, BindingKind::kScalar, 0xdd5935cc005136f1ULL, 0, kSourceSqueeze, "Squeeze"},
     {"/user/hand/right/input/trigger/value", 1, BindingKind::kScalar, 0xede7e982d5eedf21ULL, 0, kSourceTrigger, "Trigger"},
     {"/user/hand/right/input/trigger/touch", 1, BindingKind::kBinary, 0xe0a7e848dde340b0ULL, 0, kSourceTrigger, "Trigger"},
@@ -688,7 +688,7 @@ void syncOneState(
             const basalt::ControlButtonState* button =
                 findButton(snapshot, binding.inputIdX);
             const bool value = button != nullptr &&
-                (button->valueType == 0 ? button->value != 0.0f : button->value >= 0.5f);
+                basalt::controlButtonPressed(button->valueType, button->value);
             state.booleanValue = state.booleanValue || value;
             if (button != nullptr) {
                 physicalChangeTime = (std::max)(physicalChangeTime,

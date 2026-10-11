@@ -17,8 +17,6 @@ constexpr uintptr_t kSwapchainHandleStride = static_cast<uintptr_t>(0x10);
 constexpr uint32_t kSwapchainImageCount = 3;
 constexpr uint32_t kMaxArraySize = 2;
 constexpr size_t kMaxSwapchains = 4;
-constexpr uint32_t kMaxImageWidth = 1680;
-constexpr uint32_t kMaxImageHeight = 1760;
 
 constexpr std::array<DXGI_FORMAT, 2> kSupportedFormats = {
     // Runtime order is preference order. The native CoreVideo handoff can
@@ -161,7 +159,7 @@ XrResult XRAPI_CALL createSwapchain(
     if (createInfo == nullptr || createInfo->type != XR_TYPE_SWAPCHAIN_CREATE_INFO ||
         createInfo->createFlags != 0 || createInfo->usageFlags == 0 ||
         createInfo->width == 0 || createInfo->height == 0 ||
-        createInfo->width > kMaxImageWidth || createInfo->height > kMaxImageHeight ||
+        createInfo->width > basalt::kMaxViewWidth || createInfo->height > basalt::kMaxViewHeight ||
         createInfo->arraySize == 0 || createInfo->arraySize > kMaxArraySize ||
         createInfo->faceCount != 1 || createInfo->mipCount != 1 ||
         createInfo->sampleCount != 1) {
