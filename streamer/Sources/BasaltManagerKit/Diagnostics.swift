@@ -7,7 +7,8 @@ import BasaltCore
 /// headset and Bonjour host names, MAC and IP addresses (loopback is kept),
 /// long hex tokens such as the control-socket token, ADB serials, and
 /// `account=`-style values. Replacements contain no quotes or backslashes,
-/// so redacting rendered JSON keeps it valid.
+/// and any quote a rule matches is put back, so redacting rendered JSON
+/// keeps it valid.
 public struct DiagnosticRedactor: Sendable {
     public let homeDirectory: String
     public let userName: String
@@ -49,7 +50,7 @@ public struct DiagnosticRedactor: Sendable {
         value = Self.replaceMatches(Self.uuidOrSerial, in: value) { match in
             match.contains("-") ? nil : "<serial>"
         }
-        value = Self.replace(Self.account, in: value, with: "$1$2<redacted>")
+        value = Self.replace(Self.account, in: value, with: "$1$2$3<redacted>$4")
         return value
     }
 
@@ -85,8 +86,11 @@ public struct DiagnosticRedactor: Sendable {
         #"(?i)\b[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\b"#
             + "|" + #"(?-i:\b(?=[A-Z0-9]*[0-9])(?=[A-Z0-9]*[A-Z])[A-Z0-9]{10,20}\b)"#)
 
+    /// The value's quotes, plain or JSON-escaped, are captured and put back:
+    /// a closing quote can also end the enclosing JSON string. Values stop at
+    /// a lone backslash so JSON escapes such as `\n` stay intact.
     private static let account = regex(
-        #"(?i)\b(account(?:_?name)?|user_?name|login|persona(?:_?name)?|steam_?id(?:64)?|serial(?:_?number)?)(\s*[:=]\s*)"?[^\s"',;]+"?"#)
+        #"(?i)\b(account(?:_?name)?|user_?name|login|persona(?:_?name)?|steam_?id(?:64)?|serial(?:_?number)?)(\s*[:=]\s*)((?:\\?")?)(?:[^\s"',;\\]|\\\\)+((?:\\?")?)"#)
 
     private static func replace(
         _ expression: NSRegularExpression, in text: String, with template: String

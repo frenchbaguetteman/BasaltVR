@@ -44,8 +44,14 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(redactor.redact("owner 76561198012345678"), "owner <steamid>")
         XCTAssertEqual(
             redactor.redact("token 0123456789abcdef0123456789abcdef ok"), "token <token> ok")
-        XCTAssertEqual(redactor.redact(#"AccountName="ada_plays" ok"#), "AccountName=<redacted> ok")
+        XCTAssertEqual(redactor.redact(#"AccountName="ada_plays" ok"#), #"AccountName="<redacted>" ok"#)
         XCTAssertEqual(redactor.redact("serial: R3CN90ABCDE"), "serial: <redacted>")
+        // Inside rendered JSON: the string's own closing quote, escaped
+        // quotes, and escape sequences survive.
+        XCTAssertEqual(redactor.redact(#"["account=ada"]"#), #"["account=<redacted>"]"#)
+        XCTAssertEqual(redactor.redact(#""login=\"ada\" ok""#), #""login=\"<redacted>\" ok""#)
+        XCTAssertEqual(redactor.redact(#""username=ada\nnext""#), #""username=<redacted>\nnext""#)
+        XCTAssertEqual(redactor.redact(#""login=CORP\\ada""#), #""login=<redacted>""#)
     }
 
     func testKeepsOrdinaryDiagnosticText() {
@@ -72,6 +78,8 @@ final class DiagnosticsTests: XCTestCase {
             \u{1B}[32mUSB Quest TESTQUEST00042 is authorized\u{1B}[0m
             game: loading C:\\users\\ada\\AppData\\Roaming\\Beat Saber
             ```nested fence```
+            account=player_one
+            steam: login="player_two" ok
 
             """)
 
@@ -94,7 +102,7 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertFalse(markdown.contains("TESTQUEST00042"))
 
         let json = try report.json(redactedWith: redactor)
-        for leaked in ["/Users/ada", #"\\ada"#] {
+        for leaked in ["/Users/ada", #"\\ada"#, "player_one", "player_two"] {
             XCTAssertFalse(json.contains(leaked), json)
         }
         let object = try XCTUnwrap(

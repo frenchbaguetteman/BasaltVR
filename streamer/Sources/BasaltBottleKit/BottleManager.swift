@@ -968,9 +968,16 @@ public final class BottleManager: @unchecked Sendable {
     public func terminateBottleProcesses(
         forProfile profileName: String
     ) throws -> CommandOutput {
+        try terminateBottleProcesses(launchedWith: prefixCommand(forProfile: profileName))
+    }
+
+    /// A command scoped to the managed bottle for `profileName`: it runs
+    /// nothing itself, but `terminateBottleProcesses(launchedWith:)` can find
+    /// that prefix's wineserver from it.
+    public func prefixCommand(forProfile profileName: String) throws -> BottleLaunchCommand {
         let profile = try loadProfile(profileName)
         let bottle = try loadBottle(profile.bottleName)
-        return try terminateBottleProcesses(launchedWith: BottleLaunchCommand(
+        return BottleLaunchCommand(
             executable: URL(fileURLWithPath: bottle.wineBinaryPath),
             arguments: [],
             environment: [
@@ -978,7 +985,7 @@ public final class BottleManager: @unchecked Sendable {
                 "WINEARCH": "win64",
                 "WINEDEBUG": "-all",
             ],
-            currentDirectory: nil))
+            currentDirectory: nil)
     }
 
     /// Stops every Wine process owned by the prefix used for `command`.

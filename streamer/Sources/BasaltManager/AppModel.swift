@@ -576,7 +576,9 @@ final class BasaltAppModel: ObservableObject {
             // A stale control-protocol version otherwise connects headlessly
             // and presents as a completely black headset view. Registering
             // (only when the bottle's registry no longer names this runtime)
-            // cold-starts the just-stopped prefix, so keep it off the main actor.
+            // cold-starts the just-stopped prefix, so keep it off the main actor,
+            // and give stop() (also reached on failure) the prefix to shut down.
+            activeWineCommand = try manager.prefixCommand(forProfile: profileName)
             try await Task.detached {
                 let profile = try manager.loadProfile(profileName)
                 try manager.syncRuntime(in: profile.bottleName)
