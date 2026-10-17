@@ -23,3 +23,38 @@ final class GameAudioTests: XCTestCase {
             left: [0, 1], right: [0]))
     }
 }
+
+final class MicrophoneAccessTests: XCTestCase {
+    func testHostAppIsOutermostAppBundleInAncestorChain() {
+        XCTAssertEqual(MicrophoneAccess.hostAppName(fromAncestorPaths: [
+            "/Users/me/BasaltVR/streamer/.build/release/basalt-streamer",
+            "/bin/zsh",
+            "/usr/bin/login",
+            "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+        ]), "Terminal")
+        XCTAssertEqual(MicrophoneAccess.hostAppName(fromAncestorPaths: [
+            "/tmp/basalt-streamer",
+            "/Applications/Example Editor.app/Contents/Frameworks/"
+                + "Example Editor Helper.app/Contents/MacOS/Example Editor Helper",
+            "/Applications/Example Editor.app/Contents/MacOS/Example Editor",
+        ]), "Example Editor")
+        XCTAssertNil(MicrophoneAccess.hostAppName(fromAncestorPaths: [
+            "/tmp/basalt-streamer", "/usr/sbin/sshd",
+        ]))
+    }
+
+    func testDeniedHintNamesTheSettingAndTheApp() {
+        let hint = MicrophoneAccess.denialHint(state: .denied, hostApp: "Terminal")
+        XCTAssertTrue(hint.contains("Privacy & Security > Microphone"))
+        XCTAssertTrue(hint.contains("turn on Terminal"))
+    }
+
+    func testUnpromptableHintSendsUserToTerminal() {
+        let hint = MicrophoneAccess.denialHint(
+            state: .notDetermined, hostApp: "Example Editor")
+        XCTAssertTrue(hint.contains("Example Editor"))
+        XCTAssertTrue(hint.contains("Run the command in Terminal.app and click Allow"))
+        XCTAssertTrue(MicrophoneAccess.denialHint(state: .denied, hostApp: nil)
+            .contains("your terminal app"))
+    }
+}

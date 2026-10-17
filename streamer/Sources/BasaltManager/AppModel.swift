@@ -5,8 +5,9 @@ import BasaltBottleKit
 import BasaltCore
 import BasaltManagerKit
 
-/// Sidebar order; also the ⌘1…⌘5 order in the View menu.
+/// Sidebar order; also the ⌘1…⌘6 order in the View menu.
 enum ManagerSection: String, CaseIterable, Identifiable {
+    case play = "Play"
     case library = "Library"
     case stream = "Stream"
     case bottles = "Bottles"
@@ -17,6 +18,7 @@ enum ManagerSection: String, CaseIterable, Identifiable {
 
     var symbol: String {
         switch self {
+        case .play: return "play.circle"
         case .library: return "gamecontroller"
         case .stream: return "dot.radiowaves.left.and.right"
         case .bottles: return "shippingbox"
@@ -66,7 +68,7 @@ enum SessionState: Equatable {
 
 @MainActor
 final class BasaltAppModel: ObservableObject {
-    @Published var selection = ManagerSection.library
+    @Published var selection = ManagerSection.play
     @Published private(set) var setupChecks = [SetupCheck]()
     @Published private(set) var bottles = [ManagedBottle]()
     @Published private(set) var profiles = [LaunchProfile]()
@@ -105,6 +107,13 @@ final class BasaltAppModel: ObservableObject {
 
     let repoRoot: URL
     private(set) var manager: BottleManager
+    /// The Play screen's session (scripts/play.zsh); separate from the Stream page's.
+    let play: PlayController
+
+    /// Tiles for the Play screen.
+    var playGames: [PlayGame] {
+        PlayLibrary.games(profiles: profiles, steamGames: steamGames)
+    }
 
     private var streamerProcess: Process?
     private var gameProcess: Process?
@@ -168,6 +177,11 @@ final class BasaltAppModel: ObservableObject {
             .map { URL(fileURLWithPath: $0, isDirectory: true) }
         preferredProfileName = defaults.string(forKey: Self.preferredProfileKey)
         manager = BottleManager(root: selectedRoot, repoRoot: discovered)
+        play = PlayController(
+            tools: PlayTools.locate(
+                repoRoot: discovered,
+                appExecutableDirectory: Bundle.main.executableURL?.deletingLastPathComponent()),
+            dataRoot: selectedRoot)
         sessionHistory = SessionHistoryStore(dataRoot: selectedRoot).load()
         alertMessage = startupError
         Task { await refresh() }
@@ -226,7 +240,8 @@ final class BasaltAppModel: ObservableObject {
             // land on the checks they still need to finish.
             if !hasChosenInitialSection {
                 hasChosenInitialSection = true
-                if selection == .library, missingRequiredSetupCount > 0 {
+                // Players with games stay on Play; its own checks cover their setup.
+                if selection == .play, missingRequiredSetupCount > 0, profiles.isEmpty {
                     selection = .setup
                 }
             }
@@ -426,7 +441,7 @@ final class BasaltAppModel: ObservableObject {
     }
 
     func changeDataRoot(to root: URL) async {
-        guard !sessionState.isActive else {
+        guard !sessionState.isActive, !play.isActive else {
             alertMessage = "Stop the current session before changing the data location."
             return
         }
@@ -434,6 +449,7 @@ final class BasaltAppModel: ObservableObject {
         dataRoot = standardized
         UserDefaults.standard.set(standardized.path, forKey: Self.dataRootKey)
         manager = BottleManager(root: standardized, repoRoot: repoRoot)
+        play.update(tools: play.tools, dataRoot: standardized)
         sessionHistory = SessionHistoryStore(dataRoot: standardized).load()
         await refresh()
     }
@@ -526,16 +542,18 @@ final class BasaltAppModel: ObservableObject {
         case "screen":
             _ = CGRequestScreenCaptureAccess()
             await refresh()
-        case "adb", "audio":
+        case "audio":
+            // The BlackHole cask needs the Mac password, so it runs in Terminal.
+            await play.perform(.installBlackHole)
+            if let message = play.fixMessage { alertMessage = message }
+        case "adb":
             guard let brew = SetupInspector.findExecutable(named: "brew") else {
                 alertMessage = "Homebrew is not installed. Install it from brew.sh, then try again."
                 NSWorkspace.shared.open(URL(string: "https://brew.sh")!)
                 return
             }
             isBusy = true
-            let arguments = check.id == "adb"
-                ? ["install", "android-platform-tools"]
-                : ["install", "--cask", "blackhole-2ch"]
+            let arguments = ["install", "android-platform-tools"]
             let result = await Self.runUtility(brew, arguments: arguments)
             isBusy = false
             if result.status != 0 { alertMessage = result.output }
@@ -549,6 +567,10 @@ final class BasaltAppModel: ObservableObject {
 
     func launch(profileName: String) async {
         guard !sessionState.isActive else { return }
+        guard !play.isActive else {
+            alertMessage = "A game is running from the Play page. Stop it there first."
+            return
+        }
         let launchID = UUID()
         activeLaunchID = launchID
         // Stop can run at any await below; never resume a stopped launch.
@@ -863,7 +885,7 @@ final class BasaltAppModel: ObservableObject {
     }
 
     private func launchUtility(_ command: BottleLaunchCommand, label: String) throws {
-        guard !sessionState.isActive else {
+        guard !sessionState.isActive, !play.isActive else {
             throw BottleToolError("Stop the current Wine or VR session first")
         }
         let process = Process()

@@ -25,13 +25,6 @@ private final class ThrottledEventLog: @unchecked Sendable {
     }
 }
 
-private struct AlvrTrackingTimeoutError: LocalizedError {
-    var errorDescription: String? {
-        "Quest reported StreamReady but sent no tracking timestamps; "
-            + "keep the headset awake with ALVR in the foreground, then retry"
-    }
-}
-
 @main
 struct BasaltStreamerApp {
     static func main() async {
@@ -47,6 +40,11 @@ struct BasaltStreamerApp {
         if CommandLine.arguments.count >= 2,
            CommandLine.arguments[1] == "audio-loopback-selftest" {
             AudioLoopbackSelfTest.run(Array(CommandLine.arguments.dropFirst(2)))
+            return
+        }
+        if CommandLine.arguments.count >= 2,
+           CommandLine.arguments[1] == "encoder-bench" {
+            EncoderBenchmark.run(Array(CommandLine.arguments.dropFirst(2)))
             return
         }
 
@@ -127,7 +125,7 @@ struct BasaltStreamerApp {
             fputs("server error: \(error.localizedDescription)\n", stderr)
             exit(1)
         }
-        let alvrVideo = AlvrVideoStreamRouter()
+        let alvrVideo = AlvrVideoStreamRouter(codec: options.codec)
         var audioOutputRoute: GameAudioOutputRoute?
         var gameAudio: GameAudioCapture?
         if let audioDeviceName = options.audioDeviceName {
@@ -148,47 +146,140 @@ struct BasaltStreamerApp {
         let latencyReporter = PipelineLatencyReporter()
         let headsetLatencyReporter = HeadsetLatencyReporter()
         let calibrationLogGate = CalibrationLogGate()
-        let encoder = try H264Encoder(
+        let pipelineStatistics = PipelineStatistics()
+        // Keeps the headset's reference chain intact (H.264 and HEVC alike):
+        // frames are skipped before encoding while the ALVR transport is
+        // busy, and after any lost access unit only an IDR is sent until one
+        // gets through.
+        let videoRecovery = VideoLossRecoveryGate(
+            clientRequestThrottleNanoseconds: options.wired ? 100_000_000 : 250_000_000,
+            recoveryKeyframeMinimumGapNanoseconds: options.wired ? 0 : 250_000_000)
+        let videoLossLog = ThrottledEventLog()
+        let noteVideoLoss: @Sendable (String) -> Void = { reason in
+            guard videoRecovery.frameLost() else { return }
+            videoLossLog.record {
+                "ALVR video: \(reason); holding P-frames until a recovery IDR is sent "
+                    + "(\($0) loss(es) so far)"
+            }
+        }
+        // ALVR's client keeps showing its last decoded picture when no video
+        // arrives. While the game submits nothing, the filler only repairs
+        // what the headset shows: the last game image when it was not
+        // delivered or the chain broke, or black before the first game frame.
+        let idleFiller = (runtimeMode && headsetMode)
+            ? RuntimeIdleVideoFiller<RuntimeStereoComposer.ComposedFrame>() : nil
+        let encoder = try VideoEncoder(
             width: encodedWidth,
             height: encodedHeight,
             fps: options.fps,
-            bitrate: options.megabits * 1_000_000) { annexB, isKeyframe, capturePTS in
+            bitrate: options.megabits * 1_000_000,
+            keyframeIntervalSeconds: options.keyframeIntervalSeconds,
+            codec: options.codec,
+            entropyMode: options.entropyMode) { annexB, isKeyframe, capturePTS in
                 if !runtimeMode {
                     latencyReporter.recordEncoded(capturePTS: capturePTS)
                 }
                 server.broadcast(annexB)
+                // A P-frame after a lost access unit references a picture the
+                // Quest never got (`Frame num gap is not allowed`).
+                guard videoRecovery.admit(isIDR: isKeyframe) else {
+                    pipelineStatistics.recordDrop(.awaitingIDR)
+                    return
+                }
+                let delivered: Bool
                 if runtimeMode {
-                    guard let runtimeTrackingTimestamp =
+                    guard let presentation =
                             H264Encoder.questTrackingTimestampNanoseconds(from: capturePTS) else {
                         fputs("encoded runtime frame lost its Quest tracking timestamp\n", stderr)
+                        noteVideoLoss("an encoded frame lost its Quest tracking timestamp")
                         return
                     }
-                    alvrVideo.send(
+                    // A repeated game image is encoded at a later presentation
+                    // time but keeps its own frame's tracking timestamp, so the
+                    // client reprojects it with the pose it was rendered for.
+                    let runtimeTrackingTimestamp = idleFiller?.videoTimestamp(
+                        forPresentationNanoseconds: presentation) ?? presentation
+                    delivered = alvrVideo.send(
                         annexB: annexB, isIDR: isKeyframe,
                         timestampNanoseconds: runtimeTrackingTimestamp)
+                    if delivered, alvrVideo.hasStream {
+                        idleFiller?.recordDelivered(presentationNanoseconds: presentation)
+                    }
                 } else {
-                    alvrVideo.send(annexB: annexB, isIDR: isKeyframe)
+                    delivered = alvrVideo.send(annexB: annexB, isIDR: isKeyframe)
+                }
+                if !delivered {
+                    noteVideoLoss("an encoded frame could not be sent")
                 }
             }
         encoder.onError = { error in
             fputs("encoder error: \(error.localizedDescription)\n", stderr)
         }
-        let streamRecovery = StreamRecoveryController(
-            encoder: encoder,
-            minimumIDRIntervalNanoseconds: options.wired
-                ? 1_000_000_000 : 2_000_000_000)
-
+        encoder.onFrameEncoded = { duration, dropped in
+            pipelineStatistics.recordEncode(durationNanoseconds: duration, droppedByEncoder: dropped)
+        }
         // A client joining mid-stream needs an IDR frame before it can
         // decode anything.
         server.onClientConnected = { encoder.forceKeyframe() }
         let droppedFrames = ThrottledEventLog()
+        // The throttled log shows the first and every 120th drop; the
+        // pipeline line counts every drop per interval.
+        let noteDrop: @Sendable (String, PipelineStatistics.DropStage) -> Void = { stage, kind in
+            droppedFrames.recordDroppedFrame(stage: stage)
+            pipelineStatistics.recordDrop(kind)
+        }
         let runtimeWrapFailures = ThrottledEventLog()
+        // While no ALVR client is attached (Quest asleep, ALVR closed, or
+        // still reconnecting) and nobody watches the local preview, frames
+        // are dropped before any GPU or encoder work.
+        let hasVideoConsumer: @Sendable () -> Bool = {
+            !headsetMode || alvrVideo.hasStream || server.hasClients
+        }
+        // Desktop frames take the newest tracking timestamp at send time, so
+        // they cannot be sent without one; runtime frames carry their own.
+        let videoTransportBusy: @Sendable () -> Bool = {
+            alvrVideo.isBusy(requiringTrackingTimestamp: !runtimeMode)
+        }
+        // Every encode goes through the loss-recovery gate. A frame the
+        // transport would drop is not encoded at all: an unencoded frame
+        // leaves no `frame_num` gap, so no IDR is needed. After a loss, the
+        // next encode is a forced IDR. `completion` runs exactly once.
+        // Returns whether the frame was submitted.
+        let encodeVideoFrame: @Sendable (
+            _ frame: CVPixelBuffer, _ pts: CMTime, _ source: String,
+            _ completion: (@Sendable () -> Void)?
+        ) -> Bool = { frame, pts, source, completion in
+            switch videoRecovery.prepareEncode(transportBusy: videoTransportBusy()) {
+            case .skipTransportBusy:
+                completion?()
+                noteDrop("network busy, not encoded (\(source))", .networkBusy)
+                return false
+            case .skipRecoveryBackoff:
+                completion?()
+                noteDrop("awaiting recovery IDR (\(source))", .awaitingIDR)
+                return false
+            case .encodeKeyframe:
+                encoder.forceKeyframe()
+            case .encode:
+                break
+            }
+            guard encoder.encode(frame, pts: pts, completion: completion) else {
+                noteDrop("encoder busy (\(source))", .encoderBusy)
+                return false
+            }
+            return true
+        }
         capture.onFrame = { pixelBuffer, pts in
+            guard hasVideoConsumer() else { return }
             // Avoid spending GPU time composing a stereo frame that the
             // bounded encoder cannot accept. `encode` repeats this check
             // atomically in case a slot changes between here and submission.
             guard encoder.canAcceptFrame else {
-                droppedFrames.recordDroppedFrame(stage: "encoder busy (capture)")
+                noteDrop("encoder busy (capture)", .encoderBusy)
+                return
+            }
+            guard !videoTransportBusy() else {
+                noteDrop("network busy, not encoded (capture)", .networkBusy)
                 return
             }
 
@@ -199,36 +290,101 @@ struct BasaltStreamerApp {
             } else {
                 frame = pixelBuffer
             }
-            guard encoder.encode(frame, pts: pts) else {
-                droppedFrames.recordDroppedFrame(stage: "encoder busy (capture)")
-                return
-            }
+            _ = encodeVideoFrame(frame, pts, "capture", nil)
         }
         capture.onError = { error in
             fputs("capture stopped: \(error.localizedDescription)\n", stderr)
             raise(SIGTERM)
         }
 
+        // While a client is attached but the game submits nothing (a slow
+        // game, a hitch, loading, between OpenXR sessions, or not started),
+        // the idle filler re-sends the last game image when the headset does
+        // not have it, or sends black before the first game frame.
+        var idleFillerTimer: DispatchSourceTimer?
+        if let idleFiller {
+            let blackFrame = try makeBlackFrame(width: encodedWidth, height: encodedHeight)
+            let blackLog = ThrottledEventLog()
+            let repeatLog = ThrottledEventLog()
+            let timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
+            timer.schedule(deadline: .now() + .milliseconds(50), repeating: .milliseconds(50))
+            timer.setEventHandler {
+                guard alvrVideo.hasStream, !videoTransportBusy(), encoder.canAcceptFrame,
+                      let filler = idleFiller.nextFrame(
+                        latestTrackingTimestamp: alvrVideo.timestampForVideoFrame(),
+                        hasStream: alvrVideo.hasStream,
+                        referenceChainBroken: videoRecovery.isAwaitingIDR),
+                      let pts = H264Encoder.presentationTime(
+                        questTrackingTimestampNanoseconds: filler.presentationNanoseconds)
+                else { return }
+                switch filler {
+                case .black:
+                    guard encodeVideoFrame(blackFrame, pts, "idle filler", nil) else { return }
+                    blackLog.record {
+                        "OpenXR runtime idle with no game frame yet: sent \($0) black "
+                            + "filler frame(s)"
+                    }
+                case .repeatLast(let image, _, _):
+                    guard encodeVideoFrame(image.pixelBuffer, pts, "idle repeat",
+                                           { _ = image }) else { return }
+                    repeatLog.record {
+                        "OpenXR runtime idle: re-sent the last game image \($0) time(s) "
+                            + "(not delivered, or the headset needed an IDR)"
+                    }
+                }
+            }
+            timer.resume()
+            idleFillerTimer = timer
+        }
+
         var runtimeLink: RuntimeLink?
         if let controlFile = options.runtimeControlFile {
+            // One extra output holds the newest composed frame for idle repeats.
             let runtimeComposer = try RuntimeStereoComposer(
-                perEyeWidth: previewPerEyeWidth, height: previewPerEyeHeight)
+                perEyeWidth: previewPerEyeWidth, height: previewPerEyeHeight,
+                retainedOutputs: idleFiller == nil ? 0 : 1)
             let link = try RuntimeLink(
                 controlFilePath: controlFile,
-                recommendedViewSize: options.perEyeResolution)
+                recommendedViewSize: options.perEyeResolution,
+                handTracking: options.handTracking)
+            // Replaced by the negotiated headset rate once the Quest connects.
+            link.setDisplayRefreshRate(Float(options.fps))
             link.onHello = { sessionId, renderer in
                 print("OpenXR runtime connected (session \(sessionId), \(renderer))")
+                idleFiller?.discardHeldFrame()
                 encoder.forceKeyframe()
             }
             link.onTeardown = {
                 print("OpenXR runtime disconnected")
+                idleFiller?.discardHeldFrame()
+            }
+            link.onReplaced = {
+                print("OpenXR runtime: a new game session replaced the previous one "
+                      + "(e.g. The Lab launching Robot Repair)")
+                idleFiller?.discardHeldFrame()
             }
             link.onProtocolError = { reason in
                 fputs(RuntimeLink.connectionRefusedLogPrefix + reason + "\n", stderr)
             }
             link.onFrame = { frame, consumption in
+                pipelineStatistics.recordRuntimeFrame(
+                    trackingTimestampNanoseconds: frame.questTrackingTimestampNanoseconds)
+                // Runs before the consumer check so the filler stays quiet
+                // while the game renders, even with no headset attached.
+                let admitted = idleFiller?.admitRuntimeFrame(
+                    trackingTimestampNanoseconds: frame.questTrackingTimestampNanoseconds) ?? true
+                guard admitted, hasVideoConsumer() else {
+                    consumption.complete()
+                    return
+                }
                 guard encoder.canAcceptFrame else {
-                    droppedFrames.recordDroppedFrame(stage: "encoder busy (runtime)")
+                    noteDrop("encoder busy (runtime)", .encoderBusy)
+                    consumption.complete()
+                    return
+                }
+                // Skip the GPU work too when the output could not be sent.
+                guard !videoTransportBusy() else {
+                    noteDrop("network busy, not encoded (runtime)", .networkBusy)
                     consumption.complete()
                     return
                 }
@@ -267,15 +423,13 @@ struct BasaltStreamerApp {
                     // finishes with this compositor output.
                     consumption.complete()
                     guard let composed else { return }
-                    guard encoder.encode(
-                            composed.pixelBuffer, pts: pts,
-                            completion: { _ = composed }) else {
-                        droppedFrames.recordDroppedFrame(stage: "encoder busy (runtime)")
-                        return
-                    }
+                    idleFiller?.holdComposedFrame(
+                        composed,
+                        trackingTimestampNanoseconds: frame.questTrackingTimestampNanoseconds)
+                    _ = encodeVideoFrame(composed.pixelBuffer, pts, "runtime") { _ = composed }
                 }
                 guard scheduled else {
-                    droppedFrames.recordDroppedFrame(stage: "compositor busy (runtime)")
+                    noteDrop("compositor busy (runtime)", .compositorBusy)
                     consumption.complete()
                     return
                 }
@@ -285,35 +439,10 @@ struct BasaltStreamerApp {
 
         var discovery: AlvrDiscoveryListener?
         var wiredConnection: AlvrWiredConnection?
+        let beaconMailbox = AlvrBeaconMailbox()
         if options.discover {
-            let probeGate = AlvrControlProbeGate()
             discovery = try AlvrDiscoveryListener { beacon, ip in
-                let clientKey = "\(beacon.hostname)@\(ip)"
-                guard probeGate.begin(clientKey: clientKey) else { return }
-                let protocolHex = String(format: "%016llx", beacon.protocolId)
-                print("ALVR headset '\(beacon.hostname)' announced itself from \(ip) "
-                    + "(protocol id \(protocolHex)); probing TCP control handshake…")
-                Task {
-                    var succeeded = false
-                    defer { probeGate.finish(clientKey: clientKey, succeeded: succeeded) }
-                    do {
-                        let connected = try await connectHeadset(
-                            host: ip, expectedProtocolId: beacon.protocolId, wired: false,
-                            requestedViewWidth: negotiateViewWidth,
-                            requestedViewHeight: negotiateViewHeight,
-                            stereoComposer: stereoComposer, options: options,
-                            alvrVideo: alvrVideo,
-                            runtimeLink: runtimeLink,
-                            headsetLatencyReporter: headsetLatencyReporter,
-                            calibrationLogGate: calibrationLogGate,
-                            encoder: encoder,
-                            streamRecovery: streamRecovery)
-                        probeGate.retain(connected.handshake, clientKey: clientKey)
-                        succeeded = true
-                    } catch {
-                        fputs("ALVR control probe for \(ip) failed: \(error.localizedDescription)\n", stderr)
-                    }
-                }
+                beaconMailbox.post(.init(beacon: beacon, ip: ip))
             }
         } else if options.wired {
             let connection = try AlvrWiredConnection.setup()
@@ -321,35 +450,125 @@ struct BasaltStreamerApp {
             print("USB Quest \(connection.serial) is authorized; adb control/video forwards are ready.")
         }
 
-        try await server.start()
-        if options.wired {
-            var lastError: Error?
-            for attempt in 1...10 {
-                do {
-                    _ = try await connectHeadset(
-                        host: "127.0.0.1", expectedProtocolId: nil, wired: true,
-                        requestedViewWidth: negotiateViewWidth,
-                        requestedViewHeight: negotiateViewHeight,
-                        stereoComposer: stereoComposer, options: options,
-                        alvrVideo: alvrVideo,
-                        runtimeLink: runtimeLink,
-                        headsetLatencyReporter: headsetLatencyReporter,
-                        calibrationLogGate: calibrationLogGate,
-                        encoder: encoder,
-                        streamRecovery: streamRecovery)
-                    lastError = nil
-                    break
-                } catch {
-                    lastError = error
-                    if error is AlvrTrackingTimeoutError { break }
-                    guard attempt < 10 else { break }
-                    fputs("ALVR USB handshake attempt \(attempt) failed; retrying…\n", stderr)
-                    try await Task.sleep(nanoseconds: 500_000_000)
+        // One supervisor owns the ALVR client session for the whole run. When
+        // the Quest sleeps or ALVR closes, it ends that session (the OpenXR
+        // runtime and the game keep running) and accepts the next one.
+        var supervisor: AlvrSessionSupervisor?
+        if headsetMode {
+            let sessionRuntimeLink = runtimeLink
+            let wired = options.wired
+            let linkName = wired ? "USB" : "Wi-Fi"
+            let configuredBitrate = options.megabits * 1_000_000
+            let connectSession: @Sendable (AlvrClientSessionRequest) async throws
+                -> AlvrClientSession = { request in
+                try await connectHeadset(
+                    request: request,
+                    stereoComposer: stereoComposer, options: options,
+                    alvrVideo: alvrVideo,
+                    runtimeLink: sessionRuntimeLink,
+                    headsetLatencyReporter: headsetLatencyReporter,
+                    calibrationLogGate: calibrationLogGate,
+                    encoder: encoder,
+                    videoRecovery: videoRecovery,
+                    pipelineStatistics: pipelineStatistics)
+            }
+            let request: @Sendable (_ host: String, _ protocolId: UInt64?) -> AlvrClientSessionRequest = {
+                host, protocolId in
+                AlvrClientSessionRequest(
+                    host: host, wired: wired, expectedProtocolId: protocolId,
+                    requestedViewWidth: UInt32(negotiateViewWidth),
+                    requestedViewHeight: UInt32(negotiateViewHeight),
+                    preferredRefreshRate: Float(options.fps),
+                    latencyPreset: options.latencyPreset,
+                    controllerPrediction: options.controllerPrediction,
+                    codec: options.codec)
+            }
+            let sessionSupervisor = AlvrSessionSupervisor(
+                initialAttemptLimit: wired ? 10 : nil,
+                retryDelayNanoseconds: wired ? 500_000_000 : 1_000_000_000,
+                isFatalBeforeFirstSession: { $0 is AlvrTrackingTimeoutError }
+            ) { _ in
+                if wired {
+                    return try await connectSession(request("127.0.0.1", nil))
+                }
+                guard let announcement = await beaconMailbox.next() else {
+                    throw BasaltError("ALVR discovery stopped")
+                }
+                let beacon = announcement.beacon
+                let protocolHex = String(format: "%016llx", beacon.protocolId)
+                print("ALVR headset '\(beacon.hostname)' announced itself from \(announcement.ip) "
+                    + "(protocol id \(protocolHex)); probing TCP control handshake…")
+                return try await connectSession(request(announcement.ip, beacon.protocolId))
+            }
+            let everStreamed = SessionFlag()
+            sessionSupervisor.onSessionStarted = { _, generation in
+                everStreamed.set()
+                if generation > 1 {
+                    print("ALVR headset reconnected (session \(generation)); "
+                        + "sent a fresh IDR and the headset's view configuration resumes.")
                 }
             }
-            if let lastError {
-                throw BasaltError("Could not start wired ALVR session: \(lastError.localizedDescription)")
+            sessionSupervisor.onSessionEnded = { session, reason in
+                if let session = session as? AlvrClientSession {
+                    alvrVideo.uninstall(session.stream)
+                }
+                // The next client has its own pose history: start it on black
+                // until the game's next frame instead of a stale image.
+                idleFiller?.discardHeldFrame()
+                // INPUT_RESET: the game sees both controllers go inactive and
+                // head tracking go stale until the next session's samples.
+                sessionRuntimeLink?.resetInputs()
+                // Wi-Fi congestion control may have lowered the target; the
+                // next session starts from the configured bitrate.
+                encoder.updateAverageBitrate(configuredBitrate)
+                calibrationLogGate.reset()
+                guard reason != "closed by Basalt" else { return }
+                print("ALVR headset disconnected (\(reason)). The OpenXR runtime keeps running; "
+                    + "waiting for ALVR to reconnect over \(linkName)…")
             }
+            sessionSupervisor.onConnectFailed = { error, attempt in
+                if everStreamed.isSet {
+                    // The Quest may stay asleep for a long time; report the
+                    // first failures and then only occasionally.
+                    guard attempt <= 1 || attempt.isMultiple(of: 60) else { return }
+                    fputs("ALVR \(linkName) reconnect attempt \(attempt) failed: "
+                        + "\(error.localizedDescription); still waiting…\n", stderr)
+                } else if wired {
+                    fputs("ALVR USB handshake attempt \(attempt) failed; retrying…\n", stderr)
+                } else {
+                    fputs("ALVR control probe failed: \(error.localizedDescription)\n", stderr)
+                }
+            }
+            let connection = wiredConnection
+            let forwardLog = ThrottledEventLog()
+            sessionSupervisor.beforeReconnect = { failedAttempts in
+                if failedAttempts == 0 { beaconMailbox.discardPending() }
+                // adb removes forwards when the Quest's USB transport drops.
+                guard let connection, failedAttempts.isMultiple(of: 10) else { return }
+                do {
+                    let ports = try connection.rearmForwards()
+                    if !ports.isEmpty {
+                        print("  re-created adb forwards for ports "
+                            + ports.map(String.init).joined(separator: ", "))
+                    }
+                } catch {
+                    forwardLog.record {
+                        "adb forward check failed (\($0)x): \(error.localizedDescription)"
+                    }
+                }
+            }
+            supervisor = sessionSupervisor
+        }
+
+        try await server.start()
+        if options.wired, let supervisor {
+            do {
+                try await supervisor.startAndWaitForFirstSession()
+            } catch {
+                throw BasaltError("Could not start wired ALVR session: \(error.localizedDescription)")
+            }
+        } else {
+            supervisor?.start()
         }
         if let runtimeLink {
             try await runtimeLink.start()
@@ -364,7 +583,7 @@ struct BasaltStreamerApp {
         BasaltVR streamer — \(runtimeMode ? "M4 tracked OpenXR source" : "M1 capture") + M2/M6 ALVR media
           \(sourceLine)
           encoding \(encodedWidth)x\(encodedHeight)\(runtimeMode || stereoComposer != nil ? " side-by-side stereo" : "")
-          H.264 High \(options.megabits) Mbps, VideoToolbox low-latency mode
+          \(options.codec == .hevc ? "HEVC Main" : "H.264 High") \(options.megabits) Mbps, VideoToolbox low-latency mode
           listening on tcp://\(options.bindHost):\(server.port ?? options.port)
         """)
         if options.bindIsLoopback {
@@ -377,6 +596,16 @@ struct BasaltStreamerApp {
         } else if options.wired {
             print("  ALVR: USB via adb, TCP control \(AlvrDiscoveryListener.alvrPort)/video \(AlvrVideoStreamSender.defaultPort)")
         }
+        print("  encoder: \(options.codec.displayName)"
+              + (options.codec == .h264 ? " \(options.entropyMode.rawValue.uppercased())" : "")
+              + ", periodic IDR every "
+              + "\(options.keyframeIntervalSeconds) s, \(options.fps) fps target, "
+              + "\(options.controllerPrediction.rawValue) controller prediction, "
+              + "hand tracking \(options.handTracking ? "on" : "off")"
+              + (options.profile.map { ", profile \($0.rawValue)" } ?? ""))
+        if !encoder.rejectedProperties.isEmpty {
+            print("  VideoToolbox ignored: " + encoder.rejectedProperties.joined(separator: ", "))
+        }
         if headsetMode {
             print("  stream settings: \(previewPerEyeWidth)x\(previewPerEyeHeight) per eye, "
                   + "\(options.latencyPreset.rawValue) latency")
@@ -387,17 +616,35 @@ struct BasaltStreamerApp {
         print("""
 
         View the stream:
-          ffplay -probesize 32 -analyzeduration 0 -fflags nocache -flags low_delay -framedrop -f h264 tcp://127.0.0.1:\(options.port)
+          ffplay -probesize 32 -analyzeduration 0 -fflags nocache -flags low_delay -framedrop -f \(options.codec.ffmpegFormat) tcp://127.0.0.1:\(options.port)
 
         Ctrl-C to stop.
         """)
+
+        // Timer-driven, so a complete stall (no frames, no tracking) still
+        // prints a line with a growing tracking gap instead of going quiet.
+        var pipelineTimer: DispatchSourceTimer?
+        if headsetMode {
+            _ = pipelineStatistics.snapshot()
+            let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+            timer.schedule(deadline: .now() + .seconds(2), repeating: .seconds(2))
+            timer.setEventHandler {
+                print(StreamReport.pipelineLine(pipelineStatistics.snapshot()))
+            }
+            timer.resume()
+            pipelineTimer = timer
+        }
 
         // Capture and networking run on their own queues; park main until
         // SIGINT/SIGTERM, then tear down cleanly (stops the capture stream
         // and closes client sockets instead of dying mid-write).
         await ShutdownSignals().wait()
+        pipelineTimer?.cancel()
+        idleFillerTimer?.cancel()
         print("\nShutting down…")
         discovery?.stop()
+        beaconMailbox.close()
+        supervisor?.stop()
         runtimeLink?.stop()
         gameAudio?.stop()
         if let audioOutputRoute {
@@ -416,12 +663,11 @@ struct BasaltStreamerApp {
         wiredConnection?.stop()
     }
 
+    /// One ALVR handshake plus this streamer's callbacks. The returned
+    /// session is already installed in `alvrVideo`; the supervisor detaches
+    /// and closes it when it ends.
     private static func connectHeadset(
-        host: String,
-        expectedProtocolId: UInt64?,
-        wired: Bool,
-        requestedViewWidth: Int,
-        requestedViewHeight: Int,
+        request: AlvrClientSessionRequest,
         stereoComposer: StereoFrameComposer?,
         options: StreamerOptions,
         alvrVideo: AlvrVideoStreamRouter,
@@ -429,21 +675,57 @@ struct BasaltStreamerApp {
         headsetLatencyReporter: HeadsetLatencyReporter,
         calibrationLogGate: CalibrationLogGate,
         encoder: H264Encoder,
-        streamRecovery: StreamRecoveryController
-    ) async throws -> (handshake: AlvrSessionHandshakeResult, displayName: String) {
-        let handshake = try await AlvrControlProbe.negotiateSession(
-            host: host,
-            requestedViewWidth: UInt32(requestedViewWidth),
-            requestedViewHeight: UInt32(requestedViewHeight),
-            preferredRefreshRate: Float(options.fps),
-            latencyPreset: options.latencyPreset,
-            wired: wired)
-        guard case .accepted(let protocolId, let displayName, _, let capabilities) =
+        videoRecovery: VideoLossRecoveryGate,
+        pipelineStatistics: PipelineStatistics
+    ) async throws -> AlvrClientSession {
+        var displayName = "headset"
+        let session = try await AlvrClientSession.connect(request) { handshake, videoSender in
+            displayName = try configureHeadsetSession(
+                handshake: handshake, videoSender: videoSender, wired: request.wired,
+                stereoComposer: stereoComposer, options: options,
+                runtimeLink: runtimeLink,
+                headsetLatencyReporter: headsetLatencyReporter,
+                calibrationLogGate: calibrationLogGate,
+                encoder: encoder, videoRecovery: videoRecovery,
+                pipelineStatistics: pipelineStatistics)
+        }
+        // Earlier encoder output was skipped while no session existed, so the
+        // first frame of every session, including a reconnect, is an IDR, and
+        // no P-frame reaches the new session before it.
+        videoRecovery.restart()
+        session.stream.onTrackingReady { videoRecovery.restart() }
+        alvrVideo.install(session.stream, controlSession: session.control)
+        print("ALVR control accepted by '\(displayName)': StreamConfig sent, "
+            + "StartStream sent, and Quest replied StreamReady.")
+        if request.wired {
+            print("  ALVR TCP video stream connected through USB at \(request.host):\(request.streamPort); "
+                + "tracking uplink ready; sending \(request.codec.displayName) frames.")
+        } else {
+            print("  ALVR UDP video stream connected to \(request.host):\(request.streamPort); "
+                + "sending \(request.codec.displayName) desktop frames.")
+        }
+        return session
+    }
+
+    /// Logs the negotiated settings and wires the control and stream
+    /// callbacks of a session that is not yet streaming. Returns the
+    /// headset's display name.
+    private static func configureHeadsetSession(
+        handshake: AlvrSessionHandshakeResult,
+        videoSender: AlvrVideoStreamSender,
+        wired: Bool,
+        stereoComposer: StereoFrameComposer?,
+        options: StreamerOptions,
+        runtimeLink: RuntimeLink?,
+        headsetLatencyReporter: HeadsetLatencyReporter,
+        calibrationLogGate: CalibrationLogGate,
+        encoder: H264Encoder,
+        videoRecovery: VideoLossRecoveryGate,
+        pipelineStatistics: PipelineStatistics
+    ) throws -> String {
+        guard case .accepted(_, let displayName, _, let capabilities) =
                 handshake.clientState else {
             throw BasaltError("ALVR headset is in standby")
-        }
-        if let expectedProtocolId, protocolId != expectedProtocolId {
-            throw BasaltError("ALVR protocol mismatch between discovery and control packet")
         }
         if let capabilities {
             let rates = capabilities.refreshRates.map { String(format: "%.0f", $0) }
@@ -454,15 +736,20 @@ struct BasaltStreamerApp {
                 + "10-bit=\(capabilities.supports10Bit), AV1=\(capabilities.supportsAV1)")
             let negotiated = try requireNegotiatedSettings(handshake.negotiatedSettings)
             print("  prepared stereo desktop preview: \(negotiated.width)x\(negotiated.height) per eye "
-                + "@ \(String(format: "%.0f", negotiated.refreshRate)) Hz, H.264")
+                + "@ \(String(format: "%.0f", negotiated.refreshRate)) Hz, "
+                + options.codec.displayName)
+            // The runtime paces xrWaitFrame to the rate the Quest displays,
+            // not to the requested --fps, so a 90 Hz headset gets 90 Hz frames.
+            if let runtimeLink, runtimeLink.setDisplayRefreshRate(negotiated.refreshRate) {
+                print("  OpenXR frame pacing: "
+                    + String(format: "%.0f Hz", negotiated.refreshRate)
+                    + (abs(negotiated.refreshRate - Float(options.fps)) >= 0.5
+                        ? " (closest headset rate to --fps \(options.fps))" : ""))
+            }
         } else {
             print("  headset did not provide streaming capabilities")
         }
-        guard handshake.streamReady else {
-            throw BasaltError("Quest did not report StreamReady")
-        }
-
-        handshake.onRequestIDR { streamRecovery.requestIDR() }
+        handshake.onRequestIDR { videoRecovery.clientRequestedIDR() }
         handshake.onViewsConfig { config in
             stereoComposer?.updateViews(config)
             runtimeLink?.publishViewsConfig(config)
@@ -471,17 +758,40 @@ struct BasaltStreamerApp {
                 print("  calibrated desktop preview from headset IPD/FOV (IPD \(ipd) mm)")
             }
         }
-        handshake.onButtons { entries in
-            runtimeLink?.publishButtons(entries)
+        // One router per ALVR session: it decides per hand whether the game
+        // sees the Touch controller or Quest hand tracking (an emulated Touch
+        // controller driven by gestures, plus the hand skeleton).
+        var routerOutputs = HandTrackingInputRouter.Outputs()
+        routerOutputs.controllerMotion = { timestamp, hand, motion in
+            runtimeLink?.publishControllerMotion(
+                timestampNanoseconds: timestamp, hand: hand, motion: motion)
         }
-        handshake.onActiveInteractionProfile { deviceID, profileID in
+        routerOutputs.controllerMask = { timestamp, activeMask in
+            runtimeLink?.publishControllerMask(
+                timestampNanoseconds: timestamp, activeMask: activeMask)
+        }
+        routerOutputs.handSkeleton = { timestamp, hand, skeleton in
+            runtimeLink?.publishHandSkeleton(
+                timestampNanoseconds: timestamp, hand: hand, skeleton: skeleton)
+        }
+        routerOutputs.buttons = { entries in runtimeLink?.publishButtons(entries) }
+        routerOutputs.interactionProfile = { deviceID, profileID in
             runtimeLink?.publishInteractionProfile(deviceID: deviceID, profileID: profileID)
         }
-        handshake.onDisconnect {
-            runtimeLink?.resetInputs()
+        routerOutputs.modeChanged = { hand, handTracked in
+            let name = hand == .left ? "left" : "right"
+            print(handTracked
+                ? "  \(name) hand: Quest hand tracking (pinch = trigger, fist = grip)"
+                : "  \(name) hand: Touch controller")
         }
-        let transport: AlvrStreamTransport = wired ? .tcp : .udp
-        let videoSender = try AlvrVideoStreamSender(host: host, transport: transport)
+        let handInput = HandTrackingInputRouter(
+            handTrackingEnabled: options.handTracking, outputs: routerOutputs)
+        handshake.onButtons { entries in
+            handInput.handleClientButtons(entries)
+        }
+        handshake.onActiveInteractionProfile { deviceID, profileID in
+            handInput.handleClientInteractionProfile(deviceID: deviceID, profileID: profileID)
+        }
         let transportReporter = VideoTransportReporter(name: wired ? "USB" : "Wi-Fi")
         let audioReporter = AudioTransportReporter(name: wired ? "USB" : "Wi-Fi")
         let adaptiveBitrate = wired ? nil : AdaptiveVideoBitrateController(
@@ -496,26 +806,37 @@ struct BasaltStreamerApp {
             fputs("ALVR stream send error: \(error.localizedDescription)\n", stderr)
         }
         videoSender.onFrameSent = { report in
+            if report.isIDR { videoRecovery.idrDelivered() }
             transportReporter.record(report)
+            if let age = report.trackingAgeNanoseconds {
+                pipelineStatistics.recordPoseAge(nanoseconds: age)
+            }
         }
         videoSender.onAudioSent = { report in
             audioReporter.record(report)
         }
+        videoSender.onTrackingTimestamp = { timestamp in
+            pipelineStatistics.recordTracking(timestampNanoseconds: timestamp)
+        }
         let networkDrops = ThrottledEventLog()
         videoSender.onFrameDropped = {
             networkDrops.record { "ALVR network busy: dropped \($0) stale video frame(s)" }
+            pipelineStatistics.recordDrop(.network)
+            // A dropped access unit leaves no gap in ALVR's packet index, so
+            // the Quest cannot notice it; every later P-frame would reference
+            // the missing picture. Hold P-frames and force an IDR.
+            videoRecovery.frameLost()
         }
         videoSender.onAudioDropped = {
             audioReporter.recordDrop()
         }
         videoSender.onCongestion = {
-            // Packet loss corrupts the current H.264 access unit. Ask
-            // VideoToolbox for a fresh recovery point. Repeated pressure also
-            // lowers the encoder target before another large IDR is emitted.
+            // The lost shard was already reported through `onFrameDropped`,
+            // which starts IDR recovery. Repeated pressure also lowers the
+            // encoder target before another large IDR is emitted.
             if let bitrate = adaptiveBitrate?.recordTransportCongestion() {
                 applyAdaptiveBitrate(bitrate)
             }
-            streamRecovery.requestIDR()
         }
         videoSender.onStatistics = { statistics in
             headsetLatencyReporter.record(statistics)
@@ -527,45 +848,63 @@ struct BasaltStreamerApp {
             runtimeLink?.publishHeadPose(
                 timestampNanoseconds: timestamp, pose: pose)
         }
-        videoSender.onControllerMotion = { timestamp, hand, motion in
-            runtimeLink?.publishControllerMotion(
-                timestampNanoseconds: timestamp, hand: hand, motion: motion)
+        videoSender.onTrackingSample = { sample in
+            handInput.handleTracking(sample)
         }
-        videoSender.onControllerMask = { timestamp, activeMask in
-            runtimeLink?.publishControllerMask(
-                timestampNanoseconds: timestamp, activeMask: activeMask)
+        let logsHaptics = AlvrHapticsLog.isEnabled()
+        if logsHaptics, runtimeLink != nil {
+            fputs("BASALT_HAPTIC_LOG: logging every runtime haptic sent to ALVR\n", stderr)
         }
         runtimeLink?.onHaptic { [weak videoSender] hand, duration, frequency, amplitude in
+            if logsHaptics {
+                fputs(AlvrHapticsLog.line(
+                    hand: hand, durationNanoseconds: duration,
+                    frequency: frequency, amplitude: amplitude,
+                    uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds) + "\n", stderr)
+            }
             videoSender?.sendHaptics(
                 hand: hand, durationNanoseconds: duration,
                 frequency: frequency, amplitude: amplitude)
         }
+        return displayName
+    }
+}
 
-        // StreamReady means the client's control state advanced, but an ALVR
-        // client left stale by a prior wired session can accept both TCP
-        // connections without sending its tracking uplink. Video headers must
-        // use the Quest clock, so the router intentionally drops frames until
-        // that uplink exists. Treat tracking as part of connection readiness
-        // and let the wired retry loop replace a half-open session.
-        let trackingDeadline = DispatchTime.now().uptimeNanoseconds + 10_000_000_000
-        while videoSender.timestampForVideoFrame() == nil {
-            guard DispatchTime.now().uptimeNanoseconds < trackingDeadline else {
-                throw AlvrTrackingTimeoutError()
-            }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        videoSender.onTrackingReady { streamRecovery.forceIDR() }
-        alvrVideo.install(videoSender, controlSession: handshake)
-        print("ALVR control accepted by '\(displayName)': StreamConfig sent, "
-            + "StartStream sent, and Quest replied StreamReady.")
-        if wired {
-            print("  ALVR TCP video stream connected through USB at \(host):\(AlvrVideoStreamSender.defaultPort); "
-                + "tracking uplink ready; sending H.264 frames.")
-        } else {
-            print("  ALVR UDP video stream connected to \(host):\(AlvrVideoStreamSender.defaultPort); "
-                + "sending H.264 desktop frames.")
-        }
-        return (handshake, displayName)
+/// A zeroed BGRA IOSurface frame of the encoded size, for idle filler video.
+private func makeBlackFrame(width: Int, height: Int) throws -> CVPixelBuffer {
+    let attributes: [CFString: Any] = [
+        kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+    ]
+    var maybeBuffer: CVPixelBuffer?
+    let status = CVPixelBufferCreate(
+        nil, width, height, kCVPixelFormatType_32BGRA,
+        attributes as CFDictionary, &maybeBuffer)
+    guard status == kCVReturnSuccess, let buffer = maybeBuffer else {
+        throw BasaltError("Could not create the idle filler frame (\(status))")
+    }
+    CVPixelBufferLockBaseAddress(buffer, [])
+    if let base = CVPixelBufferGetBaseAddress(buffer) {
+        memset(base, 0, CVPixelBufferGetDataSize(buffer))
+    }
+    CVPixelBufferUnlockBaseAddress(buffer, [])
+    return buffer
+}
+
+/// Set once, read from any thread.
+private final class SessionFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func set() {
+        lock.lock()
+        value = true
+        lock.unlock()
     }
 }
 
@@ -832,42 +1171,6 @@ private final class AudioTransportReporter: @unchecked Sendable {
     }
 }
 
-/// Coordinates Quest decoder feedback with VideoToolbox. IDR requests are
-/// rate-limited because a saturated decoder asks for recovery repeatedly; an
-/// unbounded keyframe response makes saturation substantially worse.
-private final class StreamRecoveryController: @unchecked Sendable {
-    private weak var encoder: H264Encoder?
-    private let minimumIDRIntervalNanoseconds: UInt64
-    private let lock = NSLock()
-    private var lastIDRNanoseconds: UInt64 = 0
-
-    init(encoder: H264Encoder, minimumIDRIntervalNanoseconds: UInt64) {
-        self.encoder = encoder
-        self.minimumIDRIntervalNanoseconds = minimumIDRIntervalNanoseconds
-    }
-
-    func requestIDR() {
-        let now = DispatchTime.now().uptimeNanoseconds
-        lock.lock()
-        guard lastIDRNanoseconds == 0
-                || now &- lastIDRNanoseconds >= minimumIDRIntervalNanoseconds else {
-            lock.unlock()
-            return
-        }
-        lastIDRNanoseconds = now
-        lock.unlock()
-        encoder?.forceKeyframe()
-    }
-
-    func forceIDR() {
-        lock.lock()
-        lastIDRNanoseconds = DispatchTime.now().uptimeNanoseconds
-        lock.unlock()
-        encoder?.forceKeyframe()
-    }
-
-}
-
 private final class CalibrationLogGate: @unchecked Sendable {
     private let lock = NSLock()
     private var hasLogged = false
@@ -878,6 +1181,13 @@ private final class CalibrationLogGate: @unchecked Sendable {
         guard !hasLogged else { return false }
         hasLogged = true
         return true
+    }
+
+    /// A reconnected headset logs its calibration again.
+    func reset() {
+        lock.lock()
+        hasLogged = false
+        lock.unlock()
     }
 }
 

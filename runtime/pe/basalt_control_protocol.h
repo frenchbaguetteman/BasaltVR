@@ -14,6 +14,12 @@
  * Width and height are optional for compatibility; when absent or outside
  * BASALT_CONTROL_{MIN_VIEW_DIMENSION,MAX_VIEW_WIDTH,MAX_VIEW_HEIGHT} (or
  * odd), the runtime recommends its maximum per-eye size instead.
+ * An optional last field lists comma-separated features; it starts with a
+ * lowercase letter, so it never parses as a size:
+ *   "<port> <token> [<width> <height>] [<feature>[,<feature>...]]"
+ * Known feature: BASALT_CONTROL_FEATURE_HAND_TRACKING ("hand_tracking"), set
+ * when the streamer forwards Quest hand skeletons; the runtime then
+ * advertises XR_EXT_hand_tracking. Unknown features are ignored.
  *
  * Framing, all little-endian, no padding (fields are written sequentially,
  * not as C structs):
@@ -26,7 +32,10 @@
  *     u16 protocol_version, char token[32], u64 session_id,
  *     u16 renderer_length, char renderer[]   — adapter/DXMT description
  *   HELLO_ACK (daemon → runtime)
- *     u16 accepted_protocol_version
+ *     u16 accepted_protocol_version, u64 display_period_ns
+ *     — the headset refresh period xrWaitFrame paces to (the Quest rate the
+ *     daemon negotiated). Outside BASALT_CONTROL_{MIN,MAX}_DISPLAY_PERIOD_NS
+ *     the runtime keeps BASALT_CONTROL_DEFAULT_DISPLAY_PERIOD_NS (72 Hz).
  *   CREATE_SWAPCHAIN (runtime → daemon)
  *     u64 swapchain_id, u32 width, u32 height, u32 dxgi_format,
  *     u32 image_count, u32 iosurface_id[image_count]
@@ -66,18 +75,35 @@
  *   CONTROLLER_MASK (daemon → runtime; authoritative tracking presence)
  *     u64 tracking_timestamp_ns, u32 active_mask (bit 0 left, bit 1 right),
  *     u32 reserved (zero)
+ *   HAND_SKELETON (daemon → runtime; latest sample wins per hand)
+ *     u64 tracking_timestamp_ns, u32 hand (0 left, 1 right),
+ *     u32 joint_valid_mask (bit i = joint i, XR_EXT_hand_tracking order;
+ *       0 = hand not tracked, all joints ignored; else all 26 bits set),
+ *     then BASALT_CONTROL_HAND_JOINT_COUNT joints, each:
+ *       f32 orientation[4] (xyzw), f32 position[3], f32 radius_meters
+ *     — joint poses are in the same Quest stage frame as CONTROLLER_MOTION.
+ *     A hand-tracked hand also gets a CONTROLLER_MOTION (its emulated grip
+ *     pose) and emulated BUTTON_STATE values from the streamer.
  *   TEARDOWN (either direction)
  *     u32 reason (BASALT_TEARDOWN_*)
  */
 
-#define BASALT_CONTROL_PROTOCOL_VERSION 9u
+#define BASALT_CONTROL_PROTOCOL_VERSION 11u
 #define BASALT_CONTROL_TOKEN_LENGTH 32u
 #define BASALT_CONTROL_MAX_MESSAGE_LENGTH 4096u
+/* Display period bounds for HELLO_ACK: 240 Hz to 30 Hz; default 72 Hz. */
+#define BASALT_CONTROL_MIN_DISPLAY_PERIOD_NS 4166666u
+#define BASALT_CONTROL_MAX_DISPLAY_PERIOD_NS 33333334u
+#define BASALT_CONTROL_DEFAULT_DISPLAY_PERIOD_NS 13888889u
 /* Per-eye view size bounds. The maximum is also the runtime's advertised and
  * accepted swapchain limit. */
 #define BASALT_CONTROL_MIN_VIEW_DIMENSION 256u
 #define BASALT_CONTROL_MAX_VIEW_WIDTH 1680u
 #define BASALT_CONTROL_MAX_VIEW_HEIGHT 1760u
+/* XR_HAND_JOINT_COUNT_EXT; HAND_SKELETON payload is 16 + 26 * 32 bytes. */
+#define BASALT_CONTROL_HAND_JOINT_COUNT 26u
+#define BASALT_CONTROL_HAND_SKELETON_PAYLOAD_LENGTH 848u
+#define BASALT_CONTROL_FEATURE_HAND_TRACKING "hand_tracking"
 
 enum {
     BASALT_MSG_HELLO = 1,
@@ -97,6 +123,7 @@ enum {
     BASALT_MSG_VIEW_CONFIG = 15,
     BASALT_MSG_CONTROLLER_MASK = 16,
     BASALT_MSG_FRAME_CONSUMED = 17,
+    BASALT_MSG_HAND_SKELETON = 18,
 };
 
 enum {

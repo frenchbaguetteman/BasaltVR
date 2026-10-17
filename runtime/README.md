@@ -14,14 +14,34 @@ flags become tracked only while a fresh ALVR HMD pose is available.
 It now conditionally advertises `XR_KHR_D3D11_enable` after an in-process capability gate proves
 feature level 11.0 plus D3D11 NT-handle create, reopen, GPU copy, and readback. In that environment
 the runtime returns the DXGI adapter LUID, validates the application's D3D11 session binding, and
-implements up to four independent three-image color swapchains with format enumeration and
-acquire/wait/release. Every swapchain texture uses `D3D11_RESOURCE_MISC_SHARED_NTHANDLE`.
+implements up to 16 independent three-image swapchains with format enumeration and
+acquire/wait/release. Only `DXGI_FORMAT_B8G8R8A8_UNORM` and `_UNORM_SRGB` are advertised, so engines
+that choose from the list (Unity) stay on the zero-copy path. Other color/depth formats (RGBA8,
+BGRX8, 10-bit, float, typeless), mip chains, and sizes up to 4096 are still accepted by
+`xrCreateSwapchain` and converted by the runtime compositor, for OpenVR-translation layers such as
+OpenComposite that never enumerate. This deliberately goes beyond the spec's
+`XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED`. Set `BASALT_ADVERTISE_ALL_FORMATS=1` to advertise every
+supported format when testing. Every swapchain texture uses `D3D11_RESOURCE_MISC_SHARED_NTHANDLE`.
 WhiskyWine 7.7 with Apple D3DMetal fails the gate and therefore sees zero runtime graphics
 extensions; pinned DXMT v0.80 under Wine 11.10 passes it.
 
 The runtime now also provides FIFO session events, the required session control calls, an
-absolute-deadline 72 Hz `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame` contract, and bounded `VIEW`/`LOCAL`
-reference-space handles. Headless sessions stop at `SYNCHRONIZED` with `shouldRender` false.
+absolute-deadline `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame` contract paced to the headset refresh
+period the streamer negotiated (72 Hz while headless), and bounded `VIEW`/`LOCAL`/`STAGE`
+reference-space handles. `STAGE` shares LOCAL's floor-level origin and follows its recenter;
+`xrGetReferenceSpaceBoundsRect(STAGE)` returns `XR_SPACE_BOUNDS_UNAVAILABLE`.
+`XR_KHR_visibility_mask` is advertised with `XR_KHR_D3D11_enable`; because ALVR does not report
+the Quest lens mask, every mask type has zero vertices and indices, as the spec requires when no
+mask is known. An action set may be attached again to a later session once its previous session
+is destroyed (OpenComposite does this whenever it restarts its session).
+`XR_EXT_hand_tracking` is advertised only when the `BASALT_CONTROL` file lists the
+`hand_tracking` feature (protocol v11): trackers report the streamer's Quest `HAND_SKELETON`
+joints, converted like controller poses (recenter included), and an untracked or stale hand is
+`isActive = XR_FALSE` with `XR_SUCCESS`, never an error, as OpenComposite requires. See
+[hand tracking](../docs/HAND-TRACKING.md). The `control-socket` gate of `test-dxmt.zsh` checks
+injected skeletons (daemon `--hand-tracking`, smoke `BASALT_EXPECT_HAND_TRACKING=1`); every other
+run asserts the extension is absent. Headless sessions stop at `SYNCHRONIZED` with
+`shouldRender` false.
 Sessions authenticated to the native `RuntimeLink` progress through `VISIBLE`/`FOCUSED` with
 `shouldRender` true and unwind those states during clean exit.
 
@@ -40,7 +60,11 @@ inactive, no input sources are bound or localizable, and haptics validate withou
 Connected Quest sessions additionally store Oculus Touch suggestions, snapshot buttons/profile
 state at `xrSyncActions`, locate live grip action spaces, expose controller velocity through
 `XrSpaceVelocity`, enumerate and localize resolved sources, and forward priority-filtered haptic
-apply/stop commands to ALVR. Protocol v7's timestamped `ControllerMask` clears a missing hand's
+apply/stop commands to ALVR. Out-of-range haptic values are normalized instead of failing, because
+OpenVR translation layers pass game values through and abort the game on any error: amplitude is
+clamped to [0, 1], zero amplitude is sent as a stop, and a duration of zero or less
+(`XR_MIN_HAPTIC_DURATION`, zero-length OpenVR pulses) plays a 5 ms pulse.
+Protocol v7's timestamped `ControllerMask` clears a missing hand's
 pose and velocity immediately and permits recovery only from a newer presence/motion sample.
 The first fresh head sample defines LOCAL at the viewer's horizontal position and leveled yaw.
 Holding the right Quest system/Meta button for 600 ms redefines that origin at the current head
@@ -52,9 +76,12 @@ runtime logs `right system button pressed` to stderr when ALVR forwards the butt
 
 `xrEndFrame` now accepts stereo `XrCompositionLayerProjection` layers: it validates layer
 flags, session ownership of the layer space and each subimage swapchain, per-view poses and
-FOV, in-bounds image rects (`XR_ERROR_SWAPCHAIN_RECT_INVALID`), the 16-layer minimum limit
-(`XR_ERROR_LAYER_LIMIT_EXCEEDED`), and that every referenced swapchain has a released image.
-Quad and extension layers are still rejected. With the Basalt DXMT fork and an authenticated
+FOV, in-bounds image rects (`XR_ERROR_SWAPCHAIN_RECT_INVALID`; a negative extent flips that axis),
+the 16-layer minimum limit (`XR_ERROR_LAYER_LIMIT_EXCEEDED`), and that every referenced swapchain
+has a released image. Quad layers are accepted too. Frames the streamer cannot read directly
+(non-BGRA, mipmapped, or oversized swapchains, quad layers, sub-rects, flipped rects) are drawn by
+the runtime compositor into a BGRA output swapchain; plain BGRA projection frames skip it. Other
+layer types and extension layers are rejected. With the Basalt DXMT fork and an authenticated
 control connection, accepted projection layers are fence-gated and forwarded by IOSurfaceID to
 the native Swift streamer for stereo composition and encoding. This path is machine-verified and
 has a Basalt-shaped visible wired-headset diagnostic. The pinned official Khronos `hello_xr`
@@ -129,7 +156,8 @@ script registers Basalt's manifest only in that prefix, and
 then uses the official Khronos loader to exercise reference spaces, session and interaction-profile
 events, frame call ordering, exact profile bindings/localized names, action-set priority, action
 spaces, velocity, controller loss/recovery, haptics, static `xrLocateSpace`/`xrLocateViews`,
-projection-layer submission (accept, quad/limit/rect/never-released rejection), and two independent
+projection-layer submission (accept, limit/rect/never-released rejection, quad and flipped-rect
+compositing), and two independent
 three-image D3D11 swapchains. It also verifies that a two-slice texture-array swapchain is rejected
 so engines can take a per-eye multipass fallback. It does not modify `/Applications`,
 Whisky, CrossOver, or a game bottle. Rosetta 2 is required on Apple Silicon. Override the
@@ -163,6 +191,11 @@ official 1.1.61 source:
 runtime/scripts/test-khr-hello-xr-headset.zsh
 ```
 
+It reads the same `BASALT_HEADSET_FPS`, `BASALT_HEADSET_MBPS`, and `BASALT_HEADSET_RESOLUTION`
+variables, plus `BASALT_HEADSET_STREAMER_ARGS` for extra streamer flags (split on spaces, for
+example `'--idr-interval 10 --entropy cavlc'`), and `BASALT_HEADSET_TRANSPORT=usb|wifi|auto`
+(default `auto`). See [performance](../docs/PERFORMANCE.md) for what to measure.
+
 The target uses only small MinGW SDK compatibility headers; the upstream sample sources are not
 rewritten. It has completed a live Quest run through `FOCUSED`, two D3D11 eye swapchains, localized
 Touch actions, roughly 14 seconds of rendering, and clean `STOPPING→IDLE→EXITING` teardown. That is
@@ -194,6 +227,29 @@ known pattern into a gated texture through the immediate context, waits an
 maps that IOSurface by ID and must read the exact bytes. The tree is restored to the
 pinned stock overlay afterwards, including when a fork-phase step fails.
 
+### Compositor, OpenComposite, and MSAA checks
+
+`test-dxmt.zsh` also runs `d3d11_compositor_smoke` headless (the compositor API surface: formats,
+limits, layer validation, FIFO swapchain order, repeated wait+begin, and session replacement events)
+and, in the fork phase, as the "runtime compositor" control-socket gate, where OpenComposite-shaped
+swapchains and layers must reach the native daemon as the compositor's BGRA output with the expected
+pixels. It also runs `dxmt_msaa_probe` (8x MSAA creation and resolve; stock DXMT fails it, the fork
+must pass it). When `runtime/build/opencomposite/out/openvr_api.dll` exists (or `OPENCOMPOSITE_DLL`
+names one), it runs `opencomposite_frame_timing_smoke` against OpenComposite on the headless
+runtime; otherwise it prints a `SKIP` line. `runtime/scripts/test-openvr-proxy.zsh` builds and
+checks the OpenVR proxy; see [OpenComposite](../docs/OPENCOMPOSITE.md).
+
+### Runtime diagnostics
+
+- `BASALT_RUNTIME_LOG` names a file (a Windows path, or a host path starting with `/`) to which
+  the runtime appends its `Basalt OpenXR` diagnostic lines in addition to stderr. A game started by
+  another program has no stderr in the session log, so this file is its only record.
+  `scripts/play.zsh` sets it to `~/Library/Logs/BasaltVR/runtime-<time>.log`.
+- `BASALT_HAPTIC_LOG=1` writes every haptic call to stderr: the game's values, the target hands,
+  the result, and the values sent.
+- `BASALT_ADVERTISE_ALL_FORMATS=1` advertises every swapchain format the compositor accepts,
+  not only the BGRA pair, for testing.
+
 ## Next implementation boundary
 
 The next app-facing and graphics slices are:
@@ -213,11 +269,17 @@ The next app-facing and graphics slices are:
    (`streamer/Sources/BasaltCore/RuntimeLink.swift`, via `basalt-streamer
    runtime-link-selftest`), which must acknowledge and encode at least 21 frames to H.264
    through the zero-copy IOSurface → CVPixelBuffer → VideoToolbox path. The runtime advertises
-   only BGRA/BGRA-sRGB swapchains because CoreVideo cannot wrap DXMT's RGBA IOSurfaces; rejecting
-   that format at negotiation prevents a silent black stream. Protocol v9 binds each frame to the exact Quest tracking timestamp
+   only BGRA/BGRA-sRGB swapchains because CoreVideo cannot wrap DXMT's RGBA IOSurfaces; other
+   formats are converted to BGRA by the runtime compositor instead of reaching the streamer.
+   Protocol v10 paces `xrWaitFrame` to the Quest refresh period sent in `HelloAck` (the
+   control-socket gate negotiates 90 Hz and checks `predictedDisplayPeriod`); protocol v11 adds
+   `HAND_SKELETON`. The protocol binds each frame to the exact Quest tracking timestamp
    used by its successful `xrLocateViews` call, preserves it through VideoToolbox into ALVR,
    and requires an ordered post-Metal-read acknowledgement. A strict two-frame window overlaps
-   game rendering with native compose/encode while preventing latency accumulation. The control handoff also carries the
+   game rendering with native compose/encode while preventing latency accumulation. The control
+   socket is created non-inheritable, so a game started by another game (The Lab starts Robot
+   Repair) opens its own authenticated connection instead of sharing its parent's. The control
+   handoff also carries the
    selected per-eye stream dimensions so applications render at the target resolution instead
    of rendering 1680×1760 and immediately downscaling it.
    `runtime/scripts/test-headset.zsh` now runs that producer for a

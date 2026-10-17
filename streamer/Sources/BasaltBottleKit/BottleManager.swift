@@ -83,11 +83,18 @@ public struct LaunchProfile: Codable, Equatable, Sendable {
     public var arguments: [String]
     public var workingDirectory: String?
     public var environment: [String: String]
+    /// Install folder of the game, used to decide when a session is over. Some
+    /// games start a second program and exit (The Lab starts Robot Repair), so
+    /// the launched executable ending does not end the game. `play.zsh` keeps
+    /// the session open while any Windows process runs from under this folder.
+    /// When nil, it uses the `steamapps/common/<Game>` folder of `executable`.
+    public var gameRoot: String?
 
     public init(name: String, bottleName: String, source: LaunchSource,
                 executable: String, arguments: [String] = [],
                 workingDirectory: String? = nil,
-                environment: [String: String] = [:]) {
+                environment: [String: String] = [:],
+                gameRoot: String? = nil) {
         formatVersion = Self.currentFormatVersion
         self.name = name
         self.bottleName = bottleName
@@ -96,6 +103,7 @@ public struct LaunchProfile: Codable, Equatable, Sendable {
         self.arguments = arguments
         self.workingDirectory = workingDirectory
         self.environment = environment
+        self.gameRoot = gameRoot
     }
 }
 
@@ -820,8 +828,18 @@ public final class BottleManager: @unchecked Sendable {
         try fileManager.removeItem(at: file)
     }
 
+    /// File name of the real OpenComposite DLL when the Basalt proxy owns `openvr_api.dll`.
+    public static let openCompositeProxiedDLLName = "openvr_api_opencomposite.dll"
+
+    /// Installs OpenComposite as a game's `openvr_api.dll` and writes `opencomposite.ini`.
+    ///
+    /// With `proxy`, the Basalt proxy becomes `openvr_api.dll` and `artifact` is installed beside
+    /// it as `openvr_api_opencomposite.dll`. The proxy adds the Valve exports OpenComposite
+    /// lacks, such as the `VRControlPanel` export Half-Life: Alyx needs.
     public func installOpenComposite(profileName: String, artifact: URL,
-                                     targetDLL: URL) throws -> URL {
+                                     targetDLL: URL, proxy: URL? = nil,
+                                     configuration: OpenCompositeConfiguration = .standard)
+        throws -> URL {
         let profile = try loadProfile(profileName)
         let bottle = try loadBottle(profile.bottleName)
         let prefix = URL(fileURLWithPath: bottle.prefixPath).standardizedFileURL
@@ -845,9 +863,23 @@ public final class BottleManager: @unchecked Sendable {
             throw BottleToolError("OpenComposite target must be named openvr_api.dll")
         }
         let bytes = try Data(contentsOf: artifact)
-        guard bytes.count >= 2, bytes[bytes.startIndex] == 0x4d,
-              bytes[bytes.index(after: bytes.startIndex)] == 0x5a else {
+        guard Self.hasDOSHeader(bytes) else {
             throw BottleToolError("OpenComposite artifact is not a Windows PE DLL")
+        }
+        var proxyBytes: Data?
+        if let proxy {
+            let candidate = try Data(contentsOf: proxy)
+            guard let proxyMachine = Self.peMachine(candidate) else {
+                throw BottleToolError("OpenVR proxy is not a Windows PE DLL")
+            }
+            guard let artifactMachine = Self.peMachine(bytes) else {
+                throw BottleToolError("OpenComposite artifact is not a Windows PE DLL")
+            }
+            guard proxyMachine == artifactMachine else {
+                throw BottleToolError(
+                    "OpenVR proxy and OpenComposite artifact target different CPU architectures")
+            }
+            proxyBytes = candidate
         }
         try fileManager.createDirectory(
             at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -863,17 +895,42 @@ public final class BottleManager: @unchecked Sendable {
                 try copyFile(target, to: backup)
             }
         }
-        try bytes.write(to: target, options: .atomic)
-        let configuration = """
-        ; Managed by BasaltVR. OpenComposite remains a separately supplied GPLv3 artifact.
-        initUsingVulkan=false
-        enableAudio=false
-        """
-        try configuration.write(
+        let proxied = target.deletingLastPathComponent()
+            .appendingPathComponent(Self.openCompositeProxiedDLLName)
+        if let proxyBytes {
+            // Write the forwarding target first so openvr_api.dll never forwards to nothing.
+            try bytes.write(to: proxied, options: .atomic)
+            try proxyBytes.write(to: target, options: .atomic)
+        } else {
+            try bytes.write(to: target, options: .atomic)
+            // A previous proxied install left the real DLL beside the target. Remove it so the
+            // directory holds a single OpenComposite.
+            if fileManager.fileExists(atPath: proxied.path) {
+                try fileManager.removeItem(at: proxied)
+            }
+        }
+        try configuration.iniText.write(
             to: target.deletingLastPathComponent()
                 .appendingPathComponent("opencomposite.ini"),
             atomically: true, encoding: .utf8)
         return target
+    }
+
+    private static func hasDOSHeader(_ bytes: Data) -> Bool {
+        bytes.count >= 2 && bytes[bytes.startIndex] == 0x4d &&
+            bytes[bytes.index(after: bytes.startIndex)] == 0x5a
+    }
+
+    /// The COFF machine field of a PE image, or nil when `bytes` is not one.
+    static func peMachine(_ bytes: Data) -> UInt16? {
+        let image = [UInt8](bytes)
+        guard hasDOSHeader(bytes), image.count >= 0x40 else { return nil }
+        let offset = Int(image[0x3c]) | Int(image[0x3d]) << 8 |
+            Int(image[0x3e]) << 16 | Int(image[0x3f]) << 24
+        guard offset >= 0x40, offset <= image.count - 6,
+              image[offset] == 0x50, image[offset + 1] == 0x45,
+              image[offset + 2] == 0, image[offset + 3] == 0 else { return nil }
+        return UInt16(image[offset + 4]) | UInt16(image[offset + 5]) << 8
     }
 
     public func runProfile(_ name: String, controlFile: URL,
@@ -1087,6 +1144,10 @@ public final class BottleManager: @unchecked Sendable {
               shim[shim.index(after: shim.startIndex)] == 0x5a else {
             throw BottleToolError("Steam UI compatibility artifact is not a Windows PE executable")
         }
+        guard Self.isSteamWebHelperShim(shim) else {
+            throw BottleToolError(
+                "Steam UI compatibility artifact is not Basalt's web helper shim")
+        }
 
         let candidates = [
             prefix.appendingPathComponent(
@@ -1117,7 +1178,7 @@ public final class BottleManager: @unchecked Sendable {
         }
         let installed = try Data(contentsOf: helper)
 
-        if installed != shim {
+        if installed != shim && !Self.isSteamWebHelperShim(installed) {
             guard installed.count >= 2, installed[installed.startIndex] == 0x4d,
                   installed[installed.index(after: installed.startIndex)] == 0x5a else {
                 throw BottleToolError("Steam's web helper is not a Windows PE executable")
@@ -1126,6 +1187,10 @@ public final class BottleManager: @unchecked Sendable {
             // Steam. Preserve that exact version for the shim to launch.
             try copyFile(helper, to: backup)
         } else {
+            // The current shim, or a shim from another Basalt build (another
+            // checkout or worktree builds different bytes). Never preserve a
+            // shim as the original: the shim would then launch itself, and
+            // each launch would start another one (a process storm).
             guard fileManager.fileExists(atPath: backup.path) else {
                 throw BottleToolError(
                     "Steam UI compatibility is missing its preserved original helper")
@@ -1137,10 +1202,28 @@ public final class BottleManager: @unchecked Sendable {
               original[original.index(after: original.startIndex)] == 0x5a else {
             throw BottleToolError("Steam's preserved web helper is not a Windows PE executable")
         }
+        guard !Self.isSteamWebHelperShim(original) else {
+            throw BottleToolError(
+                "Steam's preserved web helper (\(backup.lastPathComponent)) is a Basalt shim, "
+                    + "not Steam's helper. Put Steam's steamwebhelper.exe there "
+                    + "(from Steam/package/bins_webhelpers_win64.zip.vz.*, or reinstall Steam)")
+        }
         if installed != shim {
             try copyFile(artifact, to: helper)
         }
         return helper
+    }
+
+    /// The shim launches "steamwebhelper.basalt-original.exe" and holds that
+    /// name as a UTF-16 string; Steam's own helper never contains it. This
+    /// recognises every shim build, not only the bytes of the current one.
+    static func isSteamWebHelperShim(_ data: Data) -> Bool {
+        var marker = Data()
+        for unit in "steamwebhelper.basalt-original.exe".utf16 {
+            marker.append(UInt8(unit & 0xff))
+            marker.append(UInt8(unit >> 8))
+        }
+        return data.range(of: marker) != nil
     }
 
     public func steamBootstrapCommand(forProfile name: String) throws -> BottleLaunchCommand? {

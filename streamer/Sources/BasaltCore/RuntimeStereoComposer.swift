@@ -46,8 +46,12 @@ public final class RuntimeStereoComposer: @unchecked Sendable {
     /// Preallocated outputs not currently in composition or downstream use.
     private var availableOutputs: [Output] = []
 
-    public init(perEyeWidth: Int, height: Int) throws {
-        guard perEyeWidth > 0, height > 0 else {
+    /// - Parameter retainedOutputs: extra preallocated outputs for frames a
+    ///   caller keeps beyond encoding (the streamer keeps the newest composed
+    ///   frame to repeat it while the game is idle), so keeping one does not
+    ///   reduce the frames that can be in flight.
+    public init(perEyeWidth: Int, height: Int, retainedOutputs: Int = 0) throws {
+        guard perEyeWidth > 0, height > 0, retainedOutputs >= 0 else {
             throw BasaltError("Invalid stereo output dimensions")
         }
         self.perEyeWidth = perEyeWidth
@@ -114,7 +118,7 @@ public final class RuntimeStereoComposer: @unchecked Sendable {
             kCVPixelBufferMetalCompatibilityKey: true,
             kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
         ]
-        for _ in 0..<Self.maximumFramesInFlight {
+        for _ in 0..<(Self.maximumFramesInFlight + retainedOutputs) {
             var maybeOutput: CVPixelBuffer?
             let outputStatus = CVPixelBufferCreate(
                 nil, perEyeWidth * 2, height, kCVPixelFormatType_32BGRA,

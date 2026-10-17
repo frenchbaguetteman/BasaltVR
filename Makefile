@@ -4,7 +4,7 @@ SHELL := /bin/zsh
 VERSION ?= 0.1.0
 REPO_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
-.PHONY: help doctor doctor-runtime doctor-dxmt check test build app runtime-build runtime-test dxmt-verify dxmt-test release
+.PHONY: help doctor doctor-runtime doctor-dxmt check test build app run-app runtime-build runtime-test dxmt-verify dxmt-test release
 
 help: ## Show the supported contributor commands.
 	@awk 'BEGIN {FS = ":.*## "; print "BasaltVR contributor commands:"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-16s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -27,7 +27,10 @@ test: ## Run all deterministic Swift tests.
 build: ## Build all native executables for Apple Silicon.
 	@swift build -c release --arch arm64 --package-path streamer
 
-app: build ## Run the management app from source.
+app: ## Build BasaltVR.app (build/), signed, and install it to ~/Applications.
+	@packaging/build-app.zsh
+
+run-app: build ## Run the management app from source, without a bundle.
 	@swift run -c release --skip-build --arch arm64 --package-path streamer BasaltVR
 
 runtime-build: ## Cross-build the Windows OpenXR runtime without running Wine.
