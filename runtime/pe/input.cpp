@@ -1759,8 +1759,13 @@ void invalidateInputForSession(XrSession session) {
     }
     for (ActionSetRecord& record : gActionSets) {
         if (record.attachedSession == session) {
-            // `attached` stays true: attachment freezes a set's actions for
-            // the set's whole lifetime, not just the session's.
+            // A destroyed session releases its attachment. OpenComposite
+            // rebuilds its session once it learns the application's graphics
+            // API (XrBackend::CheckOrInitCompositors) and re-attaches the same
+            // action sets; keeping `attached` set made that second attach fail
+            // with XR_ERROR_ACTIONSETS_ALREADY_ATTACHED, which OpenComposite
+            // treats as fatal. Real runtimes accept the re-attach.
+            record.attached = false;
             record.attachedSession = XR_NULL_HANDLE;
         }
     }
