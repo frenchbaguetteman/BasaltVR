@@ -1919,6 +1919,41 @@ int main(int argc, char** argv) {
         xrDestroyInstance(instance);
         return fail("xrCreateSwapchain(unsupported RGBA transport)", result);
     }
+    // UE4 hands over a typeless BGRA format for its eye textures; the runtime
+    // backs it with typed BGRA instead of rejecting the swapchain.
+    swapchainInfo.format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    XrSwapchain typelessSwapchain = XR_NULL_HANDLE;
+    result = xrCreateSwapchain(session, &swapchainInfo, &typelessSwapchain);
+    if (XR_FAILED(result) || typelessSwapchain == XR_NULL_HANDLE) {
+        if (typelessSwapchain != XR_NULL_HANDLE) {
+            xrDestroySwapchain(typelessSwapchain);
+        }
+        xrDestroySession(session);
+        release(context);
+        release(device);
+        xrDestroyInstance(instance);
+        return fail("xrCreateSwapchain(B8G8R8A8_TYPELESS)", result);
+    }
+    xrDestroySwapchain(typelessSwapchain);
+
+    // A side-by-side image is wider than a single view (UE4 submits 2x1152),
+    // so the per-view limit must not be applied to the swapchain image.
+    const uint32_t viewWidth = swapchainInfo.width;
+    swapchainInfo.width = 1700;
+    XrSwapchain wideSwapchain = XR_NULL_HANDLE;
+    result = xrCreateSwapchain(session, &swapchainInfo, &wideSwapchain);
+    if (XR_FAILED(result) || wideSwapchain == XR_NULL_HANDLE) {
+        if (wideSwapchain != XR_NULL_HANDLE) {
+            xrDestroySwapchain(wideSwapchain);
+        }
+        xrDestroySession(session);
+        release(context);
+        release(device);
+        xrDestroyInstance(instance);
+        return fail("xrCreateSwapchain(side-by-side width)", result);
+    }
+    xrDestroySwapchain(wideSwapchain);
+    swapchainInfo.width = viewWidth;
     swapchainInfo.format = DXGI_FORMAT_B8G8R8A8_UNORM;
 
     XrSwapchain swapchain = XR_NULL_HANDLE;
