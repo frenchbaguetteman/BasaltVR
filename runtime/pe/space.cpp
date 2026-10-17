@@ -20,9 +20,11 @@ using basalt::quaternionRotate;
 constexpr uintptr_t kFirstSpaceHandle = static_cast<uintptr_t>(0x40000);
 constexpr uintptr_t kSpaceHandleStride = static_cast<uintptr_t>(0x10);
 constexpr size_t kMaxSpaces = 64;
-constexpr std::array<XrReferenceSpaceType, 2> kSupportedReferenceSpaces = {
+constexpr std::array<XrReferenceSpaceType, 4> kSupportedReferenceSpaces = {
     XR_REFERENCE_SPACE_TYPE_VIEW,
     XR_REFERENCE_SPACE_TYPE_LOCAL,
+    XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR,
+    XR_REFERENCE_SPACE_TYPE_STAGE,
 };
 
 // The headset supplies LOCAL-from-HEAD. These eye values are conservative
@@ -192,8 +194,11 @@ XrResult XRAPI_CALL createReferenceSpace(
         createInfo->type != XR_TYPE_REFERENCE_SPACE_CREATE_INFO) {
         return XR_ERROR_VALIDATION_FAILURE;
     }
-    if (createInfo->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW &&
-        createInfo->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL) {
+    bool knownType = false;
+    for (XrReferenceSpaceType supported : kSupportedReferenceSpaces) {
+        knownType = knownType || supported == createInfo->referenceSpaceType;
+    }
+    if (!knownType) {
         return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
     }
     if (!poseValid(createInfo->poseInReferenceSpace)) {
@@ -373,7 +378,11 @@ XrResult XRAPI_CALL locateSpace(
                 *pose = poseCompose(input.controllers[hand].poseInLocal, record.pose);
                 return true;
             }
-            if (record.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
+            // Only VIEW follows the head. LOCAL, LOCAL_FLOOR and STAGE are
+            // fixed world spaces; composing them with the head pose made a
+            // VIEW-vs-floor query cancel the head transform and return a
+            // constant pose, so titles rendered a frozen camera.
+            if (record.referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW) {
                 *pose = record.pose;
                 return true;
             }
@@ -473,11 +482,14 @@ XrResult XRAPI_CALL locateViews(
     XrPosef baseInLocal{};
     bool baseTracked = false;
     if (base.kind == SpaceKind::kReference) {
-        if (base.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
+        // Same rule as locateSpace: only the VIEW space follows the head.
+        if (base.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_VIEW) {
+            if (headTracked) {
+                baseInLocal = poseCompose(headInLocal, base.pose);
+                baseTracked = true;
+            }
+        } else {
             baseInLocal = base.pose;
-            baseTracked = true;
-        } else if (headTracked) {
-            baseInLocal = poseCompose(headInLocal, base.pose);
             baseTracked = true;
         }
     } else {

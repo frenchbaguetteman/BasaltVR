@@ -611,7 +611,7 @@ int main(int argc, char** argv) {
     if (XR_SUCCEEDED(result)) {
         result = xrEnumerateReferenceSpaces(
             session, 1, &referenceSpaceCount, insufficientSpaces);
-        if (result != XR_ERROR_SIZE_INSUFFICIENT || referenceSpaceCount != 2) {
+        if (result != XR_ERROR_SIZE_INSUFFICIENT || referenceSpaceCount != 4) {
             xrDestroySession(session);
             release(context);
             release(device);
@@ -627,14 +627,21 @@ int main(int argc, char** argv) {
         referenceSpaces.data());
     bool foundViewSpace = false;
     bool foundLocalSpace = false;
+    bool foundLocalFloorSpace = false;
+    bool foundStageSpace = false;
     for (XrReferenceSpaceType referenceSpace : referenceSpaces) {
         foundViewSpace =
             foundViewSpace || referenceSpace == XR_REFERENCE_SPACE_TYPE_VIEW;
         foundLocalSpace =
             foundLocalSpace || referenceSpace == XR_REFERENCE_SPACE_TYPE_LOCAL;
+        foundLocalFloorSpace =
+            foundLocalFloorSpace || referenceSpace == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR;
+        foundStageSpace =
+            foundStageSpace || referenceSpace == XR_REFERENCE_SPACE_TYPE_STAGE;
     }
-    if (XR_FAILED(result) || referenceSpaceCount != 2 ||
-        !foundViewSpace || !foundLocalSpace) {
+    if (XR_FAILED(result) || referenceSpaceCount != 4 ||
+        !foundViewSpace || !foundLocalSpace ||
+        !foundLocalFloorSpace || !foundStageSpace) {
         xrDestroySession(session);
         release(context);
         release(device);
@@ -644,18 +651,25 @@ int main(int argc, char** argv) {
 
     XrReferenceSpaceCreateInfo referenceSpaceInfo{};
     referenceSpaceInfo.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
-    referenceSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
     referenceSpaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
-    XrSpace rejectedSpace = XR_NULL_HANDLE;
-    result = xrCreateReferenceSpace(session, &referenceSpaceInfo, &rejectedSpace);
-    if (result != XR_ERROR_REFERENCE_SPACE_UNSUPPORTED ||
-        rejectedSpace != XR_NULL_HANDLE) {
-        xrDestroySession(session);
-        release(context);
-        release(device);
-        xrDestroyInstance(instance);
-        return fail("xrCreateReferenceSpace(STAGE)", result);
+    // Floor-anchored spaces are part of the supported set: OpenVR titles ask
+    // for a standing space during initialisation and treat a rejection as a
+    // fatal error, so both floor variants must be creatable.
+    for (XrReferenceSpaceType floorSpaceType : {XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR,
+                                                XR_REFERENCE_SPACE_TYPE_STAGE}) {
+        referenceSpaceInfo.referenceSpaceType = floorSpaceType;
+        XrSpace floorSpace = XR_NULL_HANDLE;
+        result = xrCreateReferenceSpace(session, &referenceSpaceInfo, &floorSpace);
+        if (XR_FAILED(result) || floorSpace == XR_NULL_HANDLE) {
+            xrDestroySession(session);
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            return fail("xrCreateReferenceSpace(floor space)", result);
+        }
+        xrDestroySpace(floorSpace);
     }
+    XrSpace rejectedSpace = XR_NULL_HANDLE;
 
     referenceSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     referenceSpaceInfo.poseInReferenceSpace.orientation.w = 0.0f;
