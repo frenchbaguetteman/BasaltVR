@@ -68,8 +68,8 @@ XrResult XRAPI_CALL getSystemProperties(
     properties->vendorId = 0;
     std::strncpy(properties->systemName, "BasaltVR ALVR HMD prototype", XR_MAX_SYSTEM_NAME_SIZE - 1);
     properties->systemName[XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
-    properties->graphicsProperties.maxSwapchainImageWidth = kMaxViewWidth;
-    properties->graphicsProperties.maxSwapchainImageHeight = kMaxViewHeight;
+    properties->graphicsProperties.maxSwapchainImageWidth = kMaxSwapchainWidth;
+    properties->graphicsProperties.maxSwapchainImageHeight = kMaxSwapchainHeight;
     properties->graphicsProperties.maxLayerCount = XR_MIN_COMPOSITION_LAYERS_SUPPORTED;
     properties->trackingProperties.orientationTracking = XR_TRUE;
     properties->trackingProperties.positionTracking = XR_TRUE;

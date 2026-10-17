@@ -64,9 +64,21 @@ void release(Interface*& object) {
     }
 }
 
+// UE4 titles create their eye textures as B8G8R8A8_TYPELESS and rely on their
+// own resource views for the sRGB/linear interpretation, then hand that format
+// straight to xrCreateSwapchain. Back the request with the typed BGRA format
+// the compositor can export instead of rejecting the swapchain.
+DXGI_FORMAT normalizeFormat(int64_t format) {
+    if (format == static_cast<int64_t>(DXGI_FORMAT_B8G8R8A8_TYPELESS)) {
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    }
+    return static_cast<DXGI_FORMAT>(format);
+}
+
 bool isSupportedFormat(int64_t format) {
+    const DXGI_FORMAT normalized = normalizeFormat(format);
     for (DXGI_FORMAT supported : kSupportedFormats) {
-        if (format == static_cast<int64_t>(supported)) {
+        if (normalized == supported) {
             return true;
         }
     }
@@ -159,7 +171,8 @@ XrResult XRAPI_CALL createSwapchain(
     if (createInfo == nullptr || createInfo->type != XR_TYPE_SWAPCHAIN_CREATE_INFO ||
         createInfo->createFlags != 0 || createInfo->usageFlags == 0 ||
         createInfo->width == 0 || createInfo->height == 0 ||
-        createInfo->width > basalt::kMaxViewWidth || createInfo->height > basalt::kMaxViewHeight ||
+        createInfo->width > basalt::kMaxSwapchainWidth ||
+        createInfo->height > basalt::kMaxSwapchainHeight ||
         createInfo->arraySize == 0 || createInfo->arraySize > kMaxArraySize ||
         createInfo->faceCount != 1 || createInfo->mipCount != 1 ||
         createInfo->sampleCount != 1) {
@@ -182,7 +195,7 @@ XrResult XRAPI_CALL createSwapchain(
     description.Height = createInfo->height;
     description.MipLevels = createInfo->mipCount;
     description.ArraySize = createInfo->arraySize;
-    description.Format = static_cast<DXGI_FORMAT>(createInfo->format);
+    description.Format = normalizeFormat(createInfo->format);
     description.SampleDesc.Count = createInfo->sampleCount;
     description.Usage = D3D11_USAGE_DEFAULT;
     description.BindFlags = bindFlagsForUsage(createInfo->usageFlags);

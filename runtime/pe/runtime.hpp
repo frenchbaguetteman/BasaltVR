@@ -22,6 +22,12 @@ constexpr XrSystemId kSystemId = 1;
 constexpr uint32_t kMaxViewWidth = BASALT_CONTROL_MAX_VIEW_WIDTH;
 constexpr uint32_t kMaxViewHeight = BASALT_CONTROL_MAX_VIEW_HEIGHT;
 
+// A swapchain image is not per-eye sized: UE4 submits both eyes as one texture
+// and selects each eye with imageRect, so the accepted image may be twice a
+// view. Only the per-eye limits bound a view rect.
+constexpr uint32_t kMaxSwapchainWidth = kMaxViewWidth * 2;
+constexpr uint32_t kMaxSwapchainHeight = kMaxViewHeight * 2;
+
 // ALVR's hashed path ID for /user/hand/right/input/system/click.
 constexpr uint64_t kAlvrRightSystemClickPathId = 0x19729bd97073d474ULL;
 
