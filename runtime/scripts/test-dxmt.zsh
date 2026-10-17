@@ -124,12 +124,15 @@ fi
 "${cmake_bin}" --build "${build_dir}" --parallel --target \
     basalt_openxr \
     d3d11_runtime_smoke \
+    d3d11_compositor_smoke \
     dxmt_shared_texture_probe \
     dxmt_fence_probe \
     dxmt_window_swapchain_probe \
     dxmt_iosurface_probe \
     dxmt_iosurface_pixel_source \
     frame_timer_probe \
+    dxmt_msaa_probe \
+    opencomposite_frame_timing_smoke \
     steamwebhelper_compat
 
 # Keep the executable in a clean directory so an unrelated d3d11.dll beside the
@@ -140,7 +143,9 @@ cp "${build_dir}/bin/dxmt_window_swapchain_probe.exe" "${probe_dir}/dxmt_window_
 cp "${build_dir}/bin/dxmt_iosurface_probe.exe" "${probe_dir}/dxmt_iosurface_probe.exe"
 cp "${build_dir}/bin/dxmt_iosurface_pixel_source.exe" "${probe_dir}/dxmt_iosurface_pixel_source.exe"
 cp "${build_dir}/bin/d3d11_runtime_smoke.exe" "${probe_dir}/d3d11_runtime_smoke.exe"
+cp "${build_dir}/bin/d3d11_compositor_smoke.exe" "${probe_dir}/d3d11_compositor_smoke.exe"
 cp "${build_dir}/bin/frame_timer_probe.exe" "${probe_dir}/frame_timer_probe.exe"
+cp "${build_dir}/bin/dxmt_msaa_probe.exe" "${probe_dir}/dxmt_msaa_probe.exe"
 
 # An already-created disposable prefix may contain older generated built-ins.
 # Keep its Windows view in sync with the overlay before running the probe.
@@ -169,11 +174,18 @@ trap 'exit 130' INT TERM
 
 # One control-socket gate: start a native peer that publishes a control file,
 # run the OpenXR smoke against it, and fail with the peer's log if either side
-# fails. Usage: run_control_gate <label> [SMOKE_ENV=value...] -- <peer command>
-# The peer receives --control-file <path> after its own arguments.
+# fails. Usage:
+#   run_control_gate <label> [--smoke <exe>] [SMOKE_ENV=value...] -- <peer command>
+# The smoke defaults to d3d11_runtime_smoke.exe. The peer receives
+# --control-file <path> after its own arguments.
 run_control_gate() {
     local label=$1
     shift
+    local smoke_exe=./d3d11_runtime_smoke.exe
+    if [[ $1 == --smoke ]]; then
+        smoke_exe=$2
+        shift 2
+    fi
     local -a smoke_env
     while [[ $1 != -- ]]; do
         smoke_env+=("$1")
@@ -195,7 +207,7 @@ run_control_gate() {
     env WINEPREFIX=${wine_prefix} WINEDEBUG=-all MVK_CONFIG_LOG_LEVEL=0 \
         DXMT_BASALT_IOSURFACE=1 BASALT_EXPECT_IOSURFACE=1 "${smoke_env[@]}" \
         BASALT_CONTROL="Z:${control_file//\//\\}" \
-        "${wine_root}/bin/wine" ./d3d11_runtime_smoke.exe || smoke_status=$?
+        "${wine_root}/bin/wine" "${smoke_exe}" || smoke_status=$?
     # Report the peer's side too: a smoke failure alone hides whether the
     # peer saw the handshake, frames, or teardown.
     wait ${control_peer_pid} || peer_status=$?
@@ -227,6 +239,15 @@ WINEARCH=win64 \
 WINEDEBUG=-all \
     "${wine_root}/bin/wine" ./frame_timer_probe.exe
 
+# Stock v0.80 rejects 8x MSAA textures on GPUs that stop at 4x (all Apple
+# GPUs); the fork phase below must pass the same probe.
+if WINEPREFIX=${wine_prefix} WINEARCH=win64 WINEDEBUG=-all MVK_CONFIG_LOG_LEVEL=0 \
+    "${wine_root}/bin/wine" ./dxmt_msaa_probe.exe >/dev/null 2>&1; then
+    print "NOTE: stock DXMT passes the 8x MSAA probe (this GPU supports 8x MSAA)"
+else
+    print "PASS: stock DXMT ${dxmt_version} fails the 8x MSAA probe on this GPU (expected; the fork fixes it)"
+fi
+
 # Stock DXMT must not expose the Basalt IOSurface private data.
 WINEPREFIX=${wine_prefix} \
 WINEARCH=win64 \
@@ -244,6 +265,34 @@ WINEPREFIX=${wine_prefix} \
 WINEDEBUG=-all \
 MVK_CONFIG_LOG_LEVEL=0 \
     "${wine_root}/bin/wine" ./d3d11_runtime_smoke.exe
+
+# Headless compositor API surface: formats, limits, layer validation, FIFO
+# swapchain order, repeated wait+begin, and session replacement events.
+WINEPREFIX=${wine_prefix} \
+WINEDEBUG=-all \
+MVK_CONFIG_LOG_LEVEL=0 \
+    "${wine_root}/bin/wine" ./d3d11_compositor_smoke.exe
+
+# OpenComposite on the headless runtime: GetFrameTiming must report one present per
+# frame for old SteamVR Unity plugins too (IVRCompositor_013, 168-byte struct). A zero
+# there sends The Lab's Secret Shop to about 1 fps (opencomposite-patches/0005).
+opencomposite_dll=${OPENCOMPOSITE_DLL:-${build_dir}/opencomposite/out/openvr_api.dll}
+if [[ -f ${opencomposite_dll} ]]; then
+    oc_probe_dir=${build_dir}/dxmt/opencomposite-probe
+    rm -rf "${oc_probe_dir}"
+    mkdir -p "${oc_probe_dir}"
+    cp "${build_dir}/bin/opencomposite_frame_timing_smoke.exe" "${oc_probe_dir}/"
+    cp "${opencomposite_dll}" "${oc_probe_dir}/openvr_api.dll"
+    print 'initUsingVulkan=false' > "${oc_probe_dir}/opencomposite.ini"
+    pushd "${oc_probe_dir}" >/dev/null
+    WINEPREFIX=${wine_prefix} \
+    WINEDEBUG=-all \
+    MVK_CONFIG_LOG_LEVEL=0 \
+        "${wine_root}/bin/wine" ./opencomposite_frame_timing_smoke.exe
+    popd >/dev/null
+else
+    print "SKIP: OpenComposite frame-timing smoke (run runtime/scripts/build-opencomposite.zsh first)"
+fi
 
 # --- Basalt DXMT fork phase (runs when build-dxmt-fork.zsh has produced it) --
 fork_install=${build_dir}/dxmt/fork-install
@@ -265,6 +314,12 @@ if [[ -f ${fork_install}/x86_64-windows/d3d11.dll && -f ${fork_install}/x86_64-u
     system32=${wine_prefix}/drive_c/windows/system32
     fork_overlay_active=true
     overlay_dxmt "${fork_install}/x86_64-windows" "${fork_install}/x86_64-unix"
+
+    # 8x MSAA (Source 2 Auto-Fidelity): the fork falls back to the largest
+    # sample count Metal supports (patch 0006); stock v0.80 fails to create
+    # the targets on Apple GPUs, which left Robot Repair's eye texture empty.
+    WINEPREFIX=${wine_prefix} WINEARCH=win64 WINEDEBUG=-all MVK_CONFIG_LOG_LEVEL=0 \
+        "${wine_root}/bin/wine" ./dxmt_msaa_probe.exe
 
     # Fork with the gate off must be indistinguishable from stock.
     WINEPREFIX=${wine_prefix} WINEARCH=win64 WINEDEBUG=-all MVK_CONFIG_LOG_LEVEL=0 \
@@ -335,12 +390,43 @@ if [[ -f ${fork_install}/x86_64-windows/d3d11.dll && -f ${fork_install}/x86_64-u
     cc -O2 -Wall -Wextra -framework IOSurface -framework CoreFoundation \
         -o "${probe_dir}/basalt_control_test_daemon" \
         "${runtime_dir}/tests/native/basalt_control_test_daemon.c"
+    # The daemon negotiates 90 Hz here, so xrWaitFrame must report the
+    # HELLO_ACK display period instead of the 72 Hz headless default.
+    # --hand-tracking lists the hand_tracking feature in the control file, so
+    # the smoke enables XR_EXT_hand_tracking and checks injected skeletons;
+    # every other gate must not see the extension.
     run_control_gate "control-socket" \
-        BASALT_EXPECT_HEAD_POSE=1 \
-        BASALT_EXPECT_VIEW_WIDTH=1152 BASALT_EXPECT_VIEW_HEIGHT=1216 -- \
+        BASALT_EXPECT_HEAD_POSE=1 BASALT_EXPECT_HAND_TRACKING=1 \
+        BASALT_EXPECT_VIEW_WIDTH=1152 BASALT_EXPECT_VIEW_HEIGHT=1216 \
+        BASALT_EXPECT_DISPLAY_PERIOD_NS=11111111 -- \
         "${probe_dir}/basalt_control_test_daemon" \
         --expect-frames 21 --verify-clears --frame-delay-ms 25 \
-        --view-width 1152 --view-height 1216
+        --view-width 1152 --view-height 1216 --display-period-ns 11111111 \
+        --hand-tracking
+
+    # Runtime compositor gate: OpenComposite-shaped swapchains and layers
+    # (sRGB RGBA, mipmapped, oversized, flipped, blended quads, quad-only)
+    # arrive as the compositor's BGRA output with the expected pixels, the
+    # direct BGRA path still exports the application's own surfaces, and
+    # wait/release follow acquisition order.
+    runtime_log=${probe_dir}/runtime-log.$$
+    rm -f "${runtime_log}"
+    run_control_gate "runtime compositor" \
+        --smoke ./d3d11_compositor_smoke.exe \
+        BASALT_RUNTIME_LOG="${runtime_log}" -- \
+        "${probe_dir}/basalt_control_test_daemon" \
+        --expect-frames 11 --compositor-scenarios \
+        --view-width 512 --view-height 512
+    # BASALT_RUNTIME_LOG (a host path) receives the compositor diagnostics.
+    if ! grep -q 'compositor active' "${runtime_log}" ||
+        ! grep -q 'compositor frame 1: 1 layer(s), left eye draws projection\[fmt 29 view 29 96x80' \
+            "${runtime_log}"; then
+        print -u2 "FAIL: BASALT_RUNTIME_LOG lacks the compositor diagnostics"
+        cat "${runtime_log}" >&2 2>/dev/null || true
+        exit 1
+    fi
+    print "PASS: BASALT_RUNTIME_LOG records compositor activation and layer diagnostics"
+    rm -f "${runtime_log}"
 
     # The production streamer's RuntimeLink, not just the C test daemon, must
     # complete the same handshake, swapchain registration, ordered
@@ -351,7 +437,7 @@ if [[ -f ${fork_install}/x86_64-windows/d3d11.dll && -f ${fork_install}/x86_64-u
     # Leave the generated Wine tree and prefix on the pinned stock overlay.
     overlay_dxmt "${dxmt_root}/x86_64-windows" "${dxmt_root}/x86_64-unix"
     fork_overlay_active=false
-    print "PASS: Basalt DXMT fork gate (IOSurface IDs, native readback, control-socket FrameReady, streamer RuntimeLink)"
+    print "PASS: Basalt DXMT fork gate (IOSurface IDs, native readback, control-socket FrameReady, runtime compositor, streamer RuntimeLink)"
 else
     print "NOTE: fork phase skipped; run runtime/scripts/build-dxmt-fork.zsh to enable it"
 fi

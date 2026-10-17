@@ -160,7 +160,7 @@ struct ProfileEditorSheet: View {
             executable: executable.trimmingCharacters(in: .whitespacesAndNewlines),
             arguments: arguments.components(separatedBy: .newlines).filter { !$0.isEmpty },
             workingDirectory: workingDirectory.isEmpty ? nil : workingDirectory,
-            environment: values)
+            environment: values, gameRoot: profile.gameRoot)
         Task { await model.updateProfile(updated); dismiss() }
     }
 

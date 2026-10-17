@@ -35,6 +35,32 @@ bool hasArgument(const std::vector<std::wstring> &arguments,
     return false;
 }
 
+// The shim holds kOriginalName as UTF-16 (see WinMain); Steam's helper never
+// does. If the "original" is itself a shim (a Basalt install preserved a shim
+// by mistake), launching it would make it launch itself without end: every
+// Steam helper start would grow into thousands of processes.
+constexpr wchar_t kOriginalName[] = L"steamwebhelper.basalt-original.exe";
+
+bool isShim(const std::wstring &path) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    const size_t markerBytes = (sizeof(kOriginalName) - sizeof(wchar_t));
+    const char *marker = reinterpret_cast<const char *>(kOriginalName);
+    std::string carry;
+    std::vector<char> buffer(1 << 20);
+    bool found = false;
+    DWORD read = 0;
+    while (!found && ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()),
+                              &read, nullptr) && read > 0) {
+        carry.append(buffer.data(), read);
+        found = carry.find(std::string(marker, markerBytes)) != std::string::npos;
+        if (carry.size() > markerBytes) carry.erase(0, carry.size() - markerBytes);
+    }
+    CloseHandle(file);
+    return found;
+}
+
 } // namespace
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
@@ -53,7 +79,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     std::wstring realPath(modulePath, length);
     const auto separator = realPath.find_last_of(L"\\/");
     realPath.resize(separator == std::wstring::npos ? 0 : separator + 1);
-    realPath += L"steamwebhelper.basalt-original.exe";
+    realPath += kOriginalName;
+    if (isShim(realPath)) {
+        OutputDebugStringW(L"steamwebhelper shim: the preserved original is a Basalt "
+                           L"shim, not Steam's helper; refusing to launch it\n");
+        return 4;
+    }
 
     std::wstring command = quote(realPath);
     for (size_t index = 1; index < arguments.size(); ++index) {
