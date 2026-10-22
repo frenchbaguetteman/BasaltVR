@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <set>
 #include <vector>
 
@@ -415,6 +416,321 @@ bool expectInteractionProfileChanged(XrInstance instance, XrSession session) {
     return true;
 }
 
+// Consecutive locates may see a newer live sample on a real headset, so the
+// tolerance allows a few millimetres of motion between the two calls.
+bool posesNearlyEqual(const XrPosef& a, const XrPosef& b) {
+    constexpr float kTolerance = 0.01f;
+    return nearlyEqual(a.position.x, b.position.x, kTolerance) &&
+           nearlyEqual(a.position.y, b.position.y, kTolerance) &&
+           nearlyEqual(a.position.z, b.position.z, kTolerance) &&
+           nearlyEqual(a.orientation.x, b.orientation.x, kTolerance) &&
+           nearlyEqual(a.orientation.y, b.orientation.y, kTolerance) &&
+           nearlyEqual(a.orientation.z, b.orientation.z, kTolerance) &&
+           nearlyEqual(a.orientation.w, b.orientation.w, kTolerance);
+}
+
+// OpenComposite uses STAGE as its standing tracking universe. Basalt's LOCAL
+// origin already sits on the Quest floor, so STAGE shares that origin: every
+// STAGE location must equal the LOCAL one, with or without live tracking.
+bool checkStageSpace(
+    XrSession session,
+    XrSpace localSpace,
+    XrSpace handSpace,
+    XrTime locateTime) {
+    XrReferenceSpaceCreateInfo spaceInfo{};
+    spaceInfo.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
+    spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+    spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
+    XrSpace stageSpace = XR_NULL_HANDLE;
+    XrResult result = xrCreateReferenceSpace(session, &spaceInfo, &stageSpace);
+    spaceInfo.poseInReferenceSpace.position = {0.25f, 0.5f, -1.0f};
+    XrSpace offsetStageSpace = XR_NULL_HANDLE;
+    if (XR_SUCCEEDED(result)) {
+        result = xrCreateReferenceSpace(session, &spaceInfo, &offsetStageSpace);
+    }
+    spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+    spaceInfo.poseInReferenceSpace.position = {0.0f, 0.0f, 0.0f};
+    XrSpace viewSpace = XR_NULL_HANDLE;
+    if (XR_SUCCEEDED(result)) {
+        result = xrCreateReferenceSpace(session, &spaceInfo, &viewSpace);
+    }
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: xrCreateReferenceSpace(STAGE) returned %d\n", result);
+        return false;
+    }
+
+    // The STAGE↔LOCAL offset is static and known before any head sample.
+    constexpr XrSpaceLocationFlags kValidFlags =
+        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+    XrSpaceLocation location{};
+    location.type = XR_TYPE_SPACE_LOCATION;
+    result = xrLocateSpace(offsetStageSpace, localSpace, locateTime, &location);
+    if (XR_FAILED(result) || location.locationFlags != kValidFlags ||
+        !nearlyEqual(location.pose.position.x, 0.25f) ||
+        !nearlyEqual(location.pose.position.y, 0.5f) ||
+        !nearlyEqual(location.pose.position.z, -1.0f) ||
+        !nearlyEqual(location.pose.orientation.w, 1.0f)) {
+        std::fprintf(stderr, "FAIL: xrLocateSpace(STAGE offset in LOCAL) returned %d\n", result);
+        return false;
+    }
+    result = xrLocateSpace(localSpace, offsetStageSpace, locateTime, &location);
+    if (XR_FAILED(result) || location.locationFlags != kValidFlags ||
+        !nearlyEqual(location.pose.position.x, -0.25f) ||
+        !nearlyEqual(location.pose.position.y, -0.5f) ||
+        !nearlyEqual(location.pose.position.z, 1.0f)) {
+        std::fprintf(stderr, "FAIL: xrLocateSpace(LOCAL in STAGE offset) returned %d\n", result);
+        return false;
+    }
+
+    // VIEW and controller locations must be identical relative to STAGE and
+    // LOCAL (same flags, same pose), in both directions.
+    const XrSpace targets[] = {viewSpace, handSpace};
+    for (XrSpace target : targets) {
+        XrSpaceLocation inLocal{};
+        inLocal.type = XR_TYPE_SPACE_LOCATION;
+        XrSpaceLocation inStage{};
+        inStage.type = XR_TYPE_SPACE_LOCATION;
+        result = xrLocateSpace(target, localSpace, locateTime, &inLocal);
+        if (XR_SUCCEEDED(result)) {
+            result = xrLocateSpace(target, stageSpace, locateTime, &inStage);
+        }
+        if (XR_FAILED(result) || inLocal.locationFlags != inStage.locationFlags ||
+            !posesNearlyEqual(inLocal.pose, inStage.pose)) {
+            std::fprintf(stderr, "FAIL: STAGE and LOCAL locations differ (%d)\n", result);
+            return false;
+        }
+        result = xrLocateSpace(stageSpace, target, locateTime, &inStage);
+        if (XR_SUCCEEDED(result)) {
+            result = xrLocateSpace(localSpace, target, locateTime, &inLocal);
+        }
+        if (XR_FAILED(result) || inLocal.locationFlags != inStage.locationFlags ||
+            !posesNearlyEqual(inLocal.pose, inStage.pose)) {
+            std::fprintf(stderr, "FAIL: STAGE and LOCAL inverse locations differ (%d)\n", result);
+            return false;
+        }
+    }
+
+    XrViewLocateInfo viewLocateInfo{};
+    viewLocateInfo.type = XR_TYPE_VIEW_LOCATE_INFO;
+    viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    viewLocateInfo.displayTime = locateTime;
+    XrViewState localState{};
+    localState.type = XR_TYPE_VIEW_STATE;
+    XrViewState stageState{};
+    stageState.type = XR_TYPE_VIEW_STATE;
+    XrView localViews[2]{};
+    XrView stageViews[2]{};
+    for (uint32_t index = 0; index < 2; ++index) {
+        localViews[index].type = XR_TYPE_VIEW;
+        stageViews[index].type = XR_TYPE_VIEW;
+    }
+    uint32_t viewCount = 0;
+    viewLocateInfo.space = localSpace;
+    result = xrLocateViews(session, &viewLocateInfo, &localState, 2, &viewCount, localViews);
+    viewLocateInfo.space = stageSpace;
+    if (XR_SUCCEEDED(result)) {
+        result = xrLocateViews(session, &viewLocateInfo, &stageState, 2, &viewCount, stageViews);
+    }
+    if (XR_FAILED(result) || viewCount != 2 ||
+        localState.viewStateFlags != stageState.viewStateFlags ||
+        !posesNearlyEqual(localViews[0].pose, stageViews[0].pose) ||
+        !posesNearlyEqual(localViews[1].pose, stageViews[1].pose)) {
+        std::fprintf(stderr, "FAIL: xrLocateViews(STAGE) differs from LOCAL (%d)\n", result);
+        return false;
+    }
+    // The connected smoke reaches this point right after deliberately letting
+    // the injected head pose go stale; the height only applies when tracked.
+    if (expectInjectedHeadPose() &&
+        (stageState.viewStateFlags & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0 &&
+        !nearlyEqual(stageViews[0].pose.position.y, 1.5f)) {
+        std::fprintf(stderr, "FAIL: STAGE eye height %.3f is not floor-relative\n",
+                     stageViews[0].pose.position.y);
+        return false;
+    }
+
+    XrExtent2Df bounds{1.0f, 1.0f};
+    result = xrGetReferenceSpaceBoundsRect(session, XR_REFERENCE_SPACE_TYPE_STAGE, &bounds);
+    if (result != XR_SPACE_BOUNDS_UNAVAILABLE || bounds.width != 0.0f ||
+        bounds.height != 0.0f) {
+        std::fprintf(stderr, "FAIL: xrGetReferenceSpaceBoundsRect(STAGE) returned %d\n", result);
+        return false;
+    }
+    bounds = {1.0f, 1.0f};
+    result = xrGetReferenceSpaceBoundsRect(session, XR_REFERENCE_SPACE_TYPE_VIEW, &bounds);
+    if (result != XR_SPACE_BOUNDS_UNAVAILABLE || bounds.width != 0.0f ||
+        bounds.height != 0.0f) {
+        std::fprintf(stderr, "FAIL: xrGetReferenceSpaceBoundsRect(VIEW) returned %d\n", result);
+        return false;
+    }
+    result = xrGetReferenceSpaceBoundsRect(
+        session, XR_REFERENCE_SPACE_TYPE_UNBOUNDED_MSFT, &bounds);
+    if (result != XR_ERROR_REFERENCE_SPACE_UNSUPPORTED) {
+        std::fprintf(stderr, "FAIL: xrGetReferenceSpaceBoundsRect(unsupported) returned %d\n",
+                     result);
+        return false;
+    }
+
+    result = xrDestroySpace(offsetStageSpace);
+    if (XR_SUCCEEDED(result)) {
+        result = xrDestroySpace(stageSpace);
+    }
+    if (XR_SUCCEEDED(result)) {
+        result = xrDestroySpace(viewSpace);
+    }
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: xrDestroySpace(STAGE) returned %d\n", result);
+        return false;
+    }
+    return true;
+}
+
+// XR_KHR_visibility_mask reports "no mask available" (zero counts) for every
+// mask type, which the spec requires when no mask is known.
+bool checkVisibilityMask(XrInstance instance, XrSession session) {
+    PFN_xrVoidFunction function = nullptr;
+    XrResult result = xrGetInstanceProcAddr(instance, "xrGetVisibilityMaskKHR", &function);
+    if (XR_FAILED(result) || function == nullptr) {
+        std::fprintf(stderr, "FAIL: xrGetInstanceProcAddr(xrGetVisibilityMaskKHR) returned %d\n",
+                     result);
+        return false;
+    }
+    const auto getVisibilityMask = reinterpret_cast<PFN_xrGetVisibilityMaskKHR>(function);
+    const XrVisibilityMaskTypeKHR maskTypes[] = {
+        XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR,
+        XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR,
+        XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR,
+    };
+    for (XrVisibilityMaskTypeKHR maskType : maskTypes) {
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            XrVisibilityMaskKHR mask{};
+            mask.type = XR_TYPE_VISIBILITY_MASK_KHR;
+            mask.vertexCountOutput = UINT32_MAX;
+            mask.indexCountOutput = UINT32_MAX;
+            result = getVisibilityMask(
+                session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye, maskType, &mask);
+            if (XR_FAILED(result) || mask.vertexCountOutput != 0 ||
+                mask.indexCountOutput != 0) {
+                std::fprintf(stderr, "FAIL: xrGetVisibilityMaskKHR(count) returned %d\n", result);
+                return false;
+            }
+            XrVector2f vertices[4]{};
+            uint32_t indices[6]{};
+            mask.vertexCapacityInput = 4;
+            mask.indexCapacityInput = 6;
+            mask.vertices = vertices;
+            mask.indices = indices;
+            result = getVisibilityMask(
+                session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye, maskType, &mask);
+            if (XR_FAILED(result) || mask.vertexCountOutput != 0 ||
+                mask.indexCountOutput != 0) {
+                std::fprintf(stderr, "FAIL: xrGetVisibilityMaskKHR(values) returned %d\n", result);
+                return false;
+            }
+        }
+    }
+    XrVisibilityMaskKHR mask{};
+    mask.type = XR_TYPE_VISIBILITY_MASK_KHR;
+    result = getVisibilityMask(
+        session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2,
+        XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &mask);
+    if (result != XR_ERROR_VALIDATION_FAILURE) {
+        std::fprintf(stderr, "FAIL: xrGetVisibilityMaskKHR(eye 2) returned %d\n", result);
+        return false;
+    }
+    result = getVisibilityMask(
+        session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO, 0,
+        XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &mask);
+    if (result != XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED) {
+        std::fprintf(stderr, "FAIL: xrGetVisibilityMaskKHR(mono) returned %d\n", result);
+        return false;
+    }
+    return true;
+}
+
+// OpenComposite restarts its session (temporary device, then the game's
+// device) without destroying spaces or action spaces first, and attaches the
+// same action sets to every new session. Both must succeed.
+bool checkOpenCompositeSessionRestart(
+    XrInstance instance,
+    const XrSessionCreateInfo& sessionInfo,
+    const XrActionSet* attachedActionSets,
+    uint32_t attachedActionSetCount,
+    XrAction poseAction,
+    XrPath leftHandPath) {
+    XrSession session = XR_NULL_HANDLE;
+    XrResult result = xrCreateSession(instance, &sessionInfo, &session);
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: restarted xrCreateSession returned %d\n", result);
+        return false;
+    }
+
+    XrReferenceSpaceCreateInfo spaceInfo{};
+    spaceInfo.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
+    spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
+    const XrReferenceSpaceType spaceTypes[] = {
+        XR_REFERENCE_SPACE_TYPE_STAGE,
+        XR_REFERENCE_SPACE_TYPE_LOCAL,
+        XR_REFERENCE_SPACE_TYPE_VIEW,
+    };
+    std::vector<XrSpace> liveSpaces;
+    for (XrReferenceSpaceType spaceType : spaceTypes) {
+        spaceInfo.referenceSpaceType = spaceType;
+        XrSpace space = XR_NULL_HANDLE;
+        if (XR_SUCCEEDED(result)) {
+            result = xrCreateReferenceSpace(session, &spaceInfo, &space);
+            liveSpaces.push_back(space);
+        }
+    }
+    XrActionSpaceCreateInfo actionSpaceInfo{};
+    actionSpaceInfo.type = XR_TYPE_ACTION_SPACE_CREATE_INFO;
+    actionSpaceInfo.action = poseAction;
+    actionSpaceInfo.subactionPath = leftHandPath;
+    actionSpaceInfo.poseInActionSpace.orientation.w = 1.0f;
+    XrSpace actionSpace = XR_NULL_HANDLE;
+    if (XR_SUCCEEDED(result)) {
+        result = xrCreateActionSpace(session, &actionSpaceInfo, &actionSpace);
+        liveSpaces.push_back(actionSpace);
+    }
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: restarted session spaces returned %d\n", result);
+        xrDestroySession(session);
+        return false;
+    }
+
+    XrSessionActionSetsAttachInfo attachInfo{};
+    attachInfo.type = XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO;
+    attachInfo.countActionSets = attachedActionSetCount;
+    attachInfo.actionSets = attachedActionSets;
+    result = xrAttachSessionActionSets(session, &attachInfo);
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: re-attach to restarted session returned %d\n", result);
+        xrDestroySession(session);
+        return false;
+    }
+    result = xrAttachSessionActionSets(session, &attachInfo);
+    if (result != XR_ERROR_ACTIONSETS_ALREADY_ATTACHED) {
+        std::fprintf(stderr, "FAIL: second attach to restarted session returned %d\n", result);
+        xrDestroySession(session);
+        return false;
+    }
+
+    // Destroy the session with every space still alive (never begun, as
+    // OpenComposite's temporary session may be).
+    result = xrDestroySession(session);
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: xrDestroySession with live spaces returned %d\n", result);
+        return false;
+    }
+    for (XrSpace space : liveSpaces) {
+        result = xrDestroySpace(space);
+        if (result != XR_ERROR_HANDLE_INVALID) {
+            std::fprintf(stderr, "FAIL: space outlived its session (%d)\n", result);
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -441,22 +757,30 @@ int main(int argc, char** argv) {
     }
 
     bool foundD3D11 = false;
+    bool foundVisibilityMask = false;
     for (const XrExtensionProperties& extension : extensions) {
         if (std::strcmp(extension.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0 &&
             extension.extensionVersion == XR_KHR_D3D11_enable_SPEC_VERSION) {
             foundD3D11 = true;
-            break;
+        }
+        if (std::strcmp(extension.extensionName, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0 &&
+            extension.extensionVersion == XR_KHR_visibility_mask_SPEC_VERSION) {
+            foundVisibilityMask = true;
         }
     }
-    if (!foundD3D11) {
-        std::fputs("FAIL: runtime did not advertise XR_KHR_D3D11_enable v11\n", stderr);
+    if (!foundD3D11 || !foundVisibilityMask) {
+        std::fputs("FAIL: runtime did not advertise XR_KHR_D3D11_enable v11 and "
+                   "XR_KHR_visibility_mask\n", stderr);
         return 1;
     }
 
-    const char* enabledExtensions[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
+    const char* enabledExtensions[] = {
+        XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
+        XR_KHR_VISIBILITY_MASK_EXTENSION_NAME,
+    };
     XrInstanceCreateInfo instanceInfo{};
     instanceInfo.type = XR_TYPE_INSTANCE_CREATE_INFO;
-    instanceInfo.enabledExtensionCount = 1;
+    instanceInfo.enabledExtensionCount = 2;
     instanceInfo.enabledExtensionNames = enabledExtensions;
     instanceInfo.applicationInfo.apiVersion = XR_API_VERSION_1_0;
     std::strncpy(instanceInfo.applicationInfo.applicationName, "Basalt D3D11 smoke",
@@ -669,7 +993,17 @@ int main(int argc, char** argv) {
         }
         xrDestroySpace(floorSpace);
     }
+    referenceSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_UNBOUNDED_MSFT;
     XrSpace rejectedSpace = XR_NULL_HANDLE;
+    result = xrCreateReferenceSpace(session, &referenceSpaceInfo, &rejectedSpace);
+    if (result != XR_ERROR_REFERENCE_SPACE_UNSUPPORTED ||
+        rejectedSpace != XR_NULL_HANDLE) {
+        xrDestroySession(session);
+        release(context);
+        release(device);
+        xrDestroyInstance(instance);
+        return fail("xrCreateReferenceSpace(UNBOUNDED_MSFT)", result);
+    }
 
     referenceSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     referenceSpaceInfo.poseInReferenceSpace.orientation.w = 0.0f;
@@ -1718,9 +2052,13 @@ int main(int argc, char** argv) {
         result = xrApplyHapticFeedback(
             session, &hapticInfo,
             reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+        // STAGE shares LOCAL's origin, so the recenter is announced for both,
+        // LOCAL first, with the same changeTime and previous-space pose.
         XrEventDataReferenceSpaceChangePending recenterEvent{};
-        bool receivedRecenter = false;
-        for (int attempt = 0; XR_SUCCEEDED(result) && attempt < 100; ++attempt) {
+        XrEventDataReferenceSpaceChangePending stageRecenterEvent{};
+        uint32_t receivedRecenters = 0;
+        for (int attempt = 0;
+             XR_SUCCEEDED(result) && receivedRecenters < 2 && attempt < 100; ++attempt) {
             XrEventDataBuffer eventData{};
             eventData.type = XR_TYPE_EVENT_DATA_BUFFER;
             const XrResult eventResult = xrPollEvent(instance, &eventData);
@@ -1733,20 +2071,26 @@ int main(int argc, char** argv) {
                 result = XR_ERROR_RUNTIME_FAILURE;
                 break;
             }
-            recenterEvent = *reinterpret_cast<
-                const XrEventDataReferenceSpaceChangePending*>(&eventData);
-            receivedRecenter = true;
-            break;
+            (receivedRecenters == 0 ? recenterEvent : stageRecenterEvent) =
+                *reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(
+                    &eventData);
+            ++receivedRecenters;
         }
-        if (XR_FAILED(result) || !receivedRecenter ||
-            recenterEvent.session != session ||
-            recenterEvent.referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL ||
-            recenterEvent.changeTime <= 0 || recenterEvent.poseValid != XR_TRUE ||
-            !nearlyEqual(recenterEvent.poseInPreviousSpace.position.x, -0.25f) ||
-            !nearlyEqual(recenterEvent.poseInPreviousSpace.position.y, 0.0f) ||
-            !nearlyEqual(recenterEvent.poseInPreviousSpace.position.z, 0.25f) ||
-            !nearlyEqual(recenterEvent.poseInPreviousSpace.orientation.y, 0.707106781f) ||
-            !nearlyEqual(recenterEvent.poseInPreviousSpace.orientation.w, 0.707106781f)) {
+        auto validRecenter = [&](const XrEventDataReferenceSpaceChangePending& event,
+                                 XrReferenceSpaceType referenceSpaceType) {
+            return event.session == session &&
+                   event.referenceSpaceType == referenceSpaceType &&
+                   event.changeTime > 0 && event.poseValid == XR_TRUE &&
+                   nearlyEqual(event.poseInPreviousSpace.position.x, -0.25f) &&
+                   nearlyEqual(event.poseInPreviousSpace.position.y, 0.0f) &&
+                   nearlyEqual(event.poseInPreviousSpace.position.z, 0.25f) &&
+                   nearlyEqual(event.poseInPreviousSpace.orientation.y, 0.707106781f) &&
+                   nearlyEqual(event.poseInPreviousSpace.orientation.w, 0.707106781f);
+        };
+        if (XR_FAILED(result) || receivedRecenters != 2 ||
+            !validRecenter(recenterEvent, XR_REFERENCE_SPACE_TYPE_LOCAL) ||
+            !validRecenter(stageRecenterEvent, XR_REFERENCE_SPACE_TYPE_STAGE) ||
+            stageRecenterEvent.changeTime != recenterEvent.changeTime) {
             xrDestroySession(session);
             release(context);
             release(device);
@@ -1876,6 +2220,14 @@ int main(int argc, char** argv) {
         xrDestroyInstance(instance);
         return fail("xrGetReferenceSpaceBoundsRect", result);
     }
+    if (!checkStageSpace(session, localSpace, handSpace, locateTime) ||
+        !checkVisibilityMask(instance, session)) {
+        xrDestroySession(session);
+        release(context);
+        release(device);
+        xrDestroyInstance(instance);
+        return 1;
+    }
 
     uint32_t formatCount = 0;
     result = xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr);
@@ -1884,15 +2236,12 @@ int main(int argc, char** argv) {
         result = xrEnumerateSwapchainFormats(
             session, formatCount, &formatCount, formats.data());
     }
-    bool foundBgra = false;
-    for (int64_t format : formats) {
-        foundBgra = foundBgra || format == DXGI_FORMAT_B8G8R8A8_UNORM;
-    }
-    // Advertise only formats the native CoreVideo compositor can wrap. RGBA
-    // IOSurfaces must fail at swapchain negotiation instead of rendering a
-    // silently black stream.
-    if (XR_FAILED(result) || !foundBgra || formats.size() != 2 ||
-        formats.front() != DXGI_FORMAT_B8G8R8A8_UNORM) {
+    // Only the zero-copy BGRA formats are advertised; other formats (RGBA for
+    // OpenComposite) are accepted by xrCreateSwapchain and converted by the
+    // runtime compositor.
+    if (XR_FAILED(result) || formats.size() != 2 ||
+        formats[0] != DXGI_FORMAT_B8G8R8A8_UNORM ||
+        formats[1] != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
         xrDestroySession(session);
         release(context);
         release(device);
@@ -1919,19 +2268,51 @@ int main(int argc, char** argv) {
     swapchainInfo.arraySize = 1;
     swapchainInfo.mipCount = 1;
 
+    // RGBA is accepted for the runtime compositor but never exported: the
+    // CoreVideo handoff cannot wrap DXMT's RGBA IOSurfaces.
     swapchainInfo.format = DXGI_FORMAT_R8G8B8A8_UNORM;
     XrSwapchain rgbaSwapchain = XR_NULL_HANDLE;
     result = xrCreateSwapchain(session, &swapchainInfo, &rgbaSwapchain);
-    if (result != XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED ||
-        rgbaSwapchain != XR_NULL_HANDLE) {
-        if (rgbaSwapchain != XR_NULL_HANDLE) {
-            xrDestroySwapchain(rgbaSwapchain);
+    bool rgbaPrivate = XR_SUCCEEDED(result) && rgbaSwapchain != XR_NULL_HANDLE;
+    if (rgbaPrivate) {
+        uint32_t rgbaImageCount = 0;
+        XrSwapchainImageD3D11KHR rgbaImages[3]{};
+        for (XrSwapchainImageD3D11KHR& image : rgbaImages) {
+            image.type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+        }
+        result = xrEnumerateSwapchainImages(
+            rgbaSwapchain, 3, &rgbaImageCount,
+            reinterpret_cast<XrSwapchainImageBaseHeader*>(rgbaImages));
+        rgbaPrivate = XR_SUCCEEDED(result);
+        for (uint32_t index = 0; rgbaPrivate && index < rgbaImageCount; ++index) {
+            D3D11_TEXTURE2D_DESC description{};
+            rgbaImages[index].texture->GetDesc(&description);
+            uint32_t iosurfaceId = 0;
+            UINT iosurfaceIdSize = sizeof(iosurfaceId);
+            rgbaPrivate =
+                (description.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) == 0 &&
+                FAILED(rgbaImages[index].texture->GetPrivateData(
+                    kBasaltIOSurfaceIdGuid, &iosurfaceIdSize, &iosurfaceId));
+        }
+        const XrResult destroyResult = xrDestroySwapchain(rgbaSwapchain);
+        rgbaPrivate = rgbaPrivate && XR_SUCCEEDED(destroyResult);
+    }
+    swapchainInfo.format = DXGI_FORMAT_BC1_UNORM;
+    XrSwapchain compressedSwapchain = XR_NULL_HANDLE;
+    const XrResult compressedResult =
+        xrCreateSwapchain(session, &swapchainInfo, &compressedSwapchain);
+    if (!rgbaPrivate ||
+        compressedResult != XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED ||
+        compressedSwapchain != XR_NULL_HANDLE) {
+        if (compressedSwapchain != XR_NULL_HANDLE) {
+            xrDestroySwapchain(compressedSwapchain);
         }
         xrDestroySession(session);
         release(context);
         release(device);
         xrDestroyInstance(instance);
-        return fail("xrCreateSwapchain(unsupported RGBA transport)", result);
+        return fail("xrCreateSwapchain(private RGBA / unsupported BC1)",
+                    rgbaPrivate ? compressedResult : result);
     }
     // UE4 hands over a typeless BGRA format for its eye textures; the runtime
     // backs it with typed BGRA instead of rejecting the swapchain.
@@ -2536,32 +2917,50 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(options.renderFrames),
                 expectConnected() ? " and delivered to the control daemon" : "");
 
+    // Quad layers are composited by the runtime (d3d11_compositor_smoke
+    // covers them); here only frames that must not reach the daemon are
+    // submitted: an invalid quad and an extension layer type that was never
+    // enabled.
     XrCompositionLayerQuad quadLayer{};
     quadLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
     quadLayer.space = localSpace;
     quadLayer.subImage = projectionViews[0].subImage;
     quadLayer.pose.orientation.w = 1.0f;
-    quadLayer.size = {1.0f, 1.0f};
-    result = xrWaitFrame(session, nullptr, &layerFrameState);
-    if (XR_SUCCEEDED(result)) {
-        result = xrBeginFrame(session, nullptr);
-    }
-    frameEndInfo.displayTime = layerFrameState.predictedDisplayTime;
-    submittedLayers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadLayer);
-    if (XR_SUCCEEDED(result)) {
-        result = xrEndFrame(session, &frameEndInfo);
-        if (result != XR_ERROR_LAYER_INVALID) {
-            xrDestroySwapchain(secondSwapchain);
-            xrDestroySwapchain(swapchain);
-            xrDestroySession(session);
-            release(context);
-            release(device);
-            xrDestroyInstance(instance);
-            return fail("quad layer rejection", result);
+    quadLayer.size = {0.0f, 1.0f};
+    for (const XrResult expected :
+         {XR_ERROR_VALIDATION_FAILURE, XR_ERROR_LAYER_INVALID}) {
+        if (expected == XR_ERROR_LAYER_INVALID) {
+            // XR_KHR_composition_layer_cylinder's layer type.
+            quadLayer.type = static_cast<XrStructureType>(1000017000);
+            quadLayer.size = {1.0f, 1.0f};
         }
-        frameEndInfo.layerCount = 0;
-        frameEndInfo.layers = nullptr;
-        result = xrEndFrame(session, &frameEndInfo);
+        result = xrWaitFrame(session, nullptr, &layerFrameState);
+        if (XR_SUCCEEDED(result)) {
+            result = xrBeginFrame(session, nullptr);
+        }
+        frameEndInfo.displayTime = layerFrameState.predictedDisplayTime;
+        frameEndInfo.layerCount = 1;
+        frameEndInfo.layers = submittedLayers;
+        submittedLayers[0] =
+            reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadLayer);
+        if (XR_SUCCEEDED(result)) {
+            result = xrEndFrame(session, &frameEndInfo);
+            if (result != expected) {
+                xrDestroySwapchain(secondSwapchain);
+                xrDestroySwapchain(swapchain);
+                xrDestroySession(session);
+                release(context);
+                release(device);
+                xrDestroyInstance(instance);
+                return fail("invalid quad / unknown layer rejection", result);
+            }
+            frameEndInfo.layerCount = 0;
+            frameEndInfo.layers = nullptr;
+            result = xrEndFrame(session, &frameEndInfo);
+        }
+        if (XR_FAILED(result)) {
+            break;
+        }
     }
     if (XR_FAILED(result)) {
         xrDestroySwapchain(secondSwapchain);
@@ -2828,6 +3227,18 @@ int main(int argc, char** argv) {
             xrDestroyInstance(instance);
             return fail("session-cascaded xrDestroySpace(LOCAL)", cascadeResult);
         }
+    }
+    // A second session would start a second control-daemon handshake, so the
+    // OpenComposite-style restart runs only in headless mode.
+    if (XR_SUCCEEDED(result) && !expectConnected() &&
+        !checkOpenCompositeSessionRestart(
+            instance, sessionInfo, attachedActionSets,
+            static_cast<uint32_t>(std::size(attachedActionSets)),
+            overlayPoseAction, leftHandPath)) {
+        release(context);
+        release(device);
+        xrDestroyInstance(instance);
+        return 1;
     }
     if (XR_SUCCEEDED(result)) {
         result = xrDestroyInstance(instance);

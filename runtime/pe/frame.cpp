@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "compositor.hpp"
 #include "control.hpp"
 
 namespace {
@@ -178,6 +179,26 @@ bool lifecycleMatchesLocked(XrSession session) {
     return session != XR_NULL_HANDLE && session == gLifecycleSession;
 }
 
+// Every queued session-scoped event names its session. OpenComposite aborts
+// on a state event for any session but its current one, so an event that
+// outlived its session (one is cleared and the next initialized under the
+// same lock, but stay defensive) is dropped rather than delivered.
+bool eventBelongsToLifecycleLocked(const XrEventDataBuffer& event) {
+    switch (event.type) {
+    case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED:
+        return lifecycleMatchesLocked(
+            reinterpret_cast<const XrEventDataSessionStateChanged*>(&event)->session);
+    case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
+        return lifecycleMatchesLocked(
+            reinterpret_cast<const XrEventDataInteractionProfileChanged*>(&event)->session);
+    case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
+        return lifecycleMatchesLocked(
+            reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&event)->session);
+    default:
+        return true;
+    }
+}
+
 }  // namespace
 
 namespace basalt {
@@ -208,15 +229,20 @@ void queueReferenceSpaceChange(
     const XrPosef& poseInPreviousSpace) {
     AcquireSRWLockExclusive(&gLifecycleLock);
     if (lifecycleMatchesLocked(session) && gSessionRunning && changeTime > 0) {
-        XrEventDataReferenceSpaceChangePending event{};
-        event.type = XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING;
-        event.next = nullptr;
-        event.session = session;
-        event.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
-        event.changeTime = changeTime;
-        event.poseValid = XR_TRUE;
-        event.poseInPreviousSpace = poseInPreviousSpace;
-        queueEventLocked(&event, sizeof(event));
+        // STAGE shares LOCAL's origin, so a recenter moves both by the same
+        // transform (OpenComposite tracks in STAGE).
+        for (const XrReferenceSpaceType referenceSpaceType :
+             {XR_REFERENCE_SPACE_TYPE_LOCAL, XR_REFERENCE_SPACE_TYPE_STAGE}) {
+            XrEventDataReferenceSpaceChangePending event{};
+            event.type = XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING;
+            event.next = nullptr;
+            event.session = session;
+            event.referenceSpaceType = referenceSpaceType;
+            event.changeTime = changeTime;
+            event.poseValid = XR_TRUE;
+            event.poseInPreviousSpace = poseInPreviousSpace;
+            queueEventLocked(&event, sizeof(event));
+        }
     }
     ReleaseSRWLockExclusive(&gLifecycleLock);
 }
@@ -225,17 +251,69 @@ void queueReferenceSpaceChange(
 
 namespace {
 
+constexpr XrCompositionLayerFlags kSupportedLayerFlags =
+    XR_COMPOSITION_LAYER_CORRECT_CHROMATIC_ABERRATION_BIT |
+    XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+    XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+
+// A negative extent flips that axis (OpenComposite submits flipped bounds
+// this way): the rect then spans [offset + extent, offset).
+bool rectAxisInBounds(int32_t offset, int32_t extent, uint32_t size) {
+    const int64_t first = extent < 0
+        ? static_cast<int64_t>(offset) + extent : static_cast<int64_t>(offset);
+    const int64_t last = extent < 0
+        ? static_cast<int64_t>(offset) : static_cast<int64_t>(offset) + extent;
+    return extent != 0 && first >= 0 && last <= static_cast<int64_t>(size);
+}
+
+// Validates one layer's subimage against the session's swapchains and
+// captures the image the compositor would consume. *direct reports whether
+// the native streamer can read it as-is: an exported swapchain whose whole
+// image is submitted unflipped (the streamer ignores rects).
+XrResult validateSubImage(
+    XrSession session,
+    const XrSwapchainSubImage& subImage,
+    basalt::CompositionSubImage* captured,
+    bool* direct) {
+    basalt::SwapchainLayerState state{};
+    if (!basalt::getSwapchainLayerState(subImage.swapchain, &state) ||
+        state.session != session) {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    if (state.depth) {
+        // A depth swapchain is never a color source.
+        return XR_ERROR_LAYER_INVALID;
+    }
+    if (subImage.imageArrayIndex >= state.arraySize) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    const XrRect2Di& rect = subImage.imageRect;
+    if (!rectAxisInBounds(rect.offset.x, rect.extent.width, state.width) ||
+        !rectAxisInBounds(rect.offset.y, rect.extent.height, state.height)) {
+        return XR_ERROR_SWAPCHAIN_RECT_INVALID;
+    }
+    if (!state.hasReleasedImage) {
+        // The compositor can only consume an image the app has released.
+        return XR_ERROR_LAYER_INVALID;
+    }
+
+    captured->swapchain = subImage.swapchain;
+    captured->imageIndex = state.lastReleasedIndex;
+    captured->imageArrayIndex = subImage.imageArrayIndex;
+    captured->rect = rect;
+    *direct = state.exported && rect.offset.x == 0 && rect.offset.y == 0 &&
+              static_cast<int64_t>(rect.extent.width) == state.width &&
+              static_cast<int64_t>(rect.extent.height) == state.height;
+    return XR_SUCCESS;
+}
+
 // Validates one submitted projection layer against the session's spaces and
-// swapchains. When outViews is non-null, the validated per-view submission
-// data is captured for the control-socket FrameReady handoff.
+// swapchains, capturing per-view data for FrameReady or the compositor.
 XrResult validateProjectionLayer(
     XrSession session,
     const XrCompositionLayerProjection* layer,
-    basalt::ControlFrameView* outViews) {
-    constexpr XrCompositionLayerFlags kSupportedLayerFlags =
-        XR_COMPOSITION_LAYER_CORRECT_CHROMATIC_ABERRATION_BIT |
-        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
-        XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+    basalt::CompositionLayer* captured,
+    bool* direct) {
     constexpr float kMaxFovHalfAngleRadians = 1.57079633f;
     constexpr uint32_t kStereoViewCount = 2;
 
@@ -249,6 +327,10 @@ XrResult validateProjectionLayer(
         return XR_ERROR_VALIDATION_FAILURE;
     }
 
+    captured->kind = basalt::CompositionLayerKind::kProjection;
+    captured->layerFlags = layer->layerFlags;
+    captured->space = layer->space;
+    *direct = true;
     for (uint32_t index = 0; index < layer->viewCount; ++index) {
         const XrCompositionLayerProjectionView& view = layer->views[index];
         if (view.type != XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW) {
@@ -268,50 +350,54 @@ XrResult validateProjectionLayer(
             return XR_ERROR_VALIDATION_FAILURE;
         }
 
-        XrSession swapchainSession = XR_NULL_HANDLE;
-        uint32_t width = 0;
-        uint32_t height = 0;
-        uint32_t arraySize = 0;
-        bool hasReleasedImage = false;
-        uint32_t lastReleasedIndex = 0;
-        if (!basalt::getSwapchainSubmitState(
-                view.subImage.swapchain,
-                &swapchainSession,
-                &width,
-                &height,
-                &arraySize,
-                &hasReleasedImage,
-                &lastReleasedIndex) ||
-            swapchainSession != session) {
-            return XR_ERROR_HANDLE_INVALID;
+        bool viewDirect = false;
+        const XrResult result = validateSubImage(
+            session, view.subImage, &captured->subImages[index], &viewDirect);
+        if (XR_FAILED(result)) {
+            return result;
         }
-        if (view.subImage.imageArrayIndex >= arraySize) {
-            return XR_ERROR_VALIDATION_FAILURE;
-        }
-        const XrRect2Di& rect = view.subImage.imageRect;
-        if (rect.offset.x < 0 || rect.offset.y < 0 ||
-            rect.extent.width <= 0 || rect.extent.height <= 0 ||
-            static_cast<int64_t>(rect.offset.x) + rect.extent.width >
-                static_cast<int64_t>(width) ||
-            static_cast<int64_t>(rect.offset.y) + rect.extent.height >
-                static_cast<int64_t>(height)) {
-            return XR_ERROR_SWAPCHAIN_RECT_INVALID;
-        }
-        if (!hasReleasedImage) {
-            // The compositor can only consume an image the app has released.
-            return XR_ERROR_LAYER_INVALID;
-        }
-
-        if (outViews != nullptr) {
-            outViews[index].swapchainId =
-                reinterpret_cast<uintptr_t>(view.subImage.swapchain);
-            outViews[index].imageIndex = lastReleasedIndex;
-            outViews[index].imageArrayIndex = view.subImage.imageArrayIndex;
-            outViews[index].rect = view.subImage.imageRect;
-            outViews[index].pose = view.pose;
-            outViews[index].fov = view.fov;
-        }
+        *direct = *direct && viewDirect;
+        captured->poses[index] = view.pose;
+        captured->fovs[index] = view.fov;
     }
+    return XR_SUCCESS;
+}
+
+XrResult validateQuadLayer(
+    XrSession session,
+    const XrCompositionLayerQuad* layer,
+    basalt::CompositionLayer* captured) {
+    if ((layer->layerFlags & ~kSupportedLayerFlags) != 0) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (!basalt::isSpaceForSession(layer->space, session)) {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    if (layer->eyeVisibility != XR_EYE_VISIBILITY_BOTH &&
+        layer->eyeVisibility != XR_EYE_VISIBILITY_LEFT &&
+        layer->eyeVisibility != XR_EYE_VISIBILITY_RIGHT) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (!basalt::isPoseWellFormed(layer->pose)) {
+        return XR_ERROR_POSE_INVALID;
+    }
+    if (!std::isfinite(layer->size.width) || !std::isfinite(layer->size.height) ||
+        layer->size.width <= 0.0f || layer->size.height <= 0.0f) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+
+    bool direct = false;
+    const XrResult result = validateSubImage(
+        session, layer->subImage, &captured->subImages[0], &direct);
+    if (XR_FAILED(result)) {
+        return result;
+    }
+    captured->kind = basalt::CompositionLayerKind::kQuad;
+    captured->layerFlags = layer->layerFlags;
+    captured->space = layer->space;
+    captured->eyeVisibility = layer->eyeVisibility;
+    captured->pose = layer->pose;
+    captured->size = layer->size;
     return XR_SUCCESS;
 }
 
@@ -357,15 +443,18 @@ XrResult XRAPI_CALL pollEvent(
     }
 
     AcquireSRWLockExclusive(&gLifecycleLock);
-    if (instance != gLifecycleInstance || gEventCount == 0) {
-        ReleaseSRWLockExclusive(&gLifecycleLock);
+    XrEventDataBuffer event{};
+    bool found = false;
+    while (instance == gLifecycleInstance && gEventCount > 0 && !found) {
+        event = gEvents[gEventHead];
+        gEventHead = (gEventHead + 1) % kEventCapacity;
+        --gEventCount;
+        found = eventBelongsToLifecycleLocked(event);
+    }
+    ReleaseSRWLockExclusive(&gLifecycleLock);
+    if (!found) {
         return XR_EVENT_UNAVAILABLE;
     }
-
-    const XrEventDataBuffer event = gEvents[gEventHead];
-    gEventHead = (gEventHead + 1) % kEventCapacity;
-    --gEventCount;
-    ReleaseSRWLockExclusive(&gLifecycleLock);
 
     std::memset(eventData, 0, sizeof(*eventData));
     std::memcpy(eventData, &event, sizeof(event));
@@ -637,23 +726,42 @@ XrResult XRAPI_CALL endFrame(
         ReleaseSRWLockExclusive(&gLifecycleLock);
         return XR_ERROR_VALIDATION_FAILURE;
     }
-    basalt::ControlFrameView frameViews[2]{};
-    bool haveFrameViews = false;
+    // Layers are captured in submission order. Only the first projection
+    // layer is displayed; later ones are validated like before.
+    basalt::CompositionFrame composition{};
+    bool haveProjection = false;
+    bool projectionDirect = false;
+    uint32_t projectionLayer = 0;
+    bool haveQuads = false;
     for (uint32_t index = 0; index < frameEndInfo->layerCount; ++index) {
         const XrCompositionLayerBaseHeader* layer = frameEndInfo->layers[index];
         XrResult layerResult = XR_SUCCESS;
+        basalt::CompositionLayer captured{};
         if (layer == nullptr) {
             layerResult = XR_ERROR_LAYER_INVALID;
         } else if (layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
-            // The first projection layer feeds the FrameReady handoff; the
-            // native compositor composes additional layers later.
+            bool direct = false;
             layerResult = validateProjectionLayer(
                 session,
                 reinterpret_cast<const XrCompositionLayerProjection*>(layer),
-                haveFrameViews ? nullptr : frameViews);
-            haveFrameViews = true;
+                &captured, &direct);
+            if (XR_SUCCEEDED(layerResult) && !haveProjection) {
+                projectionLayer = composition.layerCount;
+                composition.layers[composition.layerCount++] = captured;
+                haveProjection = true;
+                projectionDirect = direct;
+            }
+        } else if (layer->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+            layerResult = validateQuadLayer(
+                session,
+                reinterpret_cast<const XrCompositionLayerQuad*>(layer),
+                &captured);
+            if (XR_SUCCEEDED(layerResult)) {
+                composition.layers[composition.layerCount++] = captured;
+                haveQuads = true;
+            }
         } else {
-            // Quad and extension layers wait for the native compositor.
+            // Extension layers (cylinder, cube, equirect) are not enabled.
             layerResult = XR_ERROR_LAYER_INVALID;
         }
         if (XR_FAILED(layerResult)) {
@@ -672,14 +780,45 @@ XrResult XRAPI_CALL endFrame(
         queueStateLocked(XR_SESSION_STATE_VISIBLE);
         queueStateLocked(XR_SESSION_STATE_FOCUSED);
     }
-    const uint64_t questTrackingTimestamp = haveFrameViews
+    const uint64_t questTrackingTimestamp = haveProjection
         ? locatedViewsQuestTimestamp(session, frameEndInfo->displayTime) : 0;
     ReleaseSRWLockExclusive(&gLifecycleLock);
-    if (haveFrameViews) {
+
+    // The streamer reads whole BGRA eye images. A frame that already has
+    // that shape is exported zero-copy exactly as before; anything else is
+    // drawn by the runtime compositor into its own exported images.
+    basalt::ControlFrameView frameViews[2]{};
+    if (haveProjection) {
+        const basalt::CompositionLayer& projection =
+            composition.layers[projectionLayer];
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            const basalt::CompositionSubImage& subImage = projection.subImages[eye];
+            frameViews[eye].swapchainId =
+                reinterpret_cast<uintptr_t>(subImage.swapchain);
+            frameViews[eye].imageIndex = subImage.imageIndex;
+            frameViews[eye].imageArrayIndex = subImage.imageArrayIndex;
+            frameViews[eye].rect = subImage.rect;
+            frameViews[eye].pose = projection.poses[eye];
+            frameViews[eye].fov = projection.fovs[eye];
+        }
+    }
+    if (haveQuads || (haveProjection && !projectionDirect)) {
+        const bool composited = basalt::compositorSubmitFrame(
+            session, frameEndInfo->displayTime, questTrackingTimestamp,
+            composition);
+        if (!composited && haveProjection && projectionDirect) {
+            // Without a usable compositor, still show the projection rather
+            // than dropping the frame (its quads are lost).
+            controlFrameReady(
+                frameEndInfo->displayTime,
+                questTrackingTimestamp,
+                frameViews, 2, true);
+        }
+    } else if (haveProjection) {
         controlFrameReady(
             frameEndInfo->displayTime,
             questTrackingTimestamp,
-            frameViews, 2);
+            frameViews, 2, true);
     }
     return XR_SUCCESS;
 }

@@ -1,0 +1,146 @@
+diff --git a/scripts/split_headers.py b/scripts/split_headers.py
+index 7788a33..a3f1d7d 100644
+--- a/scripts/split_headers.py
++++ b/scripts/split_headers.py
+@@ -133,6 +133,46 @@ def patch(text, patchfile):
+     return "\n".join(lines)
+ 
+ 
++# Aggregates that OpenVR interface methods return by value. All are larger than 8 bytes.
++MSVC_AGGREGATE_RETURN_TYPES = ("HmdMatrix34_t", "HmdMatrix44_t", "HmdColor_t", "HiddenAreaMesh_t",
++                               "DistortionCoordinates_t")
++
++MSVC_AGGREGATE_RETURN_PRELUDE = """#ifndef OC_MSVC_AGGREGATE_RETURN
++#if defined(_WIN32) && defined(__GNUC__)
++#define OC_MSVC_AGGREGATE_RETURN 1
++#else
++#define OC_MSVC_AGGREGATE_RETURN 0
++#endif
++#endif
++#ifndef OC_AGGREGATE_RETURN_PTR
++// Kept out of the plain 'Type Name(' shape so the stub generator parses only the
++// portable declaration below each one.
++#define OC_AGGREGATE_RETURN_PTR(type) type*
++#endif
++"""
++
++_aggregate_decl = re.compile(
++    r"^(?P<indent>[ \t]*)virtual (?P<type>" + "|".join(MSVC_AGGREGATE_RETURN_TYPES) +
++    r") (?P<name>\w+)\((?P<args>[^;]*)\)(?P<tail>\s*= 0;.*)$", re.MULTILINE)
++
++
++def msvc_aggregate_return(text: str) -> str:
++    def repl(m):
++        args = m.group("args").strip()
++        ret_arg = f"{m.group('type')} *_ocRet"
++        new_args = f" {ret_arg}, {args} " if args else f" {ret_arg} "
++        return (f"#if OC_MSVC_AGGREGATE_RETURN\n"
++                f"{m.group('indent')}virtual OC_AGGREGATE_RETURN_PTR({m.group('type')}) {m.group('name')}({new_args}){m.group('tail')}\n"
++                f"#else\n"
++                f"{m.group(0)}\n"
++                f"#endif")
++
++    new_text, count = _aggregate_decl.subn(repl, text)
++    if count:
++        new_text = MSVC_AGGREGATE_RETURN_PRELUDE + new_text
++    return new_text
++
++
+ def write_interface(target: str, result: str, usingiface: bool, interface_checker: Callable, out_dir: Path):
+     """
+     Writes an interface out to a file.
+@@ -210,6 +250,13 @@ def write_interface(target: str, result: str, usingiface: bool, interface_checke
+     if target in patches:
+         result = patch(result, input_dir / f"patches/{target}.ipatch")
+ 
++    # MinGW (GCC and Clang) pass the hidden aggregate-return pointer of a C++ method before
++    # 'this', while MSVC passes 'this' first, then the return pointer, and returns that
++    # pointer in RAX. Games are MSVC-built, so a MinGW OpenComposite must declare these
++    # vtable slots in the MSVC shape. See msvc_aggregate_return() below.
++    if usingiface:
++        result = msvc_aggregate_return(result)
++
+     # if nooverwrite and os.path.isfile(outfile):
+     #   # Check the hashes of the files, in case the headers have been modified, a new
+     #   #  header has been added, or anything like that.
+diff --git a/scripts/stubs/codegen.py b/scripts/stubs/codegen.py
+index 39cebd4..101ac17 100644
+--- a/scripts/stubs/codegen.py
++++ b/scripts/stubs/codegen.py
+@@ -6,6 +6,20 @@ from stubs.interface_spec import InterfaceSpec
+ 
+ cflag_spec = re.compile(r"\[(?P<name>\w+)\]\s*=\s*(?P<value>.*)")
+ 
++# Must match MSVC_AGGREGATE_RETURN_TYPES in split_headers.py. With OC_MSVC_AGGREGATE_RETURN
++# (MinGW builds), these methods take the return pointer after 'this' and return it, like MSVC.
++MSVC_AGGREGATE_RETURN_TYPES = ("HmdMatrix34_t", "HmdMatrix44_t", "HmdColor_t", "HiddenAreaMesh_t",
++                               "DistortionCoordinates_t")
++
++
++def _returns_aggregate(func) -> bool:
++    return func.return_type.split("::")[-1].strip() in MSVC_AGGREGATE_RETURN_TYPES
++
++
++def _sret_args(func) -> str:
++    args = func.args_str()
++    return f"{func.return_type} *_ocRet" + (f", {args}" if args else "")
++
+ 
+ def write_header(filename, iface):
+     header = open(filename, "w", newline='\n')
+@@ -41,6 +55,13 @@ public:
+     fi.write("\n")
+ 
+     for func in iface.functions:
++        if _returns_aggregate(func):
++            fi.write("#if OC_MSVC_AGGREGATE_RETURN\n")
++            fi.write(f"\t{func.return_type}* {func.name}({_sret_args(func)}) override;\n")
++            fi.write("#else\n")
++            fi.write(f"\t{func.return_type} {func.name}({func.args_str()}) override;\n")
++            fi.write("#endif\n")
++            continue
+         fi.write(f"\t{func.return_type} {func.name}({func.args_str()}) override;\n")
+ 
+     fi.write("};\n")
+@@ -104,10 +125,21 @@ std::shared_ptr<{cls}> GetCreate{getter_name}() {{
+             if namespace in f.return_type:
+                 return_str += f" ({f.return_type})"
+ 
++            if _returns_aggregate(f):
++                cast = f"({f.return_type}) " if namespace in f.return_type else ""
++                fi.write("#if OC_MSVC_AGGREGATE_RETURN\n"
++                         f"{f.return_type}* {cname}::{f.name}({_sret_args(f)}) {{\n"
++                         "\tif (oovr_global_configuration.LogAllOpenVRCalls())\n"
++                         f"\t\tOOVR_LOG(\"Entered function (from interface {ver.namespace()})\");\n"
++                         f"\t*_ocRet = {cast}base->{f.name}({nargs});\n"
++                         "\treturn _ocRet;\n}\n"
++                         "#else\n")
+             fi.write(f"{f.return_type} {cname}::{f.name}({f.args_str()}) {{\n"
+                      "\tif (oovr_global_configuration.LogAllOpenVRCalls())\n"
+                      f"\t\tOOVR_LOG(\"Entered function (from interface {ver.namespace()})\");\n"
+                      f"\t{return_str} base->{f.name}({nargs});\n}}\n")
++            if _returns_aggregate(f):
++                fi.write("#endif\n")
+ 
+         # Generate the fntable
+         _build_fntable(fi, ver)
+@@ -129,6 +161,19 @@ def _build_fntable(fi, ver: InterfaceDef):
+     # Generate the stub functions
+     for func in ver.functions:
+         call_stmt = f"return {inst_name}->{func.name}({func.args_names()});"
++        if _returns_aggregate(func):
++            # FnTable entries are plain functions, where MinGW and MSVC agree.
++            names = func.args_names()
++            sret_call = (f"{func.return_type} _ocRet; {inst_name}->{func.name}(&_ocRet"
++                         + (f", {names}" if names else "") + "); return _ocRet;")
++            fi.write("#if OC_MSVC_AGGREGATE_RETURN\n")
++            fi.write(f"static {func.return_type} OPENVR_FNTABLE_CALLTYPE {func_name_template % func.name}"
++                     f"({func.args_str()}) {{ {sret_call} }}\n")
++            fi.write("#else\n")
++            fi.write(
++                f"static {func.return_type} OPENVR_FNTABLE_CALLTYPE {func_name_template % func.name}({func.args_str()}) {{ {call_stmt} }}\n")
++            fi.write("#endif\n")
++            continue
+ 
+         fi.write(
+             f"static {func.return_type} OPENVR_FNTABLE_CALLTYPE {func_name_template % func.name}({func.args_str()}) {{ {call_stmt} }}\n")

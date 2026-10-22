@@ -33,6 +33,7 @@ constexpr uint64_t kAlvrRightSystemClickPathId = 0x19729bd97073d474ULL;
 
 bool isValidInstance(XrInstance instance);
 bool isD3D11ExtensionEnabled(XrInstance instance);
+bool isVisibilityMaskExtensionEnabled(XrInstance instance);
 bool isD3D11RuntimeAvailable();
 bool isValidSession(XrSession session);
 ID3D11Device* retainSessionDevice(XrSession session);
@@ -230,6 +231,12 @@ XrResult XRAPI_CALL getReferenceSpaceBoundsRect(
     XrSession session,
     XrReferenceSpaceType referenceSpaceType,
     XrExtent2Df* bounds);
+XrResult XRAPI_CALL getVisibilityMask(
+    XrSession session,
+    XrViewConfigurationType viewConfigurationType,
+    uint32_t viewIndex,
+    XrVisibilityMaskTypeKHR visibilityMaskType,
+    XrVisibilityMaskKHR* visibilityMask);
 XrResult XRAPI_CALL enumerateReferenceSpaces(
     XrSession session,
     uint32_t spaceCapacityInput,

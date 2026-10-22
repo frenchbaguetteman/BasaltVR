@@ -62,12 +62,16 @@ private struct BasaltCLI {
         --source direct|steam|bsmanager|itch --exe PATH [--cwd PATH] \
         [--arg VALUE ...] [--env KEY=VALUE ...]
       basaltctl [--root PATH] [--repo PATH] opencomposite install PROFILE \
-        --artifact /path/openvr_api.dll --target /managed/prefix/.../openvr_api.dll
+        --artifact /path/openvr_api.dll --target /managed/prefix/.../openvr_api.dll \
+        [--proxy /path/basalt/openvr_api.dll] [--preset default|alyx] \
+        [--ini KEY=VALUE ...]
       basaltctl [--root PATH] [--repo PATH] run PROFILE --control-file PATH [-- ARG ...]
 
     `bottle prepare` installs the Basalt DXMT fork and OpenXR runtime into an
     existing managed pinned-engine bottle. OpenComposite is deliberately supplied
-    by the user and remains a separate GPLv3 artifact.
+    by the user and remains a separate GPLv3 artifact. With --proxy, the Basalt
+    proxy becomes openvr_api.dll and OpenComposite is installed beside it as
+    openvr_api_opencomposite.dll; Half-Life: Alyx needs --proxy and --preset alyx.
     """
 
     static func main() {
@@ -260,11 +264,32 @@ private struct BasaltCLI {
             throw BottleToolError(
                 "opencomposite install requires --artifact and --target")
         }
+        let proxy = try cursor.value(after: "--proxy")
+        let presetName = try cursor.value(after: "--preset") ?? "default"
+        guard let preset = OpenCompositeConfiguration.Preset(rawValue: presetName) else {
+            let names = OpenCompositeConfiguration.Preset.allCases.map(\.rawValue)
+            throw BottleToolError(
+                "Unknown OpenComposite preset '\(presetName)'; use \(names.joined(separator: " or "))")
+        }
+        let assignments = try cursor.repeatedValues(after: "--ini")
         try rejectRemainder(cursor)
+        if preset == .alyx, proxy == nil {
+            throw BottleToolError(
+                "--preset alyx requires --proxy: Half-Life: Alyx needs Valve's VRControlPanel export, which OpenComposite lacks")
+        }
+        var configuration = OpenCompositeConfiguration(preset: preset)
+        for assignment in assignments { try configuration.apply(assignment) }
         let installed = try manager.installOpenComposite(
             profileName: profile, artifact: URL(fileURLWithPath: artifact),
-            targetDLL: URL(fileURLWithPath: target))
-        print("Installed OpenComposite at \(installed.path)")
+            targetDLL: URL(fileURLWithPath: target),
+            proxy: proxy.map { URL(fileURLWithPath: $0) },
+            configuration: configuration)
+        if proxy != nil {
+            print("Installed the OpenVR proxy at \(installed.path)")
+            print("Installed OpenComposite at \(installed.deletingLastPathComponent().appendingPathComponent(BottleManager.openCompositeProxiedDLLName).path)")
+        } else {
+            print("Installed OpenComposite at \(installed.path)")
+        }
     }
 
     private static func runCommand(_ cursor: inout ArgumentCursor,
