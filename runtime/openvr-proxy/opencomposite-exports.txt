@@ -1,0 +1,31 @@
+# Export table of the pinned OpenComposite openvr_api.dll, one name per line, sorted.
+# runtime/scripts/build-opencomposite.zsh compares this list with the built DLL and fails on
+# any difference; the proxy forwards exactly these names. The VR* accessors, VR_Init and
+# VR_Shutdown come from OpenComposite's OpenVR 0.9.12 compatibility layer.
+HmdSystemFactory
+VRApplications
+VRChaperone
+VRChaperoneSetup
+VRClientCoreFactory
+VRCompositor
+VRExtendedDisplay
+VRNotifications
+VROverlay
+VRRenderModels
+VRSettings
+VRSystem
+VRTrackedCamera
+VR_GetGenericInterface
+VR_GetInitToken
+VR_GetStringForHmdError
+VR_GetVRInitErrorAsEnglishDescription
+VR_GetVRInitErrorAsSymbol
+VR_Init
+VR_InitInternal
+VR_InitInternal2
+VR_IsHmdPresent
+VR_IsInterfaceVersionValid
+VR_IsRuntimeInstalled
+VR_RuntimePath
+VR_Shutdown
+VR_ShutdownInternal

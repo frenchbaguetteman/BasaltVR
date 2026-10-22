@@ -81,12 +81,13 @@ done
 rm -rf "$app_dir"
 mkdir -p "$macos_dir" "$resources_dir" "$support_dir" "$release_dir"
 
-cp "${swift_release_dir}/BasaltVR" "${macos_dir}/BasaltVR-bin"
+# The Swift app is the bundle executable, so macOS attributes Microphone access (BlackHole
+# game audio) to BasaltVR. It finds Resources/BasaltVR and sets PATH itself
+# (AppBundleEnvironment); the Play page runs the bundled scripts with the tools below.
+cp "${swift_release_dir}/BasaltVR" "${macos_dir}/BasaltVR"
 cp "${swift_release_dir}/basalt-streamer" "${macos_dir}/basalt-streamer"
 cp "${swift_release_dir}/basaltctl" "${macos_dir}/basaltctl"
-cp "${repo_dir}/packaging/BasaltVRLauncher" "${macos_dir}/BasaltVRLauncher"
-chmod 755 "${macos_dir}/BasaltVR-bin" "${macos_dir}/basalt-streamer" \
-    "${macos_dir}/basaltctl" "${macos_dir}/BasaltVRLauncher"
+chmod 755 "${macos_dir}/BasaltVR" "${macos_dir}/basalt-streamer" "${macos_dir}/basaltctl"
 
 cp "${repo_dir}/packaging/Info.plist" "${contents_dir}/Info.plist"
 /usr/libexec/PlistBuddy \
@@ -138,6 +139,10 @@ if [[ -f "${dxmt_source_dir}/x86_64-unix/winemetal.so" ]]; then
 fi
 
 ditto "${repo_dir}/docs" "${support_dir}/docs"
+mkdir -p "${support_dir}/scripts"
+for script in play steam quest-adb quest-check quest-wireless game-processes install-quest-client; do
+    cp "${repo_dir}/scripts/${script}.zsh" "${support_dir}/scripts/${script}.zsh"
+done
 cp "${repo_dir}/README.md" "${support_dir}/README.md"
 cp "${repo_dir}/CHANGELOG.md" "${support_dir}/CHANGELOG.md"
 cp "${repo_dir}/ROADMAP.md" "${support_dir}/ROADMAP.md"
@@ -171,11 +176,20 @@ find "$app_dir" -type f -print0 | while IFS= read -r -d '' artifact; do
         "$artifact"
 done
 
-codesign --force --sign - --timestamp=none "${macos_dir}/basalt-streamer"
-codesign --force --sign - --timestamp=none "${macos_dir}/basaltctl"
-codesign --force --sign - --timestamp=none "${macos_dir}/BasaltVR-bin"
-codesign --force --deep --sign - --timestamp=none "$app_dir"
+# Hardened runtime plus the audio-input entitlement: without it macOS can never show the
+# Microphone prompt and BlackHole capture records silence.
+readonly entitlements="${repo_dir}/packaging/BasaltVR.entitlements"
+for executable in basalt-streamer basaltctl; do
+    codesign --force --sign - --timestamp=none --options runtime \
+        --entitlements "$entitlements" "${macos_dir}/${executable}"
+done
+codesign --force --sign - --timestamp=none --options runtime \
+    --entitlements "$entitlements" "$app_dir"
 codesign --verify --deep --strict --verbose=2 "$app_dir"
+if [[ "$(codesign -d --entitlements - --xml "$app_dir" 2>/dev/null)" != *com.apple.security.device.audio-input* ]]; then
+    print -u2 "error: the app signature lacks com.apple.security.device.audio-input"
+    exit 1
+fi
 plutil -lint "${contents_dir}/Info.plist"
 
 # Verify the bundled CLI can discover its packaged support files without relying on

@@ -1,0 +1,18 @@
+diff --git a/OpenOVR/Reimpl/BaseCompositor.cpp b/OpenOVR/Reimpl/BaseCompositor.cpp
+index 849195e..5c8d22f 100644
+--- a/OpenOVR/Reimpl/BaseCompositor.cpp
++++ b/OpenOVR/Reimpl/BaseCompositor.cpp
+@@ -598,7 +598,12 @@ ovr_enum_t BaseCompositor::GetLastPosePredictionIDs(uint32_t* pRenderPosePredict
+ 
+ ovr_enum_t BaseCompositor::GetPosesForFrame(uint32_t unPosePredictionID, TrackedDevicePose_t* pPoseArray, uint32_t unPoseArrayCount)
+ {
+-	STUBBED();
++	// GetLastPosePredictionIDs always reports ID 0, so every ID names the latest render poses.
++	// Recent Half-Life: Alyx builds call this every frame through IVRCompositor_029
++	// (see xrizer issue #448).
++	if (!pPoseArray && unPoseArrayCount)
++		return VRCompositorError_RequestFailed;
++	return GetLastPoses(pPoseArray, unPoseArrayCount, nullptr, 0);
+ }
+ 
+ 

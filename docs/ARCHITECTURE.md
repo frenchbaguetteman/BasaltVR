@@ -69,10 +69,10 @@ The runtime therefore splits in two:
 |-----------|--------|------|
 | Wine build (GPTK/WhiskyWine) | reuse | packaging + bottle tooling |
 | D3D11 → Metal | reuse DXMT | interop patch for swapchain export |
-| OpenVR → OpenXR | reuse OpenComposite | build for Wine/PE, config |
+| OpenVR → OpenXR | reuse OpenComposite | local MinGW build from pinned source + patches, `openvr_api.dll` proxy, config ([OPENCOMPOSITE.md](OPENCOMPOSITE.md)) |
 | Headset client | reuse stock ALVR client | none (that's the point) |
 | Streaming transport | reuse/port ALVR streamer protocol | significant: ALVR's streamer targets Windows/Linux; port session, sockets, packetization |
-| Video encode | **build** (this repo, M1 ✅) | VideoToolbox low-latency H.264 |
+| Video encode | **build** (this repo, M1 ✅) | VideoToolbox low-latency H.264 (HEVC Main with `--codec hevc`) |
 | OpenXR runtime | **build** | the big one — see M3 |
 | Audio capture | build (thin) | BlackHole device capture → ALVR audio |
 | USB transport | **built** (thin) | physical-device detection + `adb forward` + ALVR TCP mode |
@@ -109,8 +109,9 @@ and 1,404-byte legacy-compatible wire limit. Wi-Fi uses UDP. `--wired` detects a
 physical Quest, creates ADB forwards for the headset's TCP 9943/9944 listeners, negotiates
 `wired: true`, launches the client, and transports the same ALVR shards as a length-framed TCP
 stream in both directions. Packet reconstruction plus UDP and TCP loopback tests cover the
-downlink and uplink. Wired TCP uses a separate 1 MiB send/receive buffer and a single 50 ms
-whole-access-unit deadline; a partial write poisons and closes the connection instead of allowing
+downlink and uplink. Wired TCP uses a separate 1 MiB send/receive buffer and keeps one access unit
+in flight. A write that waits on a paused USB link keeps draining the tracking uplink and only
+fails after 5 s without progress; a failed partial write closes the connection instead of allowing
 later shards to desynchronize the stream. Send reports expose wire rate, access-unit size, write
 duration, IDRs, and repeated tracking timestamps. Because ScreenCaptureKit only generates a new
 surface when desktop content changes, a latest-frame pacer advances the encoder at video cadence
@@ -118,9 +119,13 @@ with fresh host-clock timestamps and no catch-up queue; unchanged stereo output 
 temporary desktop is rendered as a smaller virtual monitor in both halves of
 the side-by-side frame; live `ViewsConfig` packets supply the Quest's IPD and asymmetric FOV for
 placement. Capture and negotiation use the same supported refresh rate. Encoder, kernel UDP, and
-Quest decoder queues are explicitly bounded. Client IDR requests recover packet loss without
-waiting for the normal keyframe interval and are rate-limited to prevent a decoder-saturation
-keyframe storm. The uplink extracts Quest tracking timestamps and the head pose, but the temporary
+Quest decoder queues are explicitly bounded. Frames are not encoded while the transport is busy,
+and after a lost access unit P-frames are held until a forced IDR arrives, so the Quest never
+decodes against a missing reference; Wi-Fi spaces recovery IDRs to prevent a keyframe storm. The
+streamer outlives an ALVR client session: after a disconnect it resets runtime input and accepts
+the next connection while the game keeps running (see [STREAMER.md](STREAMER.md), "Loss
+recovery" and "Headset disconnects and reconnects").
+The uplink extracts Quest tracking timestamps and the head pose, but the temporary
 flat desktop preview does not apply that pose: correct world anchoring requires M3's per-eye 3D
 renderer, and attempting to fake it with a 2D image transform caused visible tilt. `ClientStatistics`
 reports display FPS, input-to-display, decode, decoder-queue, and vsync measurements. Those values
@@ -163,12 +168,14 @@ location results become tracked only while fresh M4 pose state is connected.
 create/share/reopen/copy/readback test. It remains absent under the installed WhiskyWine 7.7 +
 Apple D3DMetal path and is advertised under the pinned disposable Wine 11.10 + DXMT v0.80 path.
 In that path the runtime returns the DXGI adapter LUID, validates the application's graphics
-binding, creates/destroys a session, enumerates the CoreVideo-compatible BGRA color formats, and supports two per-eye
-swapchains (up to four total), each with three
-`D3D11_RESOURCE_MISC_SHARED_NTHANDLE` textures and independent acquire/wait/release state. It
-also implements session events/control, CTS-shaped 72 Hz frame call ordering with an
-absolute-deadline waitable-timer scheduler, and bounded
-`VIEW`/`LOCAL` reference spaces. The official Khronos loader smoke exercises these lifecycles and
+binding, creates/destroys a session, enumerates the CoreVideo-compatible BGRA color formats, and
+supports up to 16 swapchains, each with three `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` textures and
+independent acquire/wait/release state. Formats, mip chains, and sizes the streamer cannot read
+directly are still accepted and converted by a runtime compositor (see below). It also implements
+session events/control, CTS-shaped frame call ordering with an absolute-deadline waitable-timer
+scheduler paced to the negotiated headset refresh period (72 Hz while headless), and bounded
+`VIEW`/`LOCAL`/`STAGE` reference spaces.
+The official Khronos loader smoke exercises these lifecycles and
 independently opens every texture's NT handle.
 
 The `hello_xr` initialization surface is now implemented and covered by both Wine smokes:
@@ -187,7 +194,10 @@ forwards haptics as described in M4 below.
 
 `xrEndFrame` now validates and accepts stereo projection layers — layer flags, space and
 swapchain session ownership, per-view poses/FOV, in-bounds image rects, the 16-layer limit,
-and a released image in every referenced swapchain — while still rejecting quad layers.
+and a released image in every referenced swapchain. Quad layers, sub-rects, flipped (negative
+extent) rects, and non-BGRA, mipmapped, or oversized swapchains — all of which OpenComposite
+produces — are drawn by a runtime-side D3D11 compositor into a BGRA output swapchain that is
+handed off like an application swapchain; plain BGRA projection frames skip it.
 As of 2026-07-18 accepted layers ARE consumed: with the Basalt DXMT fork
 (`runtime/dxmt-fork`, IOSurface-backed swapchain textures) and the control socket
 (`runtime/pe/control.cpp`, protocol in `docs/DXMT-INTEROP.md` §4), every layered
@@ -246,9 +256,12 @@ recovers tracking. ALVR control disconnect atomically resets all retained input.
 spaces retain their backing resources when public action handles are destroyed. Calibrated Quest
 IPD and asymmetric per-eye FOV now drive `xrLocateViews`; the headset visual gate renders a LOCAL-fixed depth
 constellation and a physically scaled controller marker to expose stereo/head-tracking errors.
-Each submitted frame also carries the exact Quest tracking timestamp consumed by its successful
-`xrLocateViews` call through the control daemon and VideoToolbox to ALVR, preventing the client
-from applying a newer or older pose to that rendered image.
+Each submitted frame also carries the exact Quest tracking timestamp of the head sample it was
+rendered with through the control daemon and VideoToolbox to ALVR, preventing the client from
+applying a newer or older pose to that rendered image. For each `xrWaitFrame` display time, the
+first `xrLocateViews` or `xrLocateSpace` pins the newest head sample, and every later head query
+for that time returns it, so an app that locates one frame several times (OpenComposite does)
+renders and tags the frame with one sample.
 The swapchain API deliberately rejects `arraySize=2` texture arrays because the native handoff
 currently consumes one IOSurface per eye; Unity-style engines can then take their multipass
 `arraySize=1` fallback rather than receiving a falsely supported multiview path. Khronos' real
@@ -258,16 +271,25 @@ roughly 14 seconds of rendering, and clean `STOPPING→IDLE→EXITING` teardown.
 the live Quest gate now verifies fused, level/world-fixed visuals, 6DoF controller response, analog
 squeeze, and squeeze-triggered haptics at 72 fps. M4 is complete.
 
+Later additions: the streamer removes the ALVR client's SteamVR-only grip offset so the runtime
+exposes Meta's Touch grip pose, haptic values from OpenVR translation layers are normalized
+instead of rejected, and control protocol v11 forwards Quest optical hand tracking as
+`XR_EXT_hand_tracking` plus a gesture-emulated Touch controller. See
+[HAND-TRACKING.md](HAND-TRACKING.md).
+
 ### M5 — Wine bottle tooling ✅
 The `basaltctl` Swift CLI creates and lists managed bottles, discovers pinned Wine,
 WhiskyWine, and GPTK providers, and stores direct/Steam/BSManager/itch launch profiles. The VR
 path APFS-clones the pinned Wine 11.10 engine per bottle before installing the Basalt DXMT fork;
 shared Whisky/GPTK engines may back managed prefixes but are never patched. It stages the runtime
 DLL and manifest at `C:\basalt\runtime`, registers `ActiveRuntime` under the Khronos HKLM key, and
-verifies the exact bottle through the official loader. OpenComposite remains user-supplied:
-installation is constrained to an `openvr_api.dll` inside the managed prefix, preserves the first
-game DLL backup, and writes the D3D11 configuration beside it. A disposable end-to-end bottle and
-all four launch-source profiles pass on Apple Silicon. See [BOTTLES.md](BOTTLES.md).
+verifies the exact bottle through the official loader. OpenComposite is built locally from
+pinned source (`runtime/scripts/build-opencomposite.zsh`) or supplied by the user, never
+redistributed: installation is constrained to an `openvr_api.dll` inside the managed prefix,
+preserves the first game DLL backup, optionally installs Basalt's `openvr_api.dll` proxy, and
+writes a validated `opencomposite.ini` beside it (see [OPENCOMPOSITE.md](OPENCOMPOSITE.md)).
+A disposable end-to-end bottle and all four launch-source profiles pass on Apple Silicon. See
+[BOTTLES.md](BOTTLES.md).
 
 ### M6 — Audio + USB ✅
 USB streaming uses ALVR's native wired design: ADB forwards the Mac's localhost 9943/9944 to the
@@ -344,4 +366,6 @@ account, and a managed Beat Saber launch completes the live Quest acceptance pat
 - **Quest thermal state**: repeated high-resolution prototype sessions triggered Horizon OS thermal
   governance and MediaCodec buffer discards during testing. Performance comparisons must start from
   a cool headset; fixed user-selected settings and bounded queues do not replace foveated encoding.
-- **Licensing**: keep GPLv3 OpenComposite an external artifact; everything first-party MIT.
+- **Licensing**: keep GPLv3 OpenComposite an external, locally built artifact; everything
+  first-party MIT. The OpenComposite patch files are GPL-derived and carry OpenComposite's license
+  (see [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)).

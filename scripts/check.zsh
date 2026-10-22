@@ -19,7 +19,8 @@ run_step "Environment" "$script_dir/doctor.zsh" --core
 print
 print "==> Repository hygiene"
 zsh -n packaging/*.zsh runtime/scripts/*.zsh scripts/*.zsh
-plutil -lint packaging/Info.plist
+"$script_dir/test-quest-adb.zsh"
+plutil -lint packaging/Info.plist packaging/BasaltVR.entitlements
 swift package --package-path streamer dump-package >/dev/null
 (
     ruby -e '
@@ -51,6 +52,10 @@ print "PASS: scripts, metadata, package manifest, native test tools, and tracked
 run_step "Swift tests" swift test --package-path streamer
 run_step "Apple Silicon release build" \
     swift build -c release --arch arm64 --package-path streamer
+# The app bundle: signature, hardened runtime, audio-input entitlement (no install).
+app_out=$(mktemp -d)
+run_step "App bundle" packaging/build-app.zsh --no-install --output "$app_out"
+rm -rf "$app_out"
 
 print
 print "PASS: contributor checks completed"

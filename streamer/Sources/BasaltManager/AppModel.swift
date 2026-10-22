@@ -5,8 +5,9 @@ import BasaltBottleKit
 import BasaltCore
 import BasaltManagerKit
 
-/// Sidebar order; also the ⌘1…⌘5 order in the View menu.
+/// Sidebar order; also the ⌘1…⌘6 order in the View menu.
 enum ManagerSection: String, CaseIterable, Identifiable {
+    case play = "Play"
     case library = "Library"
     case stream = "Stream"
     case bottles = "Bottles"
@@ -17,6 +18,7 @@ enum ManagerSection: String, CaseIterable, Identifiable {
 
     var symbol: String {
         switch self {
+        case .play: return "play.circle"
         case .library: return "gamecontroller"
         case .stream: return "dot.radiowaves.left.and.right"
         case .bottles: return "shippingbox"
@@ -66,10 +68,12 @@ enum SessionState: Equatable {
 
 @MainActor
 final class BasaltAppModel: ObservableObject {
-    @Published var selection = ManagerSection.library
+    @Published var selection = ManagerSection.play
     @Published private(set) var setupChecks = [SetupCheck]()
     @Published private(set) var bottles = [ManagedBottle]()
     @Published private(set) var profiles = [LaunchProfile]()
+    /// VR file checks per profile, recomputed on every refresh.
+    @Published private(set) var vrStatuses = [String: VRSetupStatus]()
     @Published private(set) var games = [DetectedGame]()
     @Published private(set) var discoveredBottles = [DiscoveredBottle]()
     @Published private(set) var steamGames = [SteamGame]()
@@ -105,6 +109,13 @@ final class BasaltAppModel: ObservableObject {
 
     let repoRoot: URL
     private(set) var manager: BottleManager
+    /// The Play screen's session (scripts/play.zsh); separate from the Stream page's.
+    let play: PlayController
+
+    /// Tiles for the Play screen.
+    var playGames: [PlayGame] {
+        PlayLibrary.games(profiles: profiles, steamGames: steamGames)
+    }
 
     private var streamerProcess: Process?
     private var gameProcess: Process?
@@ -117,6 +128,17 @@ final class BasaltAppModel: ObservableObject {
     private var activeLaunchID: UUID?
     /// The session `launch` started; `finishSession` records it to history.
     private var openSession: SessionRecord?
+    /// Follows a game's other programs after the launched executable exits.
+    private var followTask: Task<Void, Never>?
+    /// Steam, Wine, and the bottle's services closing after Stop (this can
+    /// take half a minute). The next launch waits for it, so two cleanups
+    /// never run in one prefix at the same time.
+    private var wineShutdown: Task<Void, Never>?
+    private var wineShutdownID: UUID?
+    /// The launched program is the Steam client; Stop closes it gracefully.
+    private var gameIsSteamClient = false
+    /// The session console, also saved to ~/Library/Logs/BasaltVR.
+    private var sessionLog: FileHandle?
     private var hasChosenInitialSection = false
     private static let streamSettingsKey = "BasaltVR.streamSettings.v1"
     private static let preferredProfileKey = "BasaltVR.preferredProfile"
@@ -168,7 +190,13 @@ final class BasaltAppModel: ObservableObject {
             .map { URL(fileURLWithPath: $0, isDirectory: true) }
         preferredProfileName = defaults.string(forKey: Self.preferredProfileKey)
         manager = BottleManager(root: selectedRoot, repoRoot: discovered)
+        play = PlayController(
+            tools: PlayTools.locate(
+                repoRoot: discovered,
+                appExecutableDirectory: Bundle.main.executableURL?.deletingLastPathComponent()),
+            dataRoot: selectedRoot)
         sessionHistory = SessionHistoryStore(dataRoot: selectedRoot).load()
+        play.onHistoryChanged = { [weak self] in self?.sessionHistory = $0 }
         alertMessage = startupError
         Task { await refresh() }
     }
@@ -181,7 +209,7 @@ final class BasaltAppModel: ObservableObject {
             [ManagedBottle], [LaunchProfile], [DetectedGame],
             [BottleEngine], [SetupCheck], [GameAudioDevice],
             [DiscoveredBottle], [SteamGame], [BSManagerInstance],
-            [BSManagerInstallation]
+            [BSManagerInstallation], [String: VRSetupStatus]
         ), Error>
         let bsManagerLocation = bsManagerLocation
         let result: RefreshResult = await Task.detached {
@@ -199,9 +227,12 @@ final class BasaltAppModel: ObservableObject {
                     bottles: bottles)
                 let bsManagerApps = BSManagerInstallationDiscovery().discover(
                     in: bottles)
+                let vr = Dictionary(uniqueKeysWithValues: profiles.map {
+                    ($0.name, manager.vrSetupStatus(profileName: $0.name))
+                })
                 return RefreshResult.success(
                     (bottles, profiles, games, manager.engines(), checks, audio,
-                     discovered, steam, bsManager, bsManagerApps))
+                     discovered, steam, bsManager, bsManagerApps, vr))
             } catch {
                 return RefreshResult.failure(error)
             }
@@ -210,7 +241,7 @@ final class BasaltAppModel: ObservableObject {
         case .success(let values):
             (bottles, profiles, games, engines, setupChecks, audioDevices,
              discoveredBottles, steamGames, bsManagerInstances,
-             bsManagerInstallations) = values
+             bsManagerInstallations, vrStatuses) = values
             print("BasaltVR library: \(discoveredBottles.count) bottle(s), "
                   + "\(steamGames.filter { !$0.isTool }.count) Steam game(s), "
                   + "\(bsManagerInstances.count) BSManager instance(s), "
@@ -226,7 +257,8 @@ final class BasaltAppModel: ObservableObject {
             // land on the checks they still need to finish.
             if !hasChosenInitialSection {
                 hasChosenInitialSection = true
-                if selection == .library, missingRequiredSetupCount > 0 {
+                // Players with games stay on Play; its own checks cover their setup.
+                if selection == .play, missingRequiredSetupCount > 0, profiles.isEmpty {
                     selection = .setup
                 }
             }
@@ -346,6 +378,93 @@ final class BasaltAppModel: ObservableObject {
         }
     }
 
+    /// A launch profile for a Windows game chosen by hand (GOG, itch.io, or
+    /// any installer). Its folder is the game root, so the session follows
+    /// launchers that start the real game and exit.
+    /// Returns the new profile's name, or nil after showing why it failed.
+    @discardableResult
+    func createGameProfile(
+        named title: String, executable: URL, source: LaunchSource,
+        arguments: [String], in bottle: ManagedBottle
+    ) async -> String? {
+        let prefix = URL(fileURLWithPath: bottle.prefixPath, isDirectory: true)
+        let folder = executable.deletingLastPathComponent()
+        guard ManualGame.isInstalled(executable, inPrefix: prefix),
+              let windowsExecutable = ManualGame.windowsPath(for: executable, prefix: prefix),
+              let windowsFolder = ManualGame.windowsPath(for: folder, prefix: prefix) else {
+            alertMessage = "Install \(executable.lastPathComponent) in the \(bottle.name) bottle first."
+            return nil
+        }
+        let name = uniqueProfileName(for: title)
+        do {
+            try manager.saveProfile(LaunchProfile(
+                name: name, bottleName: bottle.name, source: source,
+                executable: windowsExecutable,
+                arguments: arguments,
+                workingDirectory: folder.path,
+                gameRoot: windowsFolder))
+            await refresh()
+            return name
+        } catch {
+            alertMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    // MARK: VR setup
+
+    var vrArtifacts: VRArtifacts { VRArtifacts.local(repoRoot: repoRoot) }
+
+    /// The game folder of `profile`; a `steam.exe -applaunch` profile uses the Steam
+    /// game's install folder from the library.
+    func vrLocation(for profile: LaunchProfile) throws -> VRGameLocation {
+        var appID = profile.environment["SteamAppId"]
+        if let index = profile.arguments.firstIndex(of: "-applaunch"),
+           profile.arguments.indices.contains(index + 1) {
+            appID = profile.arguments[index + 1]
+        }
+        let install = appID.flatMap { id in
+            steamGames.first {
+                $0.appID == id && $0.bottleOrigin == .managed && $0.bottleName == profile.bottleName
+            }?.installDirectory
+        }
+        return try manager.vrGameLocation(for: profile, steamInstallDirectory: install)
+    }
+
+    func inspectVR(_ location: VRGameLocation, bottleName: String) async
+        -> Result<VRGameDetection, Error> {
+        let manager = manager
+        return await Task.detached {
+            Result { try manager.inspectVRGame(location, bottleName: bottleName) }
+        }.value
+    }
+
+    func prepareVR(profileName: String, location: VRGameLocation, mode: VRMode,
+                   replaceCustomFiles: Bool = false) async -> Result<VRPrepareResult, Error> {
+        let manager = manager
+        let artifacts = vrArtifacts
+        isBusy = true
+        let result = await Task.detached {
+            Result {
+                try manager.prepareVR(
+                    profileName: profileName, location: location, mode: mode,
+                    artifacts: artifacts, replaceCustomFiles: replaceCustomFiles)
+            }
+        }.value
+        await refresh()
+        return result
+    }
+
+    func restoreVR(profileName: String) async -> Result<VRRestoreReport, Error> {
+        let manager = manager
+        isBusy = true
+        let result = await Task.detached {
+            Result { try manager.restoreVR(profileName: profileName) }
+        }.value
+        await refresh()
+        return result
+    }
+
     func profile(for instance: BSManagerInstance) -> LaunchProfile? {
         profiles.first { profile in
             guard profile.source == .bsmanager,
@@ -426,7 +545,7 @@ final class BasaltAppModel: ObservableObject {
     }
 
     func changeDataRoot(to root: URL) async {
-        guard !sessionState.isActive else {
+        guard !sessionState.isActive, !play.isActive else {
             alertMessage = "Stop the current session before changing the data location."
             return
         }
@@ -434,6 +553,7 @@ final class BasaltAppModel: ObservableObject {
         dataRoot = standardized
         UserDefaults.standard.set(standardized.path, forKey: Self.dataRootKey)
         manager = BottleManager(root: standardized, repoRoot: repoRoot)
+        play.update(tools: play.tools, dataRoot: standardized)
         sessionHistory = SessionHistoryStore(dataRoot: standardized).load()
         await refresh()
     }
@@ -443,21 +563,12 @@ final class BasaltAppModel: ObservableObject {
             alertMessage = "External bottles are shown read-only. Open this bottle in \(bottle.origin.label), or copy it into Basalt first."
             return
         }
-        let candidates = [
-            bottle.prefix.appendingPathComponent("drive_c/Program Files (x86)/Steam/steam.exe"),
-            bottle.prefix.appendingPathComponent("drive_c/Program Files/Steam/steam.exe"),
-        ]
-        guard let steam = candidates.first(where: {
-            FileManager.default.fileExists(atPath: $0.path)
-        }) else {
-            alertMessage = "Steam is not installed in '\(bottle.name)'."
-            return
-        }
         do {
-            let command = try manager.applicationLaunchCommand(
-                bottleName: managed.name,
-                executable: BottleManager.winePath(for: steam, prefix: bottle.prefix),
-                currentDirectory: steam.deletingLastPathComponent())
+            // Plain steam.exe verifies its files and restores Valve's web
+            // helper, which renders a black window through DXMT. Use the
+            // profile path: install the shim, then launch with Basalt's flags.
+            let command = try manager.steamBootstrapCommand(bottleName: managed.name)
+            try manager.installSteamWebHelperCompatibility(bottleName: managed.name)
             try launchUtility(command, label: "Steam • \(bottle.name)")
         } catch {
             alertMessage = error.localizedDescription
@@ -526,16 +637,18 @@ final class BasaltAppModel: ObservableObject {
         case "screen":
             _ = CGRequestScreenCaptureAccess()
             await refresh()
-        case "adb", "audio":
+        case "audio":
+            // The BlackHole cask needs the Mac password, so it runs in Terminal.
+            await play.perform(.installBlackHole)
+            if let message = play.fixMessage { alertMessage = message }
+        case "adb":
             guard let brew = SetupInspector.findExecutable(named: "brew") else {
                 alertMessage = "Homebrew is not installed. Install it from brew.sh, then try again."
                 NSWorkspace.shared.open(URL(string: "https://brew.sh")!)
                 return
             }
             isBusy = true
-            let arguments = check.id == "adb"
-                ? ["install", "android-platform-tools"]
-                : ["install", "--cask", "blackhole-2ch"]
+            let arguments = ["install", "android-platform-tools"]
             let result = await Self.runUtility(brew, arguments: arguments)
             isBusy = false
             if result.status != 0 { alertMessage = result.output }
@@ -549,6 +662,10 @@ final class BasaltAppModel: ObservableObject {
 
     func launch(profileName: String) async {
         guard !sessionState.isActive else { return }
+        guard !play.isActive else {
+            alertMessage = "A game is running from the Play page. Stop it there first."
+            return
+        }
         let launchID = UUID()
         activeLaunchID = launchID
         // Stop can run at any await below; never resume a stopped launch.
@@ -560,16 +677,28 @@ final class BasaltAppModel: ObservableObject {
             preferredProfileName = profileName
             sessionState = .starting(profile: profileName)
             selection = .stream
-            console.restart(with: "Preparing \(profileName)…\n")
+            if let wineShutdown {
+                appendLog("Waiting for the last session's Steam and Wine to close…\n")
+                await wineShutdown.value
+                try ensureCurrent()
+            }
+            console.restart(with: "")
+            openSessionLog(named: profileName)
+            appendLog("Preparing \(profileName)…\n")
             openSession = SessionRecord(profileName: profileName, settings: launchSettings)
+            let profile = try manager.loadProfile(profileName)
 
+            // As play.zsh does: close a Steam that already runs in the bottle
+            // (a game started from it would inherit its old environment), and
+            // end Wine processes left over from an earlier session.
             appendLog("Stopping stale Wine processes in this bottle…\n")
             let manager = manager
             // A failure thrown after Stop is swallowed by the catch below.
-            try await Task.detached {
-                _ = try manager.terminateBottleProcesses(forProfile: profileName)
+            let staleReport = try await Task.detached {
+                try manager.shutDownBottle(forProfile: profileName)
             }.value
             try ensureCurrent()
+            logShutdown(staleReport)
             appendLog("Bottle process state is clean\n")
 
             // Keep the bottle-side DLL in lockstep with the streamer build.
@@ -588,7 +717,10 @@ final class BasaltAppModel: ObservableObject {
 
             _ = try manager.installSteamWebHelperCompatibility(
                 forProfile: profileName)
-            if let steamCommand = try manager.steamBootstrapCommand(
+            // A profile whose executable is steam.exe is the session's Steam:
+            // a prerequisite Steam would make it hand over and exit at once.
+            if SteamSessionPlan.startsSteamFirst(profile),
+               let steamCommand = try manager.steamBootstrapCommand(
                 forProfile: profileName) {
                 let connectionLog = try manager.steamConnectionLogURL(
                     forProfile: profileName)
@@ -687,17 +819,21 @@ final class BasaltAppModel: ObservableObject {
             command.environment.forEach { environment[$0.key] = $0.value }
             game.environment = environment
             attachOutput(of: game, prefix: "game: ")
+            let matcher = command.arguments.first.flatMap {
+                GameProcessMatcher(profile: profile, launchedExecutable: $0)
+            }
             game.terminationHandler = { [weak self] game in
                 Task { @MainActor in
                     guard let self, self.gameProcess === game else { return }
                     self.appendLog("Game exited with status \(game.terminationStatus)\n")
                     self.gameProcess = nil
-                    self.finishSession(.ended)
-                    self.stop()
+                    self.followGame(matcher, launchedWith: command)
                 }
             }
-            try game.run()
+            // Replaces attachOutput's /dev/null stdin: hello_xr quits at its EOF.
+            try HeldOpenStandardInput.run(game)
             gameProcess = game
+            gameIsSteamClient = SteamSessionPlan.launchesSteamClient(profile)
             activeWineCommand = command
             activeLaunchID = nil
             openSession?.streamingStartedAt = Date()
@@ -717,30 +853,130 @@ final class BasaltAppModel: ObservableObject {
 
     func stop() {
         activeLaunchID = nil
+        followTask?.cancel()
+        followTask = nil
         finishSession(.stopped)
         let game = gameProcess
         let steam = steamProcess
         let streamer = streamerProcess
         let wineCommand = activeWineCommand
+        let gameIsSteam = gameIsSteamClient
         gameProcess = nil
         steamProcess = nil
         streamerProcess = nil
         activeWineCommand = nil
+        gameIsSteamClient = false
 
-        if let game, game.isRunning { game.terminate() }
-        if let steam, steam.isRunning { steam.terminate() }
-        if let wineCommand {
-            do {
-                try manager.terminateBottleProcesses(launchedWith: wineCommand)
-                appendLog("Stopped Wine processes for this session\n")
-            } catch {
-                appendLog("Wine cleanup failed: \(error.localizedDescription)\n")
-            }
-        }
+        // Steam is not killed: shutDownBottle asks it to close (steam.exe
+        // -shutdown) first. A killed Steam logs "didn't shutdown cleanly" at
+        // its next start.
+        if let game, game.isRunning, !gameIsSteam || wineCommand == nil { game.terminate() }
         if let streamer, streamer.isRunning { streamer.terminate() }
         if let controlFile { try? FileManager.default.removeItem(at: controlFile) }
         controlFile = nil
         if sessionState.isActive { sessionState = .stopped }
+        guard let wineCommand else {
+            if let steam, steam.isRunning { steam.terminate() }
+            closeSessionLog()
+            return
+        }
+
+        appendLog("Closing Steam and Wine in this bottle…\n")
+        let manager = manager
+        let previous = wineShutdown
+        let shutdownID = UUID()
+        wineShutdownID = shutdownID
+        wineShutdown = Task { [weak self] in
+            await previous?.value
+            let result = await Task.detached {
+                Result { try manager.shutDownBottle(launchedWith: wineCommand) }
+            }.value
+            // Normally gone with the bottle; never leave them behind.
+            for process in [game, steam].compactMap({ $0 }) where process.isRunning {
+                process.terminate()
+            }
+            guard let self else { return }
+            switch result {
+            case .success(let report):
+                self.logShutdown(report)
+                self.appendLog("Stopped Wine processes for this session\n")
+            case .failure(let error):
+                self.appendLog("Wine cleanup failed: \(error.localizedDescription)\n")
+            }
+            guard self.wineShutdownID == shutdownID else { return }
+            self.wineShutdown = nil
+            self.wineShutdownID = nil
+            self.closeSessionLog()
+        }
+    }
+
+    /// True while a session runs or its Steam and Wine are still closing.
+    var hasWineWork: Bool { sessionState.isActive || wineShutdown != nil }
+
+    /// Stops the session and calls `completion` once Steam and Wine are closed.
+    func stopForTermination(completion: @escaping @MainActor () -> Void) {
+        stop()
+        guard let wineShutdown else { return completion() }
+        Task {
+            await wineShutdown.value
+            completion()
+        }
+    }
+
+    private func logShutdown(_ report: BottleShutdownReport) {
+        if report.steamClosedGracefully { appendLog("Steam closed\n") }
+        if !report.leftoverProcessIDs.isEmpty {
+            appendLog("Ended \(report.leftoverProcessIDs.count) Wine processes that outlived their wineserver\n")
+        }
+    }
+
+    /// The launched executable exited. Like play.zsh, keep the session while
+    /// another program of the game runs (The Lab starts Robot Repair and
+    /// exits; Steam can hand over to another steam.exe), then end it.
+    private func followGame(_ matcher: GameProcessMatcher?, launchedWith command: BottleLaunchCommand) {
+        guard let matcher else {
+            finishSession(.ended)
+            stop()
+            return
+        }
+        let manager = manager
+        followTask = Task { [weak self] in
+            var follower = GameProcessFollower()
+            while !Task.isCancelled {
+                let found = await Task.detached {
+                    manager.bottleProcessCommands(launchedWith: command) {
+                        matcher.match($0) != nil
+                    }.compactMap(matcher.match)
+                }.value
+                guard let self, !Task.isCancelled else { return }
+                switch follower.observe(found) {
+                case .waiting, .running:
+                    break
+                case .started(let program):
+                    if matcher.kind == .steamClient {
+                        self.appendLog("Steam is still running. Press Stop to end the session.\n")
+                    } else {
+                        self.appendLog("\(matcher.name) started \(program); still running.\n")
+                    }
+                case .ended:
+                    self.followTask = nil
+                    self.finishSession(.ended)
+                    self.stop()
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    private func openSessionLog(named name: String) {
+        closeSessionLog()
+        sessionLog = AppSessionLog.open(profileName: name)
+    }
+
+    private func closeSessionLog() {
+        try? sessionLog?.close()
+        sessionLog = nil
     }
 
     private func waitForSteam(
@@ -783,26 +1019,11 @@ final class BasaltAppModel: ObservableObject {
     }
 
     private func sanitizedProfileName(_ value: String) -> String {
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
-        let mapped = value.lowercased().unicodeScalars.map {
-            allowed.contains($0) ? Character(String($0)) : "-"
-        }
-        let collapsed = String(mapped).replacingOccurrences(
-            of: "-+", with: "-", options: .regularExpression)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-._"))
-        return String((collapsed.isEmpty ? "game" : collapsed).prefix(56))
+        ProfileNaming.slug(value)
     }
 
     private func uniqueProfileName(for value: String) -> String {
-        let existingNames = Set(profiles.map { $0.name.lowercased() })
-        let base = sanitizedProfileName(value)
-        var name = base
-        var suffix = 2
-        while existingNames.contains(name.lowercased()) {
-            name = "\(base)-\(suffix)"
-            suffix += 1
-        }
-        return name
+        ProfileNaming.unique(value, existing: profiles.map(\.name))
     }
 
     private func persistSettings() {
@@ -849,22 +1070,33 @@ final class BasaltAppModel: ObservableObject {
         process.standardOutput = outputPipe
         process.standardError = errorPipe
 
+        // Wine writes a line in small pieces and the two pipes interleave, so
+        // each pipe buffers its own bytes and logs only whole prefixed lines.
         for pipe in [outputPipe, errorPipe] {
+            let lines = OutputLineBuffer(prefix: prefix)
             pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
-                guard !data.isEmpty else {
+                let completed: [String]
+                if data.isEmpty {
                     handle.readabilityHandler = nil
-                    return
+                    completed = lines.flush().map { [$0] } ?? []
+                } else {
+                    completed = lines.append(data)
                 }
-                let value = String(decoding: data, as: UTF8.self)
-                Task { @MainActor in self?.appendLog(prefix + value) }
+                guard !completed.isEmpty else { return }
+                let value = completed.joined(separator: "\n") + "\n"
+                Task { @MainActor in self?.appendLog(value) }
             }
         }
     }
 
     private func launchUtility(_ command: BottleLaunchCommand, label: String) throws {
-        guard !sessionState.isActive else {
+        guard !sessionState.isActive, !play.isActive else {
             throw BottleToolError("Stop the current Wine or VR session first")
+        }
+        guard wineShutdown == nil else {
+            throw BottleToolError(
+                "Steam and Wine are still closing after the last session. Try again in a few seconds.")
         }
         let process = Process()
         process.executableURL = command.executable
@@ -891,8 +1123,11 @@ final class BasaltAppModel: ObservableObject {
         try process.run()
         gameProcess = process
         activeWineCommand = command
+        gameIsSteamClient = command.arguments.first.map(WineProcessOwnership.isSteamClient) ?? false
         sessionState = .utility(label)
-        console.restart(with: "Launching \(label)…\n", clearingSamples: false)
+        console.restart(with: "", clearingSamples: false)
+        openSessionLog(named: label)
+        appendLog("Launching \(label)…\n")
         selection = .stream
     }
 
@@ -956,6 +1191,7 @@ final class BasaltAppModel: ObservableObject {
     }
 
     private func appendLog(_ value: String) {
+        if let sessionLog { try? sessionLog.write(contentsOf: Data(value.utf8)) }
         for line in console.append(value) {
             if let metric = StreamLogMetricsParser.parse(line: line) {
                 console.record(metric)

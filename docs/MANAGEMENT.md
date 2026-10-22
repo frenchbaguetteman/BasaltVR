@@ -6,11 +6,41 @@ stream settings, and safety validation have one implementation shared with the c
 
 ## Build and run
 
-From the repository root:
+From the main checkout (not a worktree):
 
 ```sh
-swift build -c release --package-path streamer
-swift run -c release --arch arm64 --package-path streamer BasaltVR
+make app        # build/BasaltVR.app, installed to ~/Applications/BasaltVR.app
+```
+
+Then open BasaltVR from Finder, Launchpad, or Spotlight, pick a game, and press Play.
+
+`make app` (`packaging/build-app.zsh`) builds the release tools and a small bundle that holds
+only the app's own binary. Its Info.plist key `BasaltRepoRoot` links it to the checkout it was
+built from: the app runs that checkout's `scripts/play.zsh` with
+`streamer/.build/release/basalt-streamer` and `basaltctl`, and the bottle gets that checkout's
+OpenXR runtime and Steam web helper shim. Terminal and the app therefore use the same copies,
+and two shims can never replace each other. Rebuilding the checkout (`make build`) updates what
+the app runs. `packaging/build-app.zsh --no-install` skips the copy to `~/Applications`, and a
+linked worktree is never installed there.
+
+The bundle is ad-hoc signed with the hardened runtime and
+`com.apple.security.device.audio-input` (`packaging/BasaltVR.entitlements`), and Info.plist has
+`NSMicrophoneUsageDescription`. macOS treats BlackHole as a microphone, and a command-line tool
+uses the Microphone permission of the app that started it. The streamer runs as a child of
+BasaltVR, so the prompt names BasaltVR and the permission belongs to it. Check the signature:
+
+```sh
+codesign -d --entitlements - ~/Applications/BasaltVR.app   # shows com.apple.security.device.audio-input
+codesign -dv ~/Applications/BasaltVR.app 2>&1 | grep flags  # flags=0x10002(adhoc,runtime)
+```
+
+An ad-hoc signature changes with every build, so macOS can ask for Microphone access again after
+`make app`. No Gatekeeper or SIP change is needed: the app is built on this Mac.
+
+Run the app from source without a bundle (Microphone permission then belongs to the terminal):
+
+```sh
+make run-app    # swift run -c release --arch arm64 --package-path streamer BasaltVR
 ```
 
 The release configuration keeps the SwiftUI manager responsive and optimizes the streaming hot
@@ -20,11 +50,56 @@ is connecting. Set
 `BASALT_REPO_ROOT` if the app is launched with neither the repository nor one of its descendants as
 the working directory.
 
-## Current workflow
+## Play (the start page)
 
-The window opens on the **Library** once the required setup checks pass and on **Setup** until then.
-Sections are also on ⌘1–⌘5, ⌘R rescans, ⌘. stops the active session, and the sidebar footer always
-shows the session state with a Stop button.
+The window opens on **Play** (on **Setup** only when required checks fail and no game profile
+exists yet). Sections are also on ⌘1–⌘6, ⌘R rescans, ⌘. stops the active session, and the
+sidebar footer always shows the session state with a Stop button.
+
+- **Games**: one tile per launch profile (the plain `steam` sign-in profile is hidden), named and
+  drawn from the Steam library cache of its bottle (`appcache/librarycache/<appid>`). The Lab and
+  Beat Saber carry a VERIFIED badge and come first; The Lab is chosen by default. Click to
+  choose, double-click to play.
+- **Play** runs `scripts/play.zsh` for the chosen profile as a child of the app, so the app and
+  Terminal share one launch flow: pick the Quest (USB wins; else Wi-Fi, after `adb connect` to the
+  saved Quest IP), restart ALVR, start the streamer with BlackHole audio routed, start Steam with
+  the web helper shim, run the game, follow its child programs (The Lab → Robot Repair), and save
+  the Quest log (capped at 200 MB).
+- **Connection**: Automatic (default; USB when the cable is in), USB cable, or Wi-Fi.
+  **Quality**: High (default: `--quality high --codec hevc`; USB 1344×1408 at 60 Mbps, Wi-Fi
+  1344×1408 at 50 Mbps, both verified with The Lab) or Normal (`--quality normal`; USB 30 Mbps
+  HEVC, Wi-Fi 20 Mbps H.264 for slower Wi-Fi). Shell variables such as `BASALT_WIFI_MBPS` cannot
+  override the app's choice.
+- **Status** is one plain sentence from play.zsh's `@@basalt` events and the streamer log:
+  "Looking for your Quest…", "Getting ALVR ready on your Quest…", "Put on your headset",
+  "Starting The Lab…", "Playing The Lab", "Quest disconnected — reconnecting…", "Stopping…",
+  "The game ended", or the reason it failed ("I cannot see your Quest on the USB cable. Plug it
+  in, or choose Wi-Fi."). Live FPS on the Quest, delay (input to display), and Mbps come from the
+  streamer's report lines.
+- **Stop** sends SIGTERM to play.zsh, which runs the same cleanup as Ctrl-C: game, Steam and the
+  bottle's Wine, streamer (Mac sound output restored), adb logcat. After 120 s the app kills
+  play.zsh's process group. Quitting the app during a game first waits for this cleanup. If the
+  app crashes, play.zsh notices (`BASALT_PLAY_PARENT_PID`) and cleans up by itself.
+- **Before you play** checks, every 5 s while the page is open and no session runs
+  (`scripts/quest-check.zsh`: one read-only look at adb; only the chosen Quest is asked for its
+  ALVR version):
+  - Quest found, waiting for "Allow USB debugging", or missing (Install Android Tools with
+    Homebrew). With a USB Quest: **Use Without Cable** (`scripts/quest-wireless.zsh`: adb over
+    Wi-Fi, IP saved). Without one but with a saved IP: **Reconnect over Wi-Fi**.
+  - ALVR 20.14.1 on the Quest: **Install ALVR** (`install-quest-client.zsh --download`: downloads
+    the release APK if needed and installs it only if its SHA-256 matches), or **Replace ALVR…**
+    after a confirmation when another version is installed.
+  - BlackHole 2ch: **Install BlackHole…** opens Terminal with `brew install --cask
+    blackhole-2ch`, because the cask needs the Mac password; **Copy Command** copies it. A rate
+    other than 48 kHz offers Audio MIDI Setup.
+  - Microphone permission: **Allow Microphone…** shows the macOS prompt; if it was denied, the
+    button opens Privacy & Security › Microphone.
+- **Details** shows the last 400 lines of play.zsh output, Copy, Open Logs Folder
+  (`~/Library/Logs/BasaltVR`), and the Quest log switch.
+
+The Play session and the Stream page's session exclude each other.
+
+## Library, Stream, and the rest
 
 1. **Setup** checks Apple Silicon and macOS 14, adb, the pinned Wine/DXMT engine, the built OpenXR
    runtime, optional Screen Recording permission, and optional BlackHole audio. The adb and
@@ -48,16 +123,72 @@ shows the session state with a Stop button.
    with the Steam identity and BSIPA `winhttp` override already set. Toolbar search plus VR-only and tool
    filters are included; playable games sort first in each section. Existing profiles and direct Beat Saber detections appear alongside Steam
    and BSManager games. Steam games in a managed bottle can become `-applaunch APP_ID` profiles
-   without re-entering paths.
-4. **Profiles** can edit their source, Windows executable, working directory, arguments, and
-   environment, or be deleted without removing the game. OpenComposite installation is available
-   from the profile editor while keeping the separately supplied DLL inside the managed prefix.
-5. **Play** (from a game tile, or the Stream page's game picker) starts wired or Wi-Fi ALVR with the selected FPS, bitrate, resolution, latency preset,
+   without re-entering paths. **Add Game…** (toolbar, `plus`) adds any other Windows game, such as
+   one from GOG or itch.io: pick a Basalt bottle and the game's `.exe` inside its `drive_c` (install
+   it first with Bottles → ⋯ → Run Windows Installer…). The name comes from the game folder and
+   the source (Direct or itch.io) from the path; optional arguments are split on spaces, without
+   quotes. The game folder becomes the working directory and `gameRoot`, so a session follows a
+   launcher that starts the real game and exits. Once the `.exe` is chosen, the sheet looks for
+   the game's VR files (see **Prepare VR** below) and offers **Add & Prepare VR**; **Add Only**
+   adds the profile without changing any game file. It is the same profile as
+   `basaltctl profile add`.
+4. **Prepare VR…** (a game tile's ⋯ menu, or the profile editor's VR Setup section) sets a game
+   up for Basalt's OpenXR runtime with the same steps Add & Prepare VR uses:
+   - *Detection* is conservative. Half-Life: Alyx is known by `hlvr.exe` or Steam app 546560. A
+     game counts as OpenVR or native OpenXR only when its executable imports `openvr_api.dll` or
+     `openxr_loader.dll` (read from the PE import table), or the DLL is in that Unity player's
+     own `<Game>_Data/Plugins` folder. A DLL that only sits somewhere in the game folder, both
+     kinds at once, or nothing at all makes the result uncertain; then **VR mode** (Auto /
+     Native OpenXR / OpenVR (OpenComposite) / Half-Life: Alyx) must be chosen. The search does
+     not follow symbolic links and stops after 40,000 entries.
+   - *Native OpenXR* changes no game file.
+   - *OpenVR* installs `runtime/build/opencomposite/out/openvr_api.dll` over each `openvr_api.dll`
+     the executable loads (or, when OpenVR was chosen by hand, every `openvr_api.dll` in the game
+     folder) and writes the `default` `opencomposite.ini`.
+   - *Half-Life: Alyx* installs `runtime/build/openvr-proxy/bin/openvr_api.dll` as
+     `game/bin/win64/openvr_api.dll` with OpenComposite beside it as
+     `openvr_api_opencomposite.dll`, writes the `alyx` preset (`initUsingVulkan=false`,
+     `invertUsingShaders=true`), adds `-vr -dx11` to the profile's arguments, and removes
+     `-vulkan` and `hello_xr` test flags (`-g D3D11`, `-ff Hmd`, `-vc Stereo`, `-bm Opaque`,
+     `--space Local`).
+   - Basalt uses only these local builds and never downloads OpenComposite. When one is missing,
+     the sheet names the command that builds it (`runtime/scripts/build-opencomposite.zsh`, or
+     `runtime/scripts/test-openvr-proxy.zsh` for the proxy) and Prepare stays disabled. Both must
+     be 64-bit PE DLLs, and a 32-bit game DLL is refused.
+   - The game's first `openvr_api.dll` is kept as `openvr_api.dll.basalt-original` and never
+     replaced by a later setup. Files Basalt did not write (including the game's first
+     `openvr_api.dll`, a custom `openvr_api_opencomposite.dll`, or an edited
+     `opencomposite.ini`) stop the setup with nothing changed. **Replace and Keep Copies** then
+     saves each as `<name>.basalt-replaced-<UTC time>` before replacing it, with a numeric suffix
+     when needed so earlier copies are never overwritten. Add Game asks in the same sheet;
+     retrying uses the profile already added.
+   - Every target must be inside the bottle's `drive_c` after resolving links, and Basalt does not
+     replace a file that is itself a symbolic link. Folder links that stay inside `drive_c`
+     are allowed. A failure part-way puts every touched file and the profile
+     back. Repeating Prepare VR is safe; changing the mode or the target folders needs Restore
+     first.
+   - What was installed, with SHA-256 hashes, is recorded in `VRSetup/<profile>.json` in the data
+     folder. The status ("Setup ready … files checked", or "Files changed since setup") is
+     recomputed from the files on every Library refresh, so a Steam update or "Verify integrity
+     of game files" that puts Valve's DLL back shows a **VR FILES CHANGED** chip and a Prepare
+     VR… button beside Play. "Setup ready" means the files are in place, not that the game works;
+     that needs a headset test.
+   - **Restore Game Files…** puts the original DLL back, removes the files Basalt installed and
+     its argument changes, and deletes the record. Files that changed after setup are left alone
+     and listed, and the `.basalt-replaced-…` copies are kept. If the original DLL backup is
+     missing, Restore keeps that folder's complete setup and record for a later retry and
+     reports that restoration is incomplete. Unedited arguments return to their exact original order.
+5. **Profiles** can edit their source, Windows executable, working directory, arguments, and
+   environment, or be deleted without removing the game (or Basalt's VR files; restore first).
+   The profile editor keeps the advanced **Install a DLL by Hand…** installer, which writes a
+   chosen DLL inside the managed prefix and refuses to replace an `opencomposite.ini` Basalt did
+   not write.
+6. **Play** (from a game tile, or the Stream page's game picker) starts wired or Wi-Fi ALVR with the selected FPS, bitrate, resolution, latency preset,
    and optional audio input. When audio is enabled, the streamer temporarily routes default
    application output to that loopback and restores the prior output on shutdown. Once the
    authenticated runtime control file exists, the app asks `BasaltBottleKit` for a fully validated
    Wine launch command and owns that child process too.
-6. **Stream** shows the session state, the effective stream settings for the selected game, the
+7. **Stream** shows the session state, the effective stream settings for the selected game, the
    latest Quest FPS, actual wire Mbps, and input-to-display latency with bounded sparkline history
    and average/min/max, and the raw session log (copyable, and clearable between sessions). Stopping the session terminates both children;
    an unexpected streamer exit also terminates the game. While streaming, a health banner explains
@@ -65,13 +196,13 @@ shows the session state with a Stop button.
    above the latency preset's budget, thermal pressure, or Low Power Mode, with a settings
    suggestion for the next session. **Save** writes the log, or every metric sample of the session
    as CSV for comparing runs.
-7. **Recent Sessions** (on the Stream page) records each session's game, settings, streamed
+8. **Recent Sessions** (on the Stream page) records each session's game, settings, streamed
    duration, outcome (ended, stopped, or the failure reason), and whole-session FPS, latency, and
    wire-rate averages, including how often the headset ran below its target. The last 50 sessions
    are kept in `SessionHistory.json` in the data folder; a finished game can be replayed from its row.
-8. **Settings** persists global stream defaults and per-profile overrides, selects audio and
+9. **Settings** persists global stream defaults and per-profile overrides, selects audio and
    USB/Wi-Fi transport, and allows the managed Basalt data directory to be changed from the UI.
-9. **Diagnostic Report** (Settings, or **Help › Diagnostic Report…**) previews a bug-report
+10. **Diagnostic Report** (Settings, or **Help › Diagnostic Report…**) previews a bug-report
    snapshot: app version, commit, and control protocol; Mac model, macOS, and power state; setup
    checks; engines, bottles, and profiles; stream settings; the current and recent sessions; and,
    optionally, the end of the session log. It can be copied as Markdown for a GitHub issue or saved
@@ -101,10 +232,24 @@ and records exactly what was included in the archive.
 swift test --package-path streamer
 ```
 
-`BasaltManagerKitTests` covers external-bottle metadata, Steam VDF/manifests, artwork, BSManager
+`BasaltManagerKitTests` covers the Play page: play.zsh arguments and environment for every
+connection × quality, `@@basalt` event parsing, the status state machine (disconnects, Stop,
+failures, crashes), live stats, game tiles and artwork matching, Quest status parsing, the
+first-run checks and their fixes, and the bundle environment. `PlaySessionRunnerTests` runs the
+real `scripts/play.zsh` with a fake adb, streamer, basaltctl, and steam.zsh: a full session, the
+streamer arguments for every connection × quality, a missing USB Quest, and Stop during a game
+(game, streamer, Steam, and logcat all end). `scripts/test-quest-adb.zsh` (part of `make check`)
+covers the same scripts from the shell side: the events, the saved-IP reconnect, the app-gone
+cleanup, `quest-check.zsh`, and the ALVR download SHA check.
+It also covers external-bottle metadata, Steam VDF/manifests, artwork, BSManager
 default/configured/explicit-location and managed-bottle launcher/instance discovery, Windows/host
 path mapping, Beat Saber scanning and source inference, duplicate resolution, stream argument
 generation, live-stat parsing, session history persistence and summaries, stream-health rules,
-metric CSV export, diagnostic redaction, and report rendering. `BasaltBottleKitTests` verifies repository/support-root
+metric CSV export, diagnostic redaction, and report rendering. `VRSetupTests` covers VR setup:
+PE import parsing, Alyx/OpenVR/OpenXR/uncertain detection (a nearby DLL alone is not enough,
+links are not followed), the Alyx proxy, preset, and arguments, native OpenXR changing nothing,
+missing builds, 32-bit DLLs, repeat setup keeping the first backup, the status after a Steam-style
+DLL restore, custom-file protection, replacement copies, restore, rollback after a failure
+part-way, and paths or links that leave the bottle. `BasaltBottleKitTests` also verifies repository/support-root
 discovery, maintenance and VR launch commands, the BSManager Steam prerequisite, profile deletion,
 and a real isolated import whose source remains unchanged.

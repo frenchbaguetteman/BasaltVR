@@ -72,6 +72,39 @@ public enum StreamReport {
                      maximumWriteMilliseconds, drops)
     }
 
+    /// Where frames were lost between tracking and the socket, with the time
+    /// since the streamer started so stalls can be lined up with other logs.
+    /// Printed on a timer, so it also appears while no frame flows at all.
+    /// It deliberately carries neither the Quest nor the video-send marker.
+    public static func pipelineLine(_ snapshot: PipelineStatistics.Snapshot) -> String {
+        func rate(_ count: Int) -> String {
+            snapshot.intervalSeconds > 0
+                ? String(format: "%.1f/s", Double(count) / snapshot.intervalSeconds)
+                : "\(count)"
+        }
+        func milliseconds(_ value: Double?) -> String {
+            value.map { String(format: "%.1f", $0) } ?? "-"
+        }
+        return String(format: "  pipeline t=%.1fs: ", snapshot.elapsedSeconds)
+            + "tracking \(rate(snapshot.trackingPackets)) "
+            + "(max gap \(milliseconds(snapshot.trackingMaximumGapMilliseconds)) ms, "
+            + "\(snapshot.trackingBackwardTimestamps) backward); "
+            + "runtime \(rate(snapshot.runtimeFrames)) "
+            + "(\(snapshot.runtimeUntrackedFrames) untracked, "
+            + "\(snapshot.runtimeRepeatedTimestamps) repeated pose); "
+            + "encoded \(rate(snapshot.encodedFrames)) "
+            + "(\(milliseconds(snapshot.encodeAverageMilliseconds)) ms avg, "
+            + "\(milliseconds(snapshot.encodeMaximumMilliseconds)) ms max); "
+            + "drops encoder-busy \(snapshot.encoderBusyDrops), "
+            + "compositor-busy \(snapshot.compositorBusyDrops), "
+            + "rate-control \(snapshot.encoderDroppedFrames), "
+            + "network-busy \(snapshot.networkBusyDrops), "
+            + "network \(snapshot.networkDrops), "
+            + "awaiting-IDR \(snapshot.awaitingIDRDrops); "
+            + "pose age at send \(milliseconds(snapshot.poseAgeAverageMilliseconds)) ms avg, "
+            + "\(milliseconds(snapshot.poseAgeMaximumMilliseconds)) ms max"
+    }
+
     /// The dashboard values in a Quest or video-send line; nil for any other
     /// output. Transport and encoder lines also mention fps, but only the
     /// Quest's own count is the headset frame rate.

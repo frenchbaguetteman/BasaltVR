@@ -12,7 +12,8 @@ import Security
 /// launcher hands the game bottle via BASALT_CONTROL, validates the Hello
 /// token, retains every registered swapchain IOSurface (IDs are untrusted:
 /// dimensions are re-checked after lookup), and surfaces fence-confirmed
-/// frames to `onFrame`. One runtime connection at a time.
+/// frames to `onFrame`. One live runtime connection at a time; a newer
+/// authenticated Hello replaces it (see `admitCandidate`).
 public final class RuntimeLink: @unchecked Sendable {
     /// Acknowledges one frame to the runtime, exactly once. Holders must keep
     /// it alive until their reads of the frame's surfaces finish: releasing
@@ -57,15 +58,27 @@ public final class RuntimeLink: @unchecked Sendable {
         case viewConfig = 15
         case controllerMask = 16
         case frameConsumed = 17
+        case handSkeleton = 18
     }
 
-    public static let protocolVersion: UInt16 = 9
+    public static let protocolVersion: UInt16 = 11
     static let tokenLength = 32
     static let maxMessageLength = 4096
+    /// HELLO_ACK display-period bounds (240 Hz to 30 Hz) and the runtime's
+    /// default (72 Hz), mirrored from basalt_control_protocol.h.
+    static let minimumDisplayPeriodNanoseconds: UInt64 = 4_166_666
+    static let maximumDisplayPeriodNanoseconds: UInt64 = 33_333_334
+    static let defaultDisplayPeriodNanoseconds: UInt64 = 13_888_889
     /// The runtime's largest per-eye view; it ignores a larger configured size.
     public static let maximumViewWidth = 1680
     public static let maximumViewHeight = 1760
     static let maximumRetainedButtonPaths = 64
+    /// BASALT_CONTROL_HAND_JOINT_COUNT / _HAND_SKELETON_PAYLOAD_LENGTH.
+    static let handJointCount = AlvrHandSkeleton.jointCount
+    static let handSkeletonPayloadLength = 16 + AlvrHandSkeleton.jointCount * 32
+    /// BASALT_CONTROL_FEATURE_HAND_TRACKING: the runtime advertises
+    /// XR_EXT_hand_tracking only when the control file lists it.
+    public static let handTrackingFeature = "hand_tracking"
 
     public struct FrameView {
         public let swapchainId: UInt64
@@ -115,14 +128,23 @@ public final class RuntimeLink: @unchecked Sendable {
     /// The streamer prefixes refusal reasons with this on stderr so the
     /// manager can surface them; the game itself only sees a headless session.
     public static let connectionRefusedLogPrefix = "OpenXR runtime connection refused: "
+    /// A newer authenticated runtime session replaced the live one. Called on
+    /// the link's queue just before the old connection is torn down.
+    public var onReplaced: (() -> Void)?
     private var hapticHandler: ((_ hand: AlvrHand, _ durationNanoseconds: UInt64,
                                  _ frequency: Float, _ amplitude: Float) -> Void)?
 
     private let controlFilePath: String
     private let recommendedViewSize: PerEyeResolution?
+    private let features: [String]
     private let queue = DispatchQueue(label: "basalt.runtime-link")
     private let listener: NWListener
     private var connection: NWConnection?
+    /// Connections that arrived while another one is live, waiting for their
+    /// first message. Only an authenticated Hello may replace the live one.
+    private var candidates: [ObjectIdentifier: (connection: NWConnection, buffer: Data)] = [:]
+    static let maximumCandidateConnections = 4
+    static let candidateHelloTimeout: DispatchTimeInterval = .seconds(5)
     private var receiveBuffer = Data()
     private var helloDone = false
     private var swapchains: [UInt64: Swapchain] = [:]
@@ -139,12 +161,47 @@ public final class RuntimeLink: @unchecked Sendable {
     private var latestViewConfigPayload: Data?
     private var latestControllerMask: UInt32?
     private var latestControllerMaskPayload: Data?
+    private var pendingHandSkeletons: [AlvrHand: Data] = [:]
+    private var handSkeletonSendInFlight = false
+    private var nextSkeletonHand = AlvrHand.left
     private var completedFrameNumbers = Set<UInt64>()
     private var lastAcknowledgedFrameNumber: UInt64 = 0
+    private var displayPeriodNanoseconds = defaultDisplayPeriodNanoseconds
 
+    /// Sets the headset refresh rate that the runtime's xrWaitFrame paces to.
+    /// It is sent in HELLO_ACK, so it applies to runtime sessions that
+    /// connect after this call. Returns false (and keeps the previous value)
+    /// for a rate outside 30–240 Hz.
+    @discardableResult
+    public func setDisplayRefreshRate(_ hertz: Float) -> Bool {
+        guard let period = Self.displayPeriodNanoseconds(refreshRate: hertz) else {
+            return false
+        }
+        queue.async { self.displayPeriodNanoseconds = period }
+        return true
+    }
+
+    static func displayPeriodNanoseconds(refreshRate hertz: Float) -> UInt64? {
+        guard hertz.isFinite, hertz > 0 else { return nil }
+        let period = (1_000_000_000 / Double(hertz)).rounded()
+        guard period >= Double(minimumDisplayPeriodNanoseconds),
+              period <= Double(maximumDisplayPeriodNanoseconds) else { return nil }
+        return UInt64(period)
+    }
+
+    static func helloAckPayload(displayPeriodNanoseconds: UInt64) -> Data {
+        var ack = Data()
+        ack.appendU16(protocolVersion)
+        ack.appendU64(displayPeriodNanoseconds)
+        return ack
+    }
+
+    /// `handTracking` lists the hand-tracking feature in the control file, so
+    /// the runtime advertises XR_EXT_hand_tracking to games.
     public init(
         controlFilePath: String,
-        recommendedViewSize: PerEyeResolution? = nil
+        recommendedViewSize: PerEyeResolution? = nil,
+        handTracking: Bool = false
     ) throws {
         if let size = recommendedViewSize,
            size.width > Self.maximumViewWidth || size.height > Self.maximumViewHeight {
@@ -156,6 +213,7 @@ public final class RuntimeLink: @unchecked Sendable {
         }
         self.controlFilePath = controlFilePath
         self.recommendedViewSize = recommendedViewSize
+        self.features = handTracking ? [Self.handTrackingFeature] : []
         // FrameConsumed gates the game's xrWaitFrame; never let Nagle hold
         // the tiny ack behind an unacknowledged pose write.
         let tcp = NWProtocolTCP.Options()
@@ -200,7 +258,8 @@ public final class RuntimeLink: @unchecked Sendable {
                                 atPath: self.controlFilePath)
                             let controlLine = Self.controlFileLine(
                                 port: port, token: self.token,
-                                recommendedViewSize: self.recommendedViewSize)
+                                recommendedViewSize: self.recommendedViewSize,
+                                features: self.features)
                             guard FileManager.default.createFile(
                                 atPath: self.controlFilePath,
                                 contents: Data(controlLine.utf8),
@@ -225,19 +284,28 @@ public final class RuntimeLink: @unchecked Sendable {
         }
     }
 
+    /// "<port> <token> [<width> <height>] [<feature>,...]" (see
+    /// basalt_control_protocol.h). Features start with a lowercase letter.
     static func controlFileLine(
         port: UInt16,
         token: String,
-        recommendedViewSize: PerEyeResolution?
+        recommendedViewSize: PerEyeResolution?,
+        features: [String] = []
     ) -> String {
-        guard let size = recommendedViewSize else {
-            return "\(port) \(token)\n"
+        var fields = ["\(port)", token]
+        if let size = recommendedViewSize {
+            fields += ["\(size.width)", "\(size.height)"]
         }
-        return "\(port) \(token) \(size.width) \(size.height)\n"
+        if !features.isEmpty {
+            fields.append(features.joined(separator: ","))
+        }
+        return fields.joined(separator: " ") + "\n"
     }
 
     public func stop() {
         queue.async {
+            for candidate in self.candidates.values { candidate.connection.cancel() }
+            self.candidates.removeAll()
             self.dropConnection()
             self.listener.cancel()
             try? FileManager.default.removeItem(atPath: self.controlFilePath)
@@ -267,6 +335,20 @@ public final class RuntimeLink: @unchecked Sendable {
         queue.async {
             self.pendingControllerMotions[hand] = payload
             self.pumpControllerMotion()
+        }
+    }
+
+    /// Publishes one hand's skeleton (joints in the Quest stage frame), or
+    /// nil when that hand is no longer hand-tracked. Latest sample wins per
+    /// hand, like controller motion.
+    public func publishHandSkeleton(timestampNanoseconds: UInt64, hand: AlvrHand,
+                                    skeleton: AlvrHandSkeleton?) {
+        guard let payload = Self.handSkeletonPayload(
+                timestampNanoseconds: timestampNanoseconds, hand: hand,
+                skeleton: skeleton) else { return }
+        queue.async {
+            self.pendingHandSkeletons[hand] = payload
+            self.pumpHandSkeleton()
         }
     }
 
@@ -339,6 +421,7 @@ public final class RuntimeLink: @unchecked Sendable {
             self.pendingHeadPose = nil
             self.pendingControllerMotions.removeAll()
             self.nextControllerHand = .left
+            self.pendingHandSkeletons.removeAll()
             self.latestButtonPayloads.removeAll()
             self.pendingButtonPayloads.removeAll()
             self.latestInteractionProfiles.removeAll()
@@ -425,6 +508,37 @@ public final class RuntimeLink: @unchecked Sendable {
         return payload
     }
 
+    /// HAND_SKELETON: u64 timestamp, u32 hand, u32 joint mask, then 26 x
+    /// (xyzw orientation, xyz position, radius). nil skeleton = not tracked.
+    static func handSkeletonPayload(
+        timestampNanoseconds: UInt64, hand: AlvrHand, skeleton: AlvrHandSkeleton?
+    ) -> Data? {
+        var payload = Data()
+        payload.appendU64(timestampNanoseconds)
+        payload.appendU32(hand.rawValue)
+        guard let skeleton else {
+            payload.appendU32(0)
+            payload.append(Data(count: handJointCount * 32))
+            return payload
+        }
+        guard skeleton.joints.count == handJointCount else { return nil }
+        payload.appendU32((1 << UInt32(handJointCount)) - 1)
+        for (index, joint) in skeleton.joints.enumerated() {
+            let values = [joint.orientationX, joint.orientationY, joint.orientationZ,
+                          joint.orientationW, joint.positionX, joint.positionY,
+                          joint.positionZ]
+            guard values.allSatisfy(\.isFinite) else { return nil }
+            let normSquared = values[0] * values[0] + values[1] * values[1]
+                + values[2] * values[2] + values[3] * values[3]
+            guard normSquared >= 0.25, normSquared <= 2.25 else { return nil }
+            let inverseNorm = 1 / sqrt(normSquared)
+            for value in values.prefix(4) { payload.appendF32(value * inverseNorm) }
+            for value in values.suffix(3) { payload.appendF32(value) }
+            payload.appendF32(AlvrHandSkeleton.jointRadiiMeters[index])
+        }
+        return payload
+    }
+
     static func controllerMaskPayload(
         timestampNanoseconds: UInt64, activeMask: UInt32
     ) -> Data? {
@@ -474,11 +588,18 @@ public final class RuntimeLink: @unchecked Sendable {
 
     private func accept(_ newConnection: NWConnection) {
         guard connection == nil else {
-            newConnection.cancel()
+            admitCandidate(newConnection)
             return
         }
+        newConnection.start(queue: queue)
+        activate(newConnection, buffered: Data())
+    }
+
+    /// Makes `newConnection` (already started) the live connection and
+    /// processes any bytes it has already sent.
+    private func activate(_ newConnection: NWConnection, buffered: Data) {
         connection = newConnection
-        receiveBuffer.removeAll()
+        receiveBuffer = buffered
         helloDone = false
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard case .failed = state, let self, let newConnection else { return }
@@ -486,8 +607,94 @@ public final class RuntimeLink: @unchecked Sendable {
             // successor (e.g. a quick OpenXR session restart).
             self.onQueue(ifCurrent: newConnection) { self.dropConnection() }
         }
-        newConnection.start(queue: queue)
+        if !receiveBuffer.isEmpty, !drainMessages() {
+            dropConnection()
+            return
+        }
         receiveMore()
+    }
+
+    /// A connection that arrives while another is live. The live one may be
+    /// stale: a game that launches its successor with inherited handles and
+    /// exits (The Lab -> Robot Repair) leaves the old socket open in the
+    /// child, so it never closes. The newcomer's first message decides: an
+    /// authenticated Hello replaces the live session (newest wins, as with
+    /// SteamVR scene apps); anything else is dropped and the live one stays.
+    private func admitCandidate(_ newConnection: NWConnection) {
+        if candidates.count >= Self.maximumCandidateConnections,
+           let oldest = candidates.keys.first {
+            candidates.removeValue(forKey: oldest)?.connection.cancel()
+        }
+        let key = ObjectIdentifier(newConnection)
+        candidates[key] = (newConnection, Data())
+        newConnection.stateUpdateHandler = { [weak self] state in
+            guard case .failed = state, let self else { return }
+            self.queue.async { self.discardCandidate(key) }
+        }
+        newConnection.start(queue: queue)
+        queue.asyncAfter(deadline: .now() + Self.candidateHelloTimeout) { [weak self] in
+            self?.discardCandidate(key)
+        }
+        receiveCandidate(key)
+    }
+
+    private func discardCandidate(_ key: ObjectIdentifier) {
+        candidates.removeValue(forKey: key)?.connection.cancel()
+    }
+
+    private func receiveCandidate(_ key: ObjectIdentifier) {
+        guard let candidate = candidates[key] else { return }
+        candidate.connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) {
+            [weak self] data, _, isComplete, error in
+            guard let self, self.candidates[key] != nil else { return }
+            if let data, !data.isEmpty {
+                self.candidates[key]?.buffer.append(data)
+            }
+            guard let buffer = self.candidates[key]?.buffer else { return }
+            switch Self.candidateFirstMessage(buffer, token: self.token) {
+            case .incomplete:
+                if isComplete || error != nil {
+                    self.discardCandidate(key)
+                } else {
+                    self.receiveCandidate(key)
+                }
+            case .reject(let reason):
+                if let reason { self.onProtocolError?(reason) }
+                self.discardCandidate(key)
+            case .accept:
+                guard let promoted = self.candidates.removeValue(forKey: key) else { return }
+                if self.connection != nil {
+                    self.onReplaced?()
+                    self.dropConnection()
+                }
+                self.activate(promoted.connection, buffered: promoted.buffer)
+            }
+        }
+    }
+
+    enum CandidateVerdict: Equatable {
+        case incomplete
+        /// Drop the candidate; a reason is reported only for an authenticated
+        /// runtime that cannot start (stale build, malformed Hello).
+        case reject(String?)
+        case accept
+    }
+
+    /// Classifies a candidate's buffered bytes by their first message.
+    static func candidateFirstMessage(_ buffer: Data, token: String) -> CandidateVerdict {
+        guard buffer.count >= 6 else { return .incomplete }
+        let length = buffer.readU32(at: 0)
+        guard length >= 2, length <= maxMessageLength,
+              buffer.readU16(at: 4) == MessageType.hello.rawValue else {
+            return .reject(nil)
+        }
+        guard buffer.count >= 4 + Int(length) else { return .incomplete }
+        let payload = buffer.subdata(in: (buffer.startIndex + 6)..<(buffer.startIndex + 4 + Int(length)))
+        switch helloVerdict(payload, token: token) {
+        case .accept: return .accept
+        case .ignore: return .reject(nil)
+        case .refuse(let reason): return .reject(reason)
+        }
     }
 
     /// Runs `body` on `queue` only while `expected` is still the live
@@ -511,6 +718,9 @@ public final class RuntimeLink: @unchecked Sendable {
         pendingControllerMotions.removeAll()
         controllerMotionSendInFlight = false
         nextControllerHand = .left
+        pendingHandSkeletons.removeAll()
+        handSkeletonSendInFlight = false
+        nextSkeletonHand = .left
         pendingButtonPayloads.removeAll()
         buttonSendInFlight = false
         completedFrameNumbers.removeAll()
@@ -610,6 +820,30 @@ public final class RuntimeLink: @unchecked Sendable {
         })
     }
 
+    private func pumpHandSkeleton() {
+        guard helloDone, !handSkeletonSendInFlight, let connection,
+              let selection = Self.controllerSendSelection(
+                  pending: Set(pendingHandSkeletons.keys),
+                  preferred: nextSkeletonHand),
+              let payload = pendingHandSkeletons.removeValue(forKey: selection.hand) else {
+            return
+        }
+        nextSkeletonHand = selection.next
+        handSkeletonSendInFlight = true
+        var message = Data()
+        message.appendU32(UInt32(2 + payload.count))
+        message.appendU16(MessageType.handSkeleton.rawValue)
+        message.append(payload)
+        connection.send(content: message, completion: .contentProcessed {
+            [weak self, weak connection] error in
+            guard let self, let connection else { return }
+            self.onQueue(ifCurrent: connection) {
+                self.handSkeletonSendInFlight = false
+                if error != nil { self.dropConnection() } else { self.pumpHandSkeleton() }
+            }
+        })
+    }
+
     private func pumpButtonState() {
         guard helloDone, !buttonSendInFlight, let connection,
               let (pathID, payload) = pendingButtonPayloads.first else { return }
@@ -655,12 +889,12 @@ public final class RuntimeLink: @unchecked Sendable {
             return false
         }
         helloDone = true
-        var ack = Data()
-        ack.appendU16(Self.protocolVersion)
-        send(type: .helloAck, payload: ack)
+        send(type: .helloAck, payload: Self.helloAckPayload(
+            displayPeriodNanoseconds: displayPeriodNanoseconds))
         onHello?(sessionId, renderer)
         pumpHeadPose()
         pumpControllerMotion()
+        pumpHandSkeleton()
         pendingButtonPayloads = latestButtonPayloads
         pumpButtonState()
         for (hand, profileID) in latestInteractionProfiles {

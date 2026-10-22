@@ -80,6 +80,36 @@ final class AlvrSessionTests: XCTestCase {
         XCTAssertEqual(json["wired"] as? Bool, false)
     }
 
+    func testControllerPredictionSettingIsPartialSessionJSON() throws {
+        func sessionSettings(_ prediction: ControllerPrediction) throws -> [String: Any] {
+            let settings = try AlvrNegotiatedSettings.beatSaberDefaults(for: quest)
+            let payload = try AlvrStreamConfigEncoder.payload(
+                settings: settings, controllerPrediction: prediction)
+            let length = payload.prefix(8).enumerated().reduce(UInt64(0)) {
+                $0 | (UInt64($1.element) << UInt64($1.offset * 8))
+            }
+            let session = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: payload[8..<(8 + Int(length))]) as? [String: Any])
+            return try XCTUnwrap(session["session_settings"] as? [String: Any])
+        }
+
+        // Full: only the one field, no "enabled", so the client's Switch
+        // default (enabled) and every other controller default survive.
+        let full = try sessionSettings(.full)
+        let headset = try XCTUnwrap(full["headset"] as? [String: Any])
+        XCTAssertEqual(headset.count, 1)
+        let controllers = try XCTUnwrap(headset["controllers"] as? [String: Any])
+        XCTAssertEqual(Array(controllers.keys), ["content"])
+        let content = try XCTUnwrap(controllers["content"] as? [String: Any])
+        XCTAssertEqual(content.count, 1)
+        XCTAssertEqual((content["steamvr_pipeline_frames"] as? NSNumber)?.doubleValue, 0)
+        XCTAssertNotNil(full["video"])
+
+        let alvr = try sessionSettings(.alvr)
+        XCTAssertNil(alvr["headset"])
+        XCTAssertNotNil(alvr["video"])
+    }
+
     func testLowLatencyPresetUsesConservativeBufferReduction() throws {
         let settings = try AlvrNegotiatedSettings.desktopPreviewDefaults(
             for: quest, requestedWidth: 1_152, requestedHeight: 1_216,

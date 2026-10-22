@@ -1,0 +1,72 @@
+diff --git a/src/airconv/nt/dxbc_converter_base.cpp b/src/airconv/nt/dxbc_converter_base.cpp
+index 0a39a13..100000b 100644
+--- a/src/airconv/nt/dxbc_converter_base.cpp
++++ b/src/airconv/nt/dxbc_converter_base.cpp
+@@ -1432,6 +1432,18 @@ Converter::operator()(const InstLoad &load) {
+   if (!Offset->isNullValue())
+     Address = ir.CreateAdd(Address, Offset);
+ 
++  if (SampleIndex) {
++    // Basalt: an 8x MSAA texture is created with 4 samples on Apple GPUs
++    // (CreateMTLTextureDescriptorInternal). A shader built for 8 samples
++    // (Source 2's MSAA resolve: Texture2DMS<float4, 8>, Load(pos, 0..7))
++    // would read past the last sample. Wrap the index into the real count:
++    // every sample is then read equally often, so averages stay correct.
++    llvm::Value *NumSamples =
++        air.CreateTextureQuery(Tex->Texture, Tex->Handle, Texture::num_samples, ir.getInt32(0));
++    NumSamples = ir.CreateSelect(ir.CreateICmpEQ(NumSamples, ir.getInt32(0)), ir.getInt32(1), NumSamples);
++    SampleIndex = ir.CreateURem(SampleIndex, NumSamples);
++  }
++
+   llvm::Value *LOD = LoadOperand(load.src_address, kMaskComponentW);
+ 
+   auto [Value, Residency] =
+diff --git a/src/d3d11/d3d11_resource_helper.cpp b/src/d3d11/d3d11_resource_helper.cpp
+index 6624ed6..d8ddf14 100644
+--- a/src/d3d11/d3d11_resource_helper.cpp
++++ b/src/d3d11/d3d11_resource_helper.cpp
+@@ -433,9 +433,28 @@ CreateMTLTextureDescriptorInternal(
+     } else {
+       if (SampleCount > 1) {
+         if (!pDevice->GetMTLDevice().supportsTextureSampleCount(SampleCount)) {
+-          ERR("CreateMTLTextureDescriptorInternal: sample count ", SampleCount,
+-              " is not supported.");
+-          return E_INVALIDARG;
++          // Basalt: D3D11 feature level 11_0 guarantees 8x MSAA, but Apple
++          // GPUs stop at 4x. Games that ask for 8x without checking (Source 2
++          // Auto-Fidelity picks 8x) got E_INVALIDARG, then rendered into
++          // nothing. Use the largest supported count instead; the D3D11
++          // description keeps the requested count, and shaders read the real
++          // count from the texture.
++          UINT supported = SampleCount - 1;
++          while (supported > 1 &&
++                 !pDevice->GetMTLDevice().supportsTextureSampleCount(supported))
++            supported--;
++          if (supported <= 1) {
++            ERR("CreateMTLTextureDescriptorInternal: sample count ", SampleCount,
++                " is not supported.");
++            return E_INVALIDARG;
++          }
++          static bool warned = false;
++          if (!warned) {
++            warned = true;
++            WARN("CreateMTLTextureDescriptorInternal: sample count ", SampleCount,
++                 " is not supported; using ", supported, " samples.");
++          }
++          SampleCount = supported;
+         }
+         if (ArraySize > 1) {
+           pDescOut->type = WMTTextureType2DMultisampleArray;
+diff --git a/src/dxmt/dxmt_shader_cache.hpp b/src/dxmt/dxmt_shader_cache.hpp
+index d102112..cf1fc16 100644
+--- a/src/dxmt/dxmt_shader_cache.hpp
++++ b/src/dxmt/dxmt_shader_cache.hpp
+@@ -4,7 +4,7 @@
+ 
+ namespace dxmt {
+ 
+-constexpr int kDXMTShaderCacheVersion = 18;
++constexpr int kDXMTShaderCacheVersion = 19; // Basalt: 18 + MS load sample index wrap
+ 
+ class ShaderCache {
+ public:

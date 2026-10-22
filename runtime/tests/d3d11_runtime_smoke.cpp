@@ -1,3 +1,4 @@
+#include <winsock2.h>
 #include <windows.h>
 
 #include <d3d11_1.h>
@@ -9,9 +10,12 @@
 #include <cerrno>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
+#include <limits>
 #include <set>
 #include <vector>
 
@@ -40,6 +44,48 @@ bool expectBasaltIOSurface() {
 bool expectConnected() {
     const char* value = std::getenv("BASALT_CONTROL");
     return value != nullptr && value[0] != '\0';
+}
+
+// A connected session's control socket must not be inheritable: The Lab
+// launches Robot Repair with CreateProcess(bInheritHandles=TRUE) and exits,
+// and an inherited socket kept its connection open in the child, so the
+// streamer never saw the old session end and the new one ran headless.
+// Scans this process's handle table for sockets; at least one (the control
+// connection) must exist and none may carry HANDLE_FLAG_INHERIT.
+bool controlSocketIsNotInheritable() {
+    WSADATA wsaData{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::fputs("FAIL: WSAStartup for the socket inheritance check\n", stderr);
+        return false;
+    }
+    int sockets = 0;
+    int inheritable = 0;
+    for (uintptr_t value = 4; value < 0x10000; value += 4) {
+        const SOCKET candidate = static_cast<SOCKET>(value);
+        int type = 0;
+        int length = sizeof(type);
+        if (getsockopt(candidate, SOL_SOCKET, SO_TYPE,
+                       reinterpret_cast<char*>(&type), &length) != 0) {
+            continue;
+        }
+        DWORD flags = 0;
+        if (!GetHandleInformation(reinterpret_cast<HANDLE>(value), &flags)) {
+            continue;
+        }
+        ++sockets;
+        if ((flags & HANDLE_FLAG_INHERIT) != 0) {
+            ++inheritable;
+        }
+    }
+    WSACleanup();
+    if (sockets == 0 || inheritable != 0) {
+        std::fprintf(stderr,
+                     "FAIL: control socket inheritance: %d socket(s), %d inheritable "
+                     "(a child process would keep the session connection open)\n",
+                     sockets, inheritable);
+        return false;
+    }
+    return true;
 }
 
 bool expectInjectedHeadPose() {
@@ -415,6 +461,772 @@ bool expectInteractionProfileChanged(XrInstance instance, XrSession session) {
     return true;
 }
 
+// Consecutive locates may see a newer live sample on a real headset, so the
+// tolerance allows a few millimetres of motion between the two calls.
+bool posesNearlyEqual(const XrPosef& a, const XrPosef& b) {
+    constexpr float kTolerance = 0.01f;
+    return nearlyEqual(a.position.x, b.position.x, kTolerance) &&
+           nearlyEqual(a.position.y, b.position.y, kTolerance) &&
+           nearlyEqual(a.position.z, b.position.z, kTolerance) &&
+           nearlyEqual(a.orientation.x, b.orientation.x, kTolerance) &&
+           nearlyEqual(a.orientation.y, b.orientation.y, kTolerance) &&
+           nearlyEqual(a.orientation.z, b.orientation.z, kTolerance) &&
+           nearlyEqual(a.orientation.w, b.orientation.w, kTolerance);
+}
+
+// OpenComposite uses STAGE as its standing tracking universe. Basalt's LOCAL
+// origin already sits on the Quest floor, so STAGE shares that origin: every
+// STAGE location must equal the LOCAL one, with or without live tracking.
+bool checkStageSpace(
+    XrSession session,
+    XrSpace localSpace,
+    XrSpace handSpace,
+    XrTime locateTime) {
+    XrReferenceSpaceCreateInfo spaceInfo{};
+    spaceInfo.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
+    spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+    spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
+    XrSpace stageSpace = XR_NULL_HANDLE;
+    XrResult result = xrCreateReferenceSpace(session, &spaceInfo, &stageSpace);
+    spaceInfo.poseInReferenceSpace.position = {0.25f, 0.5f, -1.0f};
+    XrSpace offsetStageSpace = XR_NULL_HANDLE;
+    if (XR_SUCCEEDED(result)) {
+        result = xrCreateReferenceSpace(session, &spaceInfo, &offsetStageSpace);
+    }
+    spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+    spaceInfo.poseInReferenceSpace.position = {0.0f, 0.0f, 0.0f};
+    XrSpace viewSpace = XR_NULL_HANDLE;
+    if (XR_SUCCEEDED(result)) {
+        result = xrCreateReferenceSpace(session, &spaceInfo, &viewSpace);
+    }
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: xrCreateReferenceSpace(STAGE) returned %d\n", result);
+        return false;
+    }
+
+    // The STAGE↔LOCAL offset is static and known before any head sample.
+    constexpr XrSpaceLocationFlags kValidFlags =
+        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+    XrSpaceLocation location{};
+    location.type = XR_TYPE_SPACE_LOCATION;
+    result = xrLocateSpace(offsetStageSpace, localSpace, locateTime, &location);
+    if (XR_FAILED(result) || location.locationFlags != kValidFlags ||
+        !nearlyEqual(location.pose.position.x, 0.25f) ||
+        !nearlyEqual(location.pose.position.y, 0.5f) ||
+        !nearlyEqual(location.pose.position.z, -1.0f) ||
+        !nearlyEqual(location.pose.orientation.w, 1.0f)) {
+        std::fprintf(stderr, "FAIL: xrLocateSpace(STAGE offset in LOCAL) returned %d\n", result);
+        return false;
+    }
+    result = xrLocateSpace(localSpace, offsetStageSpace, locateTime, &location);
+    if (XR_FAILED(result) || location.locationFlags != kValidFlags ||
+        !nearlyEqual(location.pose.position.x, -0.25f) ||
+        !nearlyEqual(location.pose.position.y, -0.5f) ||
+        !nearlyEqual(location.pose.position.z, 1.0f)) {
+        std::fprintf(stderr, "FAIL: xrLocateSpace(LOCAL in STAGE offset) returned %d\n", result);
+        return false;
+    }
+
+    // VIEW and controller locations must be identical relative to STAGE and
+    // LOCAL (same flags, same pose), in both directions.
+    const XrSpace targets[] = {viewSpace, handSpace};
+    for (XrSpace target : targets) {
+        XrSpaceLocation inLocal{};
+        inLocal.type = XR_TYPE_SPACE_LOCATION;
+        XrSpaceLocation inStage{};
+        inStage.type = XR_TYPE_SPACE_LOCATION;
+        result = xrLocateSpace(target, localSpace, locateTime, &inLocal);
+        if (XR_SUCCEEDED(result)) {
+            result = xrLocateSpace(target, stageSpace, locateTime, &inStage);
+        }
+        if (XR_FAILED(result) || inLocal.locationFlags != inStage.locationFlags ||
+            !posesNearlyEqual(inLocal.pose, inStage.pose)) {
+            std::fprintf(stderr, "FAIL: STAGE and LOCAL locations differ (%d)\n", result);
+            return false;
+        }
+        result = xrLocateSpace(stageSpace, target, locateTime, &inStage);
+        if (XR_SUCCEEDED(result)) {
+            result = xrLocateSpace(localSpace, target, locateTime, &inLocal);
+        }
+        if (XR_FAILED(result) || inLocal.locationFlags != inStage.locationFlags ||
+            !posesNearlyEqual(inLocal.pose, inStage.pose)) {
+            std::fprintf(stderr, "FAIL: STAGE and LOCAL inverse locations differ (%d)\n", result);
+            return false;
+        }
+    }
+
+    XrViewLocateInfo viewLocateInfo{};
+    viewLocateInfo.type = XR_TYPE_VIEW_LOCATE_INFO;
+    viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    viewLocateInfo.displayTime = locateTime;
+    XrViewState localState{};
+    localState.type = XR_TYPE_VIEW_STATE;
+    XrViewState stageState{};
+    stageState.type = XR_TYPE_VIEW_STATE;
+    XrView localViews[2]{};
+    XrView stageViews[2]{};
+    for (uint32_t index = 0; index < 2; ++index) {
+        localViews[index].type = XR_TYPE_VIEW;
+        stageViews[index].type = XR_TYPE_VIEW;
+    }
+    uint32_t viewCount = 0;
+    viewLocateInfo.space = localSpace;
+    result = xrLocateViews(session, &viewLocateInfo, &localState, 2, &viewCount, localViews);
+    viewLocateInfo.space = stageSpace;
+    if (XR_SUCCEEDED(result)) {
+        result = xrLocateViews(session, &viewLocateInfo, &stageState, 2, &viewCount, stageViews);
+    }
+    if (XR_FAILED(result) || viewCount != 2 ||
+        localState.viewStateFlags != stageState.viewStateFlags ||
+        !posesNearlyEqual(localViews[0].pose, stageViews[0].pose) ||
+        !posesNearlyEqual(localViews[1].pose, stageViews[1].pose)) {
+        std::fprintf(stderr, "FAIL: xrLocateViews(STAGE) differs from LOCAL (%d)\n", result);
+        return false;
+    }
+    // The connected smoke reaches this point right after deliberately letting
+    // the injected head pose go stale; the height only applies when tracked.
+    if (expectInjectedHeadPose() &&
+        (stageState.viewStateFlags & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0 &&
+        !nearlyEqual(stageViews[0].pose.position.y, 1.5f)) {
+        std::fprintf(stderr, "FAIL: STAGE eye height %.3f is not floor-relative\n",
+                     stageViews[0].pose.position.y);
+        return false;
+    }
+
+    XrExtent2Df bounds{1.0f, 1.0f};
+    result = xrGetReferenceSpaceBoundsRect(session, XR_REFERENCE_SPACE_TYPE_STAGE, &bounds);
+    if (result != XR_SPACE_BOUNDS_UNAVAILABLE || bounds.width != 0.0f ||
+        bounds.height != 0.0f) {
+        std::fprintf(stderr, "FAIL: xrGetReferenceSpaceBoundsRect(STAGE) returned %d\n", result);
+        return false;
+    }
+    bounds = {1.0f, 1.0f};
+    result = xrGetReferenceSpaceBoundsRect(session, XR_REFERENCE_SPACE_TYPE_VIEW, &bounds);
+    if (result != XR_SPACE_BOUNDS_UNAVAILABLE || bounds.width != 0.0f ||
+        bounds.height != 0.0f) {
+        std::fprintf(stderr, "FAIL: xrGetReferenceSpaceBoundsRect(VIEW) returned %d\n", result);
+        return false;
+    }
+    result = xrGetReferenceSpaceBoundsRect(
+        session, XR_REFERENCE_SPACE_TYPE_UNBOUNDED_MSFT, &bounds);
+    if (result != XR_ERROR_REFERENCE_SPACE_UNSUPPORTED) {
+        std::fprintf(stderr, "FAIL: xrGetReferenceSpaceBoundsRect(unsupported) returned %d\n",
+                     result);
+        return false;
+    }
+
+    result = xrDestroySpace(offsetStageSpace);
+    if (XR_SUCCEEDED(result)) {
+        result = xrDestroySpace(stageSpace);
+    }
+    if (XR_SUCCEEDED(result)) {
+        result = xrDestroySpace(viewSpace);
+    }
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: xrDestroySpace(STAGE) returned %d\n", result);
+        return false;
+    }
+    return true;
+}
+
+// XR_KHR_visibility_mask reports "no mask available" (zero counts) for every
+// mask type, which the spec requires when no mask is known.
+bool checkVisibilityMask(XrInstance instance, XrSession session) {
+    PFN_xrVoidFunction function = nullptr;
+    XrResult result = xrGetInstanceProcAddr(instance, "xrGetVisibilityMaskKHR", &function);
+    if (XR_FAILED(result) || function == nullptr) {
+        std::fprintf(stderr, "FAIL: xrGetInstanceProcAddr(xrGetVisibilityMaskKHR) returned %d\n",
+                     result);
+        return false;
+    }
+    const auto getVisibilityMask = reinterpret_cast<PFN_xrGetVisibilityMaskKHR>(function);
+    const XrVisibilityMaskTypeKHR maskTypes[] = {
+        XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR,
+        XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR,
+        XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR,
+    };
+    for (XrVisibilityMaskTypeKHR maskType : maskTypes) {
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            XrVisibilityMaskKHR mask{};
+            mask.type = XR_TYPE_VISIBILITY_MASK_KHR;
+            mask.vertexCountOutput = UINT32_MAX;
+            mask.indexCountOutput = UINT32_MAX;
+            result = getVisibilityMask(
+                session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye, maskType, &mask);
+            if (XR_FAILED(result) || mask.vertexCountOutput != 0 ||
+                mask.indexCountOutput != 0) {
+                std::fprintf(stderr, "FAIL: xrGetVisibilityMaskKHR(count) returned %d\n", result);
+                return false;
+            }
+            XrVector2f vertices[4]{};
+            uint32_t indices[6]{};
+            mask.vertexCapacityInput = 4;
+            mask.indexCapacityInput = 6;
+            mask.vertices = vertices;
+            mask.indices = indices;
+            result = getVisibilityMask(
+                session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye, maskType, &mask);
+            if (XR_FAILED(result) || mask.vertexCountOutput != 0 ||
+                mask.indexCountOutput != 0) {
+                std::fprintf(stderr, "FAIL: xrGetVisibilityMaskKHR(values) returned %d\n", result);
+                return false;
+            }
+        }
+    }
+    XrVisibilityMaskKHR mask{};
+    mask.type = XR_TYPE_VISIBILITY_MASK_KHR;
+    result = getVisibilityMask(
+        session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2,
+        XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &mask);
+    if (result != XR_ERROR_VALIDATION_FAILURE) {
+        std::fprintf(stderr, "FAIL: xrGetVisibilityMaskKHR(eye 2) returned %d\n", result);
+        return false;
+    }
+    result = getVisibilityMask(
+        session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO, 0,
+        XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &mask);
+    if (result != XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED) {
+        std::fprintf(stderr, "FAIL: xrGetVisibilityMaskKHR(mono) returned %d\n", result);
+        return false;
+    }
+    return true;
+}
+
+// OpenComposite restarts its session (temporary device, then the game's
+// device) without destroying spaces or action spaces first, and attaches the
+// same action sets to every new session. Both must succeed.
+bool checkOpenCompositeSessionRestart(
+    XrInstance instance,
+    const XrSessionCreateInfo& sessionInfo,
+    const XrActionSet* attachedActionSets,
+    uint32_t attachedActionSetCount,
+    XrAction poseAction,
+    XrPath leftHandPath) {
+    XrSession session = XR_NULL_HANDLE;
+    XrResult result = xrCreateSession(instance, &sessionInfo, &session);
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: restarted xrCreateSession returned %d\n", result);
+        return false;
+    }
+
+    XrReferenceSpaceCreateInfo spaceInfo{};
+    spaceInfo.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
+    spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
+    const XrReferenceSpaceType spaceTypes[] = {
+        XR_REFERENCE_SPACE_TYPE_STAGE,
+        XR_REFERENCE_SPACE_TYPE_LOCAL,
+        XR_REFERENCE_SPACE_TYPE_VIEW,
+    };
+    std::vector<XrSpace> liveSpaces;
+    for (XrReferenceSpaceType spaceType : spaceTypes) {
+        spaceInfo.referenceSpaceType = spaceType;
+        XrSpace space = XR_NULL_HANDLE;
+        if (XR_SUCCEEDED(result)) {
+            result = xrCreateReferenceSpace(session, &spaceInfo, &space);
+            liveSpaces.push_back(space);
+        }
+    }
+    XrActionSpaceCreateInfo actionSpaceInfo{};
+    actionSpaceInfo.type = XR_TYPE_ACTION_SPACE_CREATE_INFO;
+    actionSpaceInfo.action = poseAction;
+    actionSpaceInfo.subactionPath = leftHandPath;
+    actionSpaceInfo.poseInActionSpace.orientation.w = 1.0f;
+    XrSpace actionSpace = XR_NULL_HANDLE;
+    if (XR_SUCCEEDED(result)) {
+        result = xrCreateActionSpace(session, &actionSpaceInfo, &actionSpace);
+        liveSpaces.push_back(actionSpace);
+    }
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: restarted session spaces returned %d\n", result);
+        xrDestroySession(session);
+        return false;
+    }
+
+    XrSessionActionSetsAttachInfo attachInfo{};
+    attachInfo.type = XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO;
+    attachInfo.countActionSets = attachedActionSetCount;
+    attachInfo.actionSets = attachedActionSets;
+    result = xrAttachSessionActionSets(session, &attachInfo);
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: re-attach to restarted session returned %d\n", result);
+        xrDestroySession(session);
+        return false;
+    }
+    result = xrAttachSessionActionSets(session, &attachInfo);
+    if (result != XR_ERROR_ACTIONSETS_ALREADY_ATTACHED) {
+        std::fprintf(stderr, "FAIL: second attach to restarted session returned %d\n", result);
+        xrDestroySession(session);
+        return false;
+    }
+
+    // Destroy the session with every space still alive (never begun, as
+    // OpenComposite's temporary session may be).
+    result = xrDestroySession(session);
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: xrDestroySession with live spaces returned %d\n", result);
+        return false;
+    }
+    for (XrSpace space : liveSpaces) {
+        result = xrDestroySpace(space);
+        if (result != XR_ERROR_HANDLE_INVALID) {
+            std::fprintf(stderr, "FAIL: space outlived its session (%d)\n", result);
+            return false;
+        }
+    }
+    return true;
+}
+
+// BASALT_EXPECT_HAND_TRACKING=1: the control daemon lists hand_tracking, so
+// XR_EXT_hand_tracking must be offered, is enabled, and is exercised end to
+// end. Unset or 0: it must not be offered (headless runs and every other
+// gate). Against a live headset the real streamer may advertise it, so it is
+// then neither required nor enabled.
+enum class HandTrackingExpectation {
+    kAbsent,
+    kPresent,
+    kEither,
+};
+
+HandTrackingExpectation handTrackingExpectation() {
+    const char* value = std::getenv("BASALT_EXPECT_HAND_TRACKING");
+    if (value != nullptr && std::strcmp(value, "1") == 0) {
+        return HandTrackingExpectation::kPresent;
+    }
+    if (value != nullptr && std::strcmp(value, "0") == 0) {
+        return HandTrackingExpectation::kAbsent;
+    }
+    if (requireControllerInput() ||
+        (requireHeadPose() && !expectInjectedHeadPose())) {
+        return HandTrackingExpectation::kEither;
+    }
+    return HandTrackingExpectation::kAbsent;
+}
+
+struct HandTrackingApi {
+    PFN_xrCreateHandTrackerEXT create = nullptr;
+    PFN_xrDestroyHandTrackerEXT destroy = nullptr;
+    PFN_xrLocateHandJointsEXT locate = nullptr;
+};
+
+constexpr uint32_t kHandJoints = XR_HAND_JOINT_COUNT_EXT;
+constexpr XrSpaceLocationFlags kHandJointTrackedFlags =
+    XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+    XR_SPACE_LOCATION_POSITION_VALID_BIT |
+    XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT |
+    XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+
+// Locates every joint, pre-filling the outputs with garbage so the runtime
+// must write each one. jointCount and velocityJointCount override the
+// well-formed 26 for validation checks.
+XrResult locateHand(
+    const HandTrackingApi& api,
+    XrHandTrackerEXT tracker,
+    XrSpace baseSpace,
+    XrTime time,
+    XrHandJointLocationEXT* joints,
+    XrBool32* isActive,
+    XrHandJointVelocityEXT* velocities = nullptr,
+    uint32_t jointCount = kHandJoints,
+    uint32_t velocityJointCount = kHandJoints) {
+    for (uint32_t joint = 0; joint < kHandJoints; ++joint) {
+        joints[joint].locationFlags = ~XrSpaceLocationFlags{0};
+        joints[joint].pose = {{1.0f, 2.0f, 3.0f, 4.0f}, {5.0f, 6.0f, 7.0f}};
+        joints[joint].radius = -1.0f;
+        if (velocities != nullptr) {
+            velocities[joint].velocityFlags = ~XrSpaceVelocityFlags{0};
+            velocities[joint].linearVelocity = {9.0f, 9.0f, 9.0f};
+            velocities[joint].angularVelocity = {9.0f, 9.0f, 9.0f};
+        }
+    }
+    XrHandJointVelocitiesEXT velocityChain{};
+    velocityChain.type = XR_TYPE_HAND_JOINT_VELOCITIES_EXT;
+    velocityChain.jointCount = velocityJointCount;
+    velocityChain.jointVelocities = velocities;
+    XrHandJointLocationsEXT locations{};
+    locations.type = XR_TYPE_HAND_JOINT_LOCATIONS_EXT;
+    locations.next = velocities != nullptr ? &velocityChain : nullptr;
+    locations.isActive = 7;
+    locations.jointCount = jointCount;
+    locations.jointLocations = joints;
+    XrHandJointsLocateInfoEXT locateInfo{};
+    locateInfo.type = XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT;
+    locateInfo.baseSpace = baseSpace;
+    locateInfo.time = time;
+    const XrResult result = api.locate(tracker, &locateInfo, &locations);
+    if (isActive != nullptr) {
+        *isActive = locations.isActive;
+    }
+    return result;
+}
+
+bool handJointsInactive(const XrHandJointLocationEXT* joints) {
+    for (uint32_t joint = 0; joint < kHandJoints; ++joint) {
+        if (joints[joint].locationFlags != 0 || joints[joint].radius != 0.0f ||
+            joints[joint].pose.orientation.w != 1.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool handPosesEqual(const XrPosef& a, const XrPosef& b, float tolerance = 0.0002f) {
+    return nearlyEqual(a.position.x, b.position.x, tolerance) &&
+           nearlyEqual(a.position.y, b.position.y, tolerance) &&
+           nearlyEqual(a.position.z, b.position.z, tolerance) &&
+           nearlyEqual(a.orientation.x, b.orientation.x, tolerance) &&
+           nearlyEqual(a.orientation.y, b.orientation.y, tolerance) &&
+           nearlyEqual(a.orientation.z, b.orientation.z, tolerance) &&
+           nearlyEqual(a.orientation.w, b.orientation.w, tolerance);
+}
+
+// OpenComposite order: both trackers right after xrAttachSessionActionSets,
+// then per-frame locates that must succeed even with no hand data yet.
+bool checkHandTrackersAfterAttach(
+    const HandTrackingApi& api,
+    XrSession session,
+    XrSpace localSpace,
+    XrTime time,
+    XrHandTrackerEXT* leftTracker,
+    XrHandTrackerEXT* rightTracker) {
+    XrHandTrackerCreateInfoEXT createInfo{};
+    createInfo.type = XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT;
+    createInfo.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+    createInfo.hand = XR_HAND_LEFT_EXT;
+    XrResult result = api.create(session, &createInfo, leftTracker);
+    createInfo.hand = XR_HAND_RIGHT_EXT;
+    if (XR_SUCCEEDED(result)) {
+        result = api.create(session, &createInfo, rightTracker);
+    }
+    if (XR_FAILED(result) || *leftTracker == XR_NULL_HANDLE ||
+        *rightTracker == XR_NULL_HANDLE || *leftTracker == *rightTracker) {
+        std::fprintf(stderr, "FAIL: xrCreateHandTrackerEXT(left/right) returned %d\n", result);
+        return false;
+    }
+
+    XrHandTrackerEXT rejected = XR_NULL_HANDLE;
+    createInfo.hand = static_cast<XrHandEXT>(3);
+    const XrResult badHand = api.create(session, &createInfo, &rejected);
+    createInfo.hand = XR_HAND_LEFT_EXT;
+    createInfo.handJointSet = static_cast<XrHandJointSetEXT>(1);
+    const XrResult badJointSet = api.create(session, &createInfo, &rejected);
+    createInfo.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+    createInfo.type = XR_TYPE_SPACE_LOCATION;
+    const XrResult badType = api.create(session, &createInfo, &rejected);
+    createInfo.type = XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT;
+    const XrResult badSession = api.create(
+        reinterpret_cast<XrSession>(static_cast<uintptr_t>(0x12345)), &createInfo, &rejected);
+    if (badHand != XR_ERROR_VALIDATION_FAILURE ||
+        badJointSet != XR_ERROR_VALIDATION_FAILURE ||
+        badType != XR_ERROR_VALIDATION_FAILURE ||
+        badSession != XR_ERROR_HANDLE_INVALID || rejected != XR_NULL_HANDLE) {
+        std::fprintf(stderr,
+                     "FAIL: xrCreateHandTrackerEXT validation (hand %d, joint set %d, "
+                     "type %d, session %d)\n",
+                     badHand, badJointSet, badType, badSession);
+        return false;
+    }
+
+    XrHandJointLocationEXT joints[kHandJoints]{};
+    XrHandJointVelocityEXT velocities[kHandJoints]{};
+    for (XrHandTrackerEXT tracker : {*leftTracker, *rightTracker}) {
+        XrBool32 active = XR_TRUE;
+        result = locateHand(api, tracker, localSpace, time, joints, &active, velocities);
+        if (result != XR_SUCCESS || active != XR_FALSE || !handJointsInactive(joints) ||
+            velocities[0].velocityFlags != 0) {
+            std::fprintf(stderr,
+                         "FAIL: xrLocateHandJointsEXT before any skeleton returned %d "
+                         "(active %u)\n", result, active);
+            return false;
+        }
+    }
+
+    const XrResult shortJoints =
+        locateHand(api, *leftTracker, localSpace, time, joints, nullptr, nullptr, 25);
+    const XrResult zeroTime =
+        locateHand(api, *leftTracker, localSpace, 0, joints, nullptr);
+    const XrResult shortVelocities = locateHand(
+        api, *leftTracker, localSpace, time, joints, nullptr, velocities,
+        kHandJoints, 25);
+    const XrResult nullBase =
+        locateHand(api, *leftTracker, XR_NULL_HANDLE, time, joints, nullptr);
+    if (shortJoints != XR_ERROR_VALIDATION_FAILURE ||
+        zeroTime != XR_ERROR_TIME_INVALID ||
+        shortVelocities != XR_ERROR_VALIDATION_FAILURE ||
+        nullBase != XR_ERROR_HANDLE_INVALID) {
+        std::fprintf(stderr,
+                     "FAIL: xrLocateHandJointsEXT validation (jointCount 25 %d, time 0 %d, "
+                     "velocity jointCount 25 %d, null base %d)\n",
+                     shortJoints, zeroTime, shortVelocities, nullBase);
+        return false;
+    }
+
+    XrHandTrackerEXT extra = XR_NULL_HANDLE;
+    result = api.create(session, &createInfo, &extra);
+    const XrResult destroyed = XR_SUCCEEDED(result) ? api.destroy(extra) : result;
+    const XrResult destroyedAgain = api.destroy(extra);
+    const XrResult locateDestroyed =
+        locateHand(api, extra, localSpace, time, joints, nullptr);
+    if (XR_FAILED(result) || destroyed != XR_SUCCESS ||
+        destroyedAgain != XR_ERROR_HANDLE_INVALID ||
+        locateDestroyed != XR_ERROR_HANDLE_INVALID) {
+        std::fprintf(stderr,
+                     "FAIL: destroyed hand tracker (create %d, destroy %d, again %d, "
+                     "locate %d)\n",
+                     result, destroyed, destroyedAgain, locateDestroyed);
+        return false;
+    }
+    std::puts("PASS: XR_EXT_hand_tracking trackers created after attach; hands are "
+              "inactive (XR_SUCCESS) before skeletons; jointCount 25, time 0, bad hand/"
+              "joint set, and destroyed handles are rejected");
+    return true;
+}
+
+// The native daemon's 0.625 haptic marker publishes a left skeleton whose
+// palm equals the left controller pose and whose joint i sits at palm +
+// (0.001 i, 0.002 i, -0.003 i), radius 0.01 + 0.0001 i; 0.75 untracks the
+// left hand and then sends an older skeleton that must be ignored.
+bool checkInjectedHandSkeleton(
+    const HandTrackingApi& api,
+    XrSession session,
+    XrHandTrackerEXT leftTracker,
+    XrHandTrackerEXT rightTracker,
+    XrSpace localSpace,
+    XrSpace gripSpace,
+    XrTime time,
+    const XrHapticActionInfo& hapticInfo,
+    XrHapticVibration vibration) {
+    vibration.amplitude = 0.625f;
+    XrResult result = xrApplyHapticFeedback(
+        session, &hapticInfo, reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+    XrHandJointLocationEXT joints[kHandJoints]{};
+    XrBool32 active = XR_FALSE;
+    for (int attempt = 0; XR_SUCCEEDED(result) && attempt < 200; ++attempt) {
+        result = locateHand(api, leftTracker, localSpace, time, joints, &active);
+        if (XR_SUCCEEDED(result) && active == XR_TRUE) {
+            break;
+        }
+        Sleep(10);
+    }
+    XrSpaceLocation grip{};
+    grip.type = XR_TYPE_SPACE_LOCATION;
+    if (XR_SUCCEEDED(result)) {
+        result = xrLocateSpace(gripSpace, localSpace, time, &grip);
+    }
+    if (XR_FAILED(result) || active != XR_TRUE ||
+        grip.locationFlags != kHandJointTrackedFlags) {
+        std::fprintf(stderr,
+                     "FAIL: injected left hand skeleton never became active "
+                     "(result %d, active %u, grip flags 0x%llx)\n",
+                     result, active,
+                     static_cast<unsigned long long>(grip.locationFlags));
+        return false;
+    }
+    const XrPosef palm = joints[XR_HAND_JOINT_PALM_EXT].pose;
+    if (!handPosesEqual(palm, grip.pose)) {
+        std::fprintf(stderr,
+                     "FAIL: palm %.4f %.4f %.4f does not match the grip pose "
+                     "%.4f %.4f %.4f in LOCAL\n",
+                     palm.position.x, palm.position.y, palm.position.z,
+                     grip.pose.position.x, grip.pose.position.y, grip.pose.position.z);
+        return false;
+    }
+    for (uint32_t joint = 0; joint < kHandJoints; ++joint) {
+        const float i = static_cast<float>(joint);
+        const XrVector3f expectedOffset =
+            rotateVector(palm.orientation, {0.001f * i, 0.002f * i, -0.003f * i});
+        const XrPosef& pose = joints[joint].pose;
+        if (joints[joint].locationFlags != kHandJointTrackedFlags ||
+            !nearlyEqual(joints[joint].radius, 0.01f + 0.0001f * i) ||
+            !nearlyEqual(pose.position.x - palm.position.x, expectedOffset.x, 0.0002f) ||
+            !nearlyEqual(pose.position.y - palm.position.y, expectedOffset.y, 0.0002f) ||
+            !nearlyEqual(pose.position.z - palm.position.z, expectedOffset.z, 0.0002f) ||
+            !nearlyEqual(pose.orientation.x, palm.orientation.x, 0.0002f) ||
+            !nearlyEqual(pose.orientation.y, palm.orientation.y, 0.0002f) ||
+            !nearlyEqual(pose.orientation.z, palm.orientation.z, 0.0002f) ||
+            !nearlyEqual(pose.orientation.w, palm.orientation.w, 0.0002f)) {
+            std::fprintf(stderr, "FAIL: hand joint %u lost its offset, orientation, "
+                                 "radius, or flags in LOCAL\n", joint);
+            return false;
+        }
+    }
+
+    // OpenComposite's floor space is STAGE, which shares LOCAL's origin.
+    XrReferenceSpaceCreateInfo stageInfo{};
+    stageInfo.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
+    stageInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+    stageInfo.poseInReferenceSpace.orientation.w = 1.0f;
+    XrSpace stageSpace = XR_NULL_HANDLE;
+    result = xrCreateReferenceSpace(session, &stageInfo, &stageSpace);
+    XrHandJointLocationEXT stageJoints[kHandJoints]{};
+    XrBool32 stageActive = XR_FALSE;
+    if (XR_SUCCEEDED(result)) {
+        result = locateHand(api, leftTracker, stageSpace, time, stageJoints, &stageActive);
+        xrDestroySpace(stageSpace);
+    }
+    bool stageMatches = XR_SUCCEEDED(result) && stageActive == XR_TRUE;
+    for (uint32_t joint = 0; stageMatches && joint < kHandJoints; ++joint) {
+        stageMatches = handPosesEqual(stageJoints[joint].pose, joints[joint].pose) &&
+                       stageJoints[joint].locationFlags == kHandJointTrackedFlags;
+    }
+    if (!stageMatches) {
+        std::fprintf(stderr, "FAIL: hand joints in STAGE differ from LOCAL (%d)\n", result);
+        return false;
+    }
+
+    // Relative to the grip action space (OpenComposite's skeletal path) the
+    // palm is the grip itself, and the raw joint offsets come back unchanged.
+    XrHandJointLocationEXT gripJoints[kHandJoints]{};
+    XrHandJointVelocityEXT velocities[kHandJoints]{};
+    XrBool32 gripActive = XR_FALSE;
+    result = locateHand(api, leftTracker, gripSpace, time, gripJoints, &gripActive, velocities);
+    bool gripRelativeOk = XR_SUCCEEDED(result) && gripActive == XR_TRUE;
+    for (uint32_t joint = 0; gripRelativeOk && joint < kHandJoints; ++joint) {
+        const float i = static_cast<float>(joint);
+        const XrPosef expected{{0.0f, 0.0f, 0.0f, 1.0f},
+                               {0.001f * i, 0.002f * i, -0.003f * i}};
+        gripRelativeOk =
+            handPosesEqual(gripJoints[joint].pose, expected) &&
+            gripJoints[joint].locationFlags == kHandJointTrackedFlags &&
+            velocities[joint].velocityFlags == 0 &&
+            velocities[joint].linearVelocity.x == 0.0f &&
+            velocities[joint].linearVelocity.y == 0.0f &&
+            velocities[joint].linearVelocity.z == 0.0f &&
+            velocities[joint].angularVelocity.x == 0.0f &&
+            velocities[joint].angularVelocity.y == 0.0f &&
+            velocities[joint].angularVelocity.z == 0.0f;
+    }
+    XrHandJointLocationEXT rightJoints[kHandJoints]{};
+    XrBool32 rightActive = XR_TRUE;
+    const XrResult rightResult =
+        locateHand(api, rightTracker, localSpace, time, rightJoints, &rightActive);
+    if (!gripRelativeOk || rightResult != XR_SUCCESS || rightActive != XR_FALSE ||
+        !handJointsInactive(rightJoints)) {
+        std::fprintf(stderr,
+                     "FAIL: grip-relative hand joints/velocities (%d) or inactive right "
+                     "hand (%d, active %u)\n", result, rightResult, rightActive);
+        return false;
+    }
+    std::puts("PASS: XR_EXT_hand_tracking left skeleton: palm equals the grip pose in "
+              "LOCAL and STAGE, joint offsets and radii survive, grip-relative palm is "
+              "identity, chained velocities report no data, right hand stays inactive");
+
+    vibration.amplitude = 0.75f;
+    result = xrApplyHapticFeedback(
+        session, &hapticInfo, reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+    active = XR_TRUE;
+    for (int attempt = 0; XR_SUCCEEDED(result) && attempt < 200; ++attempt) {
+        result = locateHand(api, leftTracker, localSpace, time, joints, &active);
+        if (XR_SUCCEEDED(result) && active == XR_FALSE) {
+            break;
+        }
+        Sleep(10);
+    }
+    // The daemon follows the untrack with an older skeleton; give it time to
+    // arrive, then the hand must still be inactive.
+    Sleep(100);
+    if (XR_SUCCEEDED(result) && active == XR_FALSE) {
+        result = locateHand(api, leftTracker, localSpace, time, joints, &active);
+    }
+    if (XR_FAILED(result) || active != XR_FALSE || !handJointsInactive(joints)) {
+        std::fprintf(stderr,
+                     "FAIL: untracked left hand stayed active or a stale skeleton revived "
+                     "it (%d, active %u)\n", result, active);
+        return false;
+    }
+    std::puts("PASS: XR_EXT_hand_tracking untrack clears the left hand and a stale "
+              "skeleton cannot revive it");
+    return true;
+}
+
+// OpenComposite locates one frame several times (projection views, eye
+// transforms, IPD, then the game's WaitGetPoses through xrLocateSpace). Every
+// head query for one predictedDisplayTime must return the sample the first
+// query saw, even after a newer sample arrives, so the frame's tracking
+// timestamp matches the pose the application rendered with. The daemon's
+// 0.875 haptic marker publishes a newer head sample (timestamp 3, 0.25 m
+// higher) and then requires the next FrameReady to keep timestamp 2.
+bool checkPinnedFrameHeadPose(
+    XrSession session,
+    XrSpace localSpace,
+    XrTime displayTime,
+    const XrView (&firstViews)[2],
+    const XrHapticActionInfo& hapticInfo,
+    XrHapticVibration vibration) {
+    vibration.amplitude = 0.875f;
+    XrResult result = xrApplyHapticFeedback(
+        session, &hapticInfo, reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+
+    XrViewLocateInfo locateInfo{};
+    locateInfo.type = XR_TYPE_VIEW_LOCATE_INFO;
+    locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    locateInfo.space = localSpace;
+    XrViewState viewState{};
+    viewState.type = XR_TYPE_VIEW_STATE;
+    XrView views[2]{};
+    views[0].type = XR_TYPE_VIEW;
+    views[1].type = XR_TYPE_VIEW;
+    uint32_t viewCount = 0;
+
+    // A time no xrWaitFrame returned sees the newest sample, so it shows
+    // when the moved head has arrived.
+    locateInfo.displayTime = displayTime + 1;
+    bool moved = false;
+    for (int attempt = 0; XR_SUCCEEDED(result) && !moved && attempt < 100; ++attempt) {
+        result = xrLocateViews(session, &locateInfo, &viewState, 2, &viewCount, views);
+        moved = XR_SUCCEEDED(result) &&
+                nearlyEqual(views[0].pose.position.y,
+                            firstViews[0].pose.position.y + 0.25f, 0.001f);
+        if (!moved) {
+            Sleep(10);
+        }
+    }
+    if (XR_FAILED(result) || !moved) {
+        std::fprintf(stderr, "FAIL: the daemon's newer head sample never arrived (%d)\n",
+                     result);
+        return false;
+    }
+
+    locateInfo.displayTime = displayTime;
+    result = xrLocateViews(session, &locateInfo, &viewState, 2, &viewCount, views);
+    if (XR_FAILED(result) || !nearlyEqual(views[0].pose.position.y,
+                                          firstViews[0].pose.position.y, 0.001f) ||
+        !nearlyEqual(views[1].pose.position.y, firstViews[1].pose.position.y, 0.001f)) {
+        std::fprintf(stderr,
+                     "FAIL: a repeated xrLocateViews for one displayTime returned a newer "
+                     "head sample (%d, eye y %.4f, first %.4f)\n",
+                     result, views[0].pose.position.y, firstViews[0].pose.position.y);
+        return false;
+    }
+
+    XrReferenceSpaceCreateInfo viewSpaceInfo{};
+    viewSpaceInfo.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
+    viewSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+    viewSpaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
+    XrSpace viewSpace = XR_NULL_HANDLE;
+    result = xrCreateReferenceSpace(session, &viewSpaceInfo, &viewSpace);
+    XrSpaceLocation head{};
+    head.type = XR_TYPE_SPACE_LOCATION;
+    if (XR_SUCCEEDED(result)) {
+        result = xrLocateSpace(viewSpace, localSpace, displayTime, &head);
+    }
+    const float firstHeadY =
+        (firstViews[0].pose.position.y + firstViews[1].pose.position.y) * 0.5f;
+    if (viewSpace != XR_NULL_HANDLE) {
+        xrDestroySpace(viewSpace);
+    }
+    if (XR_FAILED(result) || !nearlyEqual(head.pose.position.y, firstHeadY, 0.001f) ||
+        !nearlyEqual(head.pose.orientation.w, firstViews[0].pose.orientation.w, 0.001f) ||
+        !nearlyEqual(head.pose.orientation.y, firstViews[0].pose.orientation.y, 0.001f)) {
+        std::fprintf(stderr,
+                     "FAIL: xrLocateSpace(VIEW in LOCAL) for the frame's displayTime "
+                     "returned a newer head sample (%d, y %.4f, first %.4f)\n",
+                     result, head.pose.position.y, firstHeadY);
+        return false;
+    }
+    std::puts("PASS: every head query for one displayTime returns the first query's sample");
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -441,23 +1253,50 @@ int main(int argc, char** argv) {
     }
 
     bool foundD3D11 = false;
+    bool foundVisibilityMask = false;
+    bool foundHandTracking = false;
     for (const XrExtensionProperties& extension : extensions) {
+        if (std::strcmp(extension.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0 &&
+            extension.extensionVersion == XR_EXT_hand_tracking_SPEC_VERSION) {
+            foundHandTracking = true;
+        }
         if (std::strcmp(extension.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0 &&
             extension.extensionVersion == XR_KHR_D3D11_enable_SPEC_VERSION) {
             foundD3D11 = true;
-            break;
+        }
+        if (std::strcmp(extension.extensionName, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0 &&
+            extension.extensionVersion == XR_KHR_visibility_mask_SPEC_VERSION) {
+            foundVisibilityMask = true;
         }
     }
-    if (!foundD3D11) {
-        std::fputs("FAIL: runtime did not advertise XR_KHR_D3D11_enable v11\n", stderr);
+    if (!foundD3D11 || !foundVisibilityMask) {
+        std::fputs("FAIL: runtime did not advertise XR_KHR_D3D11_enable v11 and "
+                   "XR_KHR_visibility_mask\n", stderr);
         return 1;
     }
 
-    const char* enabledExtensions[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
+    const HandTrackingExpectation handTrackingExpected = handTrackingExpectation();
+    if ((handTrackingExpected == HandTrackingExpectation::kPresent && !foundHandTracking) ||
+        (handTrackingExpected == HandTrackingExpectation::kAbsent && foundHandTracking)) {
+        std::fprintf(stderr, "FAIL: XR_EXT_hand_tracking %s\n",
+                     foundHandTracking ? "enumerated without the hand_tracking feature"
+                                       : "missing although the control file lists hand_tracking");
+        return 1;
+    }
+    const bool handTrackingEnabled =
+        handTrackingExpected == HandTrackingExpectation::kPresent;
+
+    std::vector<const char*> enabledExtensions = {
+        XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
+        XR_KHR_VISIBILITY_MASK_EXTENSION_NAME,
+    };
+    if (handTrackingEnabled) {
+        enabledExtensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+    }
     XrInstanceCreateInfo instanceInfo{};
     instanceInfo.type = XR_TYPE_INSTANCE_CREATE_INFO;
-    instanceInfo.enabledExtensionCount = 1;
-    instanceInfo.enabledExtensionNames = enabledExtensions;
+    instanceInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size());
+    instanceInfo.enabledExtensionNames = enabledExtensions.data();
     instanceInfo.applicationInfo.apiVersion = XR_API_VERSION_1_0;
     std::strncpy(instanceInfo.applicationInfo.applicationName, "Basalt D3D11 smoke",
                  XR_MAX_APPLICATION_NAME_SIZE - 1);
@@ -476,6 +1315,57 @@ int main(int argc, char** argv) {
     if (XR_FAILED(result)) {
         xrDestroyInstance(instance);
         return fail("xrGetSystem", result);
+    }
+
+    // XR_EXT_hand_tracking: entry points and system support exist exactly
+    // when the application enabled the offered extension.
+    HandTrackingApi handTracking;
+    {
+        XrSystemHandTrackingPropertiesEXT handTrackingProperties{};
+        handTrackingProperties.type = XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT;
+        handTrackingProperties.supportsHandTracking =
+            handTrackingEnabled ? XR_FALSE : XR_TRUE;
+        XrSystemProperties systemProperties{};
+        systemProperties.type = XR_TYPE_SYSTEM_PROPERTIES;
+        systemProperties.next = &handTrackingProperties;
+        result = xrGetSystemProperties(instance, systemId, &systemProperties);
+        PFN_xrVoidFunction createVoid = nullptr;
+        PFN_xrVoidFunction destroyVoid = nullptr;
+        PFN_xrVoidFunction locateVoid = nullptr;
+        const XrResult createLookup =
+            xrGetInstanceProcAddr(instance, "xrCreateHandTrackerEXT", &createVoid);
+        const XrResult destroyLookup =
+            xrGetInstanceProcAddr(instance, "xrDestroyHandTrackerEXT", &destroyVoid);
+        const XrResult locateLookup =
+            xrGetInstanceProcAddr(instance, "xrLocateHandJointsEXT", &locateVoid);
+        const bool lookupsOk = handTrackingEnabled
+            ? createLookup == XR_SUCCESS && destroyLookup == XR_SUCCESS &&
+                  locateLookup == XR_SUCCESS && createVoid != nullptr &&
+                  destroyVoid != nullptr && locateVoid != nullptr
+            : XR_FAILED(createLookup) && XR_FAILED(destroyLookup) &&
+                  XR_FAILED(locateLookup) && createVoid == nullptr &&
+                  destroyVoid == nullptr && locateVoid == nullptr;
+        if (XR_FAILED(result) || !lookupsOk ||
+            handTrackingProperties.supportsHandTracking !=
+                (handTrackingEnabled ? XR_TRUE : XR_FALSE)) {
+            std::fprintf(stderr,
+                         "FAIL: XR_EXT_hand_tracking system support %u / entry points "
+                         "(%d %d %d) do not match enabled=%u\n",
+                         handTrackingProperties.supportsHandTracking,
+                         createLookup, destroyLookup, locateLookup,
+                         handTrackingEnabled ? 1u : 0u);
+            xrDestroyInstance(instance);
+            return fail("XR_EXT_hand_tracking availability", result);
+        }
+        handTracking.create = reinterpret_cast<PFN_xrCreateHandTrackerEXT>(createVoid);
+        handTracking.destroy = reinterpret_cast<PFN_xrDestroyHandTrackerEXT>(destroyVoid);
+        handTracking.locate = reinterpret_cast<PFN_xrLocateHandJointsEXT>(locateVoid);
+        std::printf(handTrackingEnabled
+                        ? "PASS: XR_EXT_hand_tracking enumerated with the hand_tracking "
+                          "feature; supportsHandTracking and entry points available\n"
+                        : "PASS: XR_EXT_hand_tracking %s; supportsHandTracking false and "
+                          "xrCreateHandTrackerEXT unavailable\n",
+                    foundHandTracking ? "offered but not enabled" : "not enumerated");
     }
 
     uint32_t configurationViewCount = 0;
@@ -603,6 +1493,13 @@ int main(int argc, char** argv) {
         xrDestroyInstance(instance);
         return fail("xrCreateSession(D3D11 binding)", result);
     }
+    if (expectConnected() && !controlSocketIsNotInheritable()) {
+        xrDestroySession(session);
+        release(context);
+        release(device);
+        xrDestroyInstance(instance);
+        return 1;
+    }
 
     uint32_t referenceSpaceCount = 0;
     result = xrEnumerateReferenceSpaces(
@@ -669,7 +1566,17 @@ int main(int argc, char** argv) {
         }
         xrDestroySpace(floorSpace);
     }
+    referenceSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_UNBOUNDED_MSFT;
     XrSpace rejectedSpace = XR_NULL_HANDLE;
+    result = xrCreateReferenceSpace(session, &referenceSpaceInfo, &rejectedSpace);
+    if (result != XR_ERROR_REFERENCE_SPACE_UNSUPPORTED ||
+        rejectedSpace != XR_NULL_HANDLE) {
+        xrDestroySession(session);
+        release(context);
+        release(device);
+        xrDestroyInstance(instance);
+        return fail("xrCreateReferenceSpace(UNBOUNDED_MSFT)", result);
+    }
 
     referenceSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     referenceSpaceInfo.poseInReferenceSpace.orientation.w = 0.0f;
@@ -785,8 +1692,14 @@ int main(int argc, char** argv) {
     frameState.next = frameStateNext;
     result = xrWaitFrame(session, nullptr, &frameState);
     const XrBool32 expectedShouldRender = expectConnected() ? XR_TRUE : XR_FALSE;
+    // The daemon's HELLO_ACK display period paces a connected session;
+    // headless sessions keep the 72 Hz default.
+    const XrDuration expectedDisplayPeriod = expectConnected()
+        ? static_cast<XrDuration>(expectedViewDimension(
+              "BASALT_EXPECT_DISPLAY_PERIOD_NS", 13'888'889))
+        : 13'888'889;
     if (XR_FAILED(result) || frameState.predictedDisplayTime <= 0 ||
-        frameState.predictedDisplayPeriod <= 0 ||
+        frameState.predictedDisplayPeriod != expectedDisplayPeriod ||
         frameState.shouldRender != expectedShouldRender ||
         frameState.next != frameStateNext) {
         xrDestroySession(session);
@@ -1030,6 +1943,18 @@ int main(int argc, char** argv) {
         xrDestroyInstance(instance);
         return fail("second xrAttachSessionActionSets", result);
     }
+    XrHandTrackerEXT leftHandTracker = XR_NULL_HANDLE;
+    XrHandTrackerEXT rightHandTracker = XR_NULL_HANDLE;
+    if (handTrackingEnabled &&
+        !checkHandTrackersAfterAttach(
+            handTracking, session, localSpace, frameState.predictedDisplayTime,
+            &leftHandTracker, &rightHandTracker)) {
+        xrDestroySession(session);
+        release(context);
+        release(device);
+        xrDestroyInstance(instance);
+        return 1;
+    }
     std::strncpy(actionInfo.actionName, "late_action", XR_MAX_ACTION_NAME_SIZE - 1);
     std::strncpy(actionInfo.localizedActionName, "Late Action",
                  XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
@@ -1207,6 +2132,36 @@ int main(int argc, char** argv) {
             return fail("xrEnumerateBoundSourcesForAction values", result);
         }
     }
+    // OpenComposite's activeOriginFromSubaction prefix-matches these sources
+    // against "/user/hand/left"; pose and haptic actions must report the
+    // left-hand source like the button action does.
+    const struct {
+        XrAction action;
+        XrPath expected;
+        const char* label;
+    } leftHandSources[] = {
+        {poseAction, gripPosePath, "pose"},
+        {vibrateAction, hapticPath, "haptic"},
+    };
+    for (const auto& expectedSource : leftHandSources) {
+        boundSourcesInfo.action = expectedSource.action;
+        XrPath source = XR_NULL_PATH;
+        boundSourceCount = UINT32_MAX;
+        result = xrEnumerateBoundSourcesForAction(
+            session, &boundSourcesInfo, 1, &boundSourceCount, &source);
+        if (XR_FAILED(result) ||
+            boundSourceCount != (requireController ? 1u : 0u) ||
+            (requireController && source != expectedSource.expected)) {
+            std::fprintf(stderr, "FAIL: left-hand %s bound source (count %u)\n",
+                         expectedSource.label, boundSourceCount);
+            xrDestroySession(session);
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            return fail("xrEnumerateBoundSourcesForAction left hand", result);
+        }
+    }
+    boundSourcesInfo.action = grabAction;
 
     XrInputSourceLocalizedNameGetInfo localizedNameInfo{};
     localizedNameInfo.type = XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO;
@@ -1306,6 +2261,85 @@ int main(int argc, char** argv) {
         xrDestroyInstance(instance);
         return fail("haptic feedback", result);
     }
+
+    // OpenComposite's TriggerHapticVibrationAction forwards OpenVR values
+    // unchanged and aborts the game on any failure (The Lab level select).
+    // Each value is spec-valid or normalized, never XR_ERROR_VALIDATION_FAILURE.
+    // Connected, each reaches the daemon once on the left hand (11 calls),
+    // which checks the normalized sequence: zero amplitude is a stop, never a
+    // pulse; durations <= 0 with amplitude play the 5 ms minimum.
+    struct OpenCompositeHaptic {
+        const char* label;
+        XrPath subactionPath;
+        XrDuration duration;
+        float frequency;
+        float amplitude;
+    };
+    const float infinity = std::numeric_limits<float>::infinity();
+    const float notANumber = std::numeric_limits<float>::quiet_NaN();
+    const OpenCompositeHaptic openCompositeHaptics[] = {
+        // Hand.TriggerHapticPulse(0): seconds 0, frequency 1 / 0.
+        {"zero duration, infinite frequency", leftHandPath, 0, infinity, 1.0f},
+        // (int)(3.0f * 1e9f) overflows to INT_MIN on x86.
+        {"overflowed duration", leftHandPath, INT32_MIN, 320.0f, 1.0f},
+        {"amplitude above one", leftHandPath, 50'000'000, -1.0f, 1.5f},
+        {"non-finite amplitude", leftHandPath, 10'000'000, notANumber, notANumber},
+        // No ulRestrictToDevice: XR_NULL_PATH, frequency unspecified.
+        {"null subaction path", XR_NULL_PATH, XR_MIN_HAPTIC_DURATION,
+         XR_FREQUENCY_UNSPECIFIED, 0.5f},
+        // Silence must not become a pulse, whatever the duration.
+        {"zero amplitude, zero duration", leftHandPath, 0, infinity, 0.0f},
+        {"zero amplitude, 20 ms", leftHandPath, 20'000'000, 160.0f, 0.0f},
+        {"negative amplitude", leftHandPath, 20'000'000, 160.0f, -0.5f},
+        // The Lab's teleport hint: Hand.TriggerHapticPulse(500) every 50 ms,
+        // i.e. 0.0005 s at 1 / 0.0005 Hz, full amplitude.
+        {"500 us hint pulse", leftHandPath, 500'000, 2000.0f, 1.0f},
+        // IVRSystem::TriggerHapticPulse(us): us * 1000 ns, amplitude 1.
+        {"legacy 3999 us pulse", leftHandPath, 3'999'000,
+         XR_FREQUENCY_UNSPECIFIED, 1.0f},
+        {"legacy 0 us pulse", leftHandPath, 0, XR_FREQUENCY_UNSPECIFIED, 1.0f},
+    };
+    for (const OpenCompositeHaptic& haptic : openCompositeHaptics) {
+        XrHapticActionInfo ocInfo{};
+        ocInfo.type = XR_TYPE_HAPTIC_ACTION_INFO;
+        ocInfo.action = vibrateAction;
+        ocInfo.subactionPath = haptic.subactionPath;
+        XrHapticVibration ocVibration{};
+        ocVibration.type = XR_TYPE_HAPTIC_VIBRATION;
+        ocVibration.duration = haptic.duration;
+        ocVibration.frequency = haptic.frequency;
+        ocVibration.amplitude = haptic.amplitude;
+        result = xrApplyHapticFeedback(
+            session, &ocInfo, reinterpret_cast<const XrHapticBaseHeader*>(&ocVibration));
+        if (result != expectedHapticResult) {
+            std::fprintf(stderr, "FAIL: OpenComposite haptic (%s)\n", haptic.label);
+            xrDestroySession(session);
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            return fail("OpenComposite haptic values", result);
+        }
+    }
+    {
+        // Structurally invalid input still fails validation.
+        XrHapticVibration wrongType{};
+        wrongType.type = XR_TYPE_HAPTIC_ACTION_INFO;
+        wrongType.duration = XR_MIN_HAPTIC_DURATION;
+        wrongType.amplitude = 0.5f;
+        result = xrApplyHapticFeedback(
+            session, &hapticInfo, reinterpret_cast<const XrHapticBaseHeader*>(&wrongType));
+        if (result != XR_ERROR_VALIDATION_FAILURE) {
+            xrDestroySession(session);
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            return fail("haptic wrong struct type", result);
+        }
+    }
+    std::printf("PASS: OpenComposite haptic values (zero/overflowed duration, "
+                "infinite/negative frequency, zero/out-of-range/NaN amplitude, "
+                "null subaction, 500 us and legacy microsecond pulses) return %s\n",
+                expectedHapticResult == XR_SUCCESS ? "XR_SUCCESS" : "XR_SESSION_NOT_FOCUSED");
 
     if (injectedController) {
         // The native daemon answers the first haptic with a sparse squeeze
@@ -1572,6 +2606,17 @@ int main(int argc, char** argv) {
         }
         std::puts(
             "PASS: controller presence clears stale pose/velocity and recovers");
+
+        if (handTrackingEnabled &&
+            !checkInjectedHandSkeleton(
+                handTracking, session, leftHandTracker, rightHandTracker,
+                localSpace, handSpace, locateTime, hapticInfo, vibration)) {
+            xrDestroySession(session);
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            return 1;
+        }
     }
 
     // Public action destruction must not invalidate the backing resource of
@@ -1718,9 +2763,13 @@ int main(int argc, char** argv) {
         result = xrApplyHapticFeedback(
             session, &hapticInfo,
             reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+        // STAGE shares LOCAL's origin, so the recenter is announced for both,
+        // LOCAL first, with the same changeTime and previous-space pose.
         XrEventDataReferenceSpaceChangePending recenterEvent{};
-        bool receivedRecenter = false;
-        for (int attempt = 0; XR_SUCCEEDED(result) && attempt < 100; ++attempt) {
+        XrEventDataReferenceSpaceChangePending stageRecenterEvent{};
+        uint32_t receivedRecenters = 0;
+        for (int attempt = 0;
+             XR_SUCCEEDED(result) && receivedRecenters < 2 && attempt < 100; ++attempt) {
             XrEventDataBuffer eventData{};
             eventData.type = XR_TYPE_EVENT_DATA_BUFFER;
             const XrResult eventResult = xrPollEvent(instance, &eventData);
@@ -1733,20 +2782,26 @@ int main(int argc, char** argv) {
                 result = XR_ERROR_RUNTIME_FAILURE;
                 break;
             }
-            recenterEvent = *reinterpret_cast<
-                const XrEventDataReferenceSpaceChangePending*>(&eventData);
-            receivedRecenter = true;
-            break;
+            (receivedRecenters == 0 ? recenterEvent : stageRecenterEvent) =
+                *reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(
+                    &eventData);
+            ++receivedRecenters;
         }
-        if (XR_FAILED(result) || !receivedRecenter ||
-            recenterEvent.session != session ||
-            recenterEvent.referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL ||
-            recenterEvent.changeTime <= 0 || recenterEvent.poseValid != XR_TRUE ||
-            !nearlyEqual(recenterEvent.poseInPreviousSpace.position.x, -0.25f) ||
-            !nearlyEqual(recenterEvent.poseInPreviousSpace.position.y, 0.0f) ||
-            !nearlyEqual(recenterEvent.poseInPreviousSpace.position.z, 0.25f) ||
-            !nearlyEqual(recenterEvent.poseInPreviousSpace.orientation.y, 0.707106781f) ||
-            !nearlyEqual(recenterEvent.poseInPreviousSpace.orientation.w, 0.707106781f)) {
+        auto validRecenter = [&](const XrEventDataReferenceSpaceChangePending& event,
+                                 XrReferenceSpaceType referenceSpaceType) {
+            return event.session == session &&
+                   event.referenceSpaceType == referenceSpaceType &&
+                   event.changeTime > 0 && event.poseValid == XR_TRUE &&
+                   nearlyEqual(event.poseInPreviousSpace.position.x, -0.25f) &&
+                   nearlyEqual(event.poseInPreviousSpace.position.y, 0.0f) &&
+                   nearlyEqual(event.poseInPreviousSpace.position.z, 0.25f) &&
+                   nearlyEqual(event.poseInPreviousSpace.orientation.y, 0.707106781f) &&
+                   nearlyEqual(event.poseInPreviousSpace.orientation.w, 0.707106781f);
+        };
+        if (XR_FAILED(result) || receivedRecenters != 2 ||
+            !validRecenter(recenterEvent, XR_REFERENCE_SPACE_TYPE_LOCAL) ||
+            !validRecenter(stageRecenterEvent, XR_REFERENCE_SPACE_TYPE_STAGE) ||
+            stageRecenterEvent.changeTime != recenterEvent.changeTime) {
             xrDestroySession(session);
             release(context);
             release(device);
@@ -1876,6 +2931,14 @@ int main(int argc, char** argv) {
         xrDestroyInstance(instance);
         return fail("xrGetReferenceSpaceBoundsRect", result);
     }
+    if (!checkStageSpace(session, localSpace, handSpace, locateTime) ||
+        !checkVisibilityMask(instance, session)) {
+        xrDestroySession(session);
+        release(context);
+        release(device);
+        xrDestroyInstance(instance);
+        return 1;
+    }
 
     uint32_t formatCount = 0;
     result = xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr);
@@ -1884,15 +2947,12 @@ int main(int argc, char** argv) {
         result = xrEnumerateSwapchainFormats(
             session, formatCount, &formatCount, formats.data());
     }
-    bool foundBgra = false;
-    for (int64_t format : formats) {
-        foundBgra = foundBgra || format == DXGI_FORMAT_B8G8R8A8_UNORM;
-    }
-    // Advertise only formats the native CoreVideo compositor can wrap. RGBA
-    // IOSurfaces must fail at swapchain negotiation instead of rendering a
-    // silently black stream.
-    if (XR_FAILED(result) || !foundBgra || formats.size() != 2 ||
-        formats.front() != DXGI_FORMAT_B8G8R8A8_UNORM) {
+    // Only the zero-copy BGRA formats are advertised; other formats (RGBA for
+    // OpenComposite) are accepted by xrCreateSwapchain and converted by the
+    // runtime compositor.
+    if (XR_FAILED(result) || formats.size() != 2 ||
+        formats[0] != DXGI_FORMAT_B8G8R8A8_UNORM ||
+        formats[1] != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
         xrDestroySession(session);
         release(context);
         release(device);
@@ -1919,19 +2979,51 @@ int main(int argc, char** argv) {
     swapchainInfo.arraySize = 1;
     swapchainInfo.mipCount = 1;
 
+    // RGBA is accepted for the runtime compositor but never exported: the
+    // CoreVideo handoff cannot wrap DXMT's RGBA IOSurfaces.
     swapchainInfo.format = DXGI_FORMAT_R8G8B8A8_UNORM;
     XrSwapchain rgbaSwapchain = XR_NULL_HANDLE;
     result = xrCreateSwapchain(session, &swapchainInfo, &rgbaSwapchain);
-    if (result != XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED ||
-        rgbaSwapchain != XR_NULL_HANDLE) {
-        if (rgbaSwapchain != XR_NULL_HANDLE) {
-            xrDestroySwapchain(rgbaSwapchain);
+    bool rgbaPrivate = XR_SUCCEEDED(result) && rgbaSwapchain != XR_NULL_HANDLE;
+    if (rgbaPrivate) {
+        uint32_t rgbaImageCount = 0;
+        XrSwapchainImageD3D11KHR rgbaImages[3]{};
+        for (XrSwapchainImageD3D11KHR& image : rgbaImages) {
+            image.type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+        }
+        result = xrEnumerateSwapchainImages(
+            rgbaSwapchain, 3, &rgbaImageCount,
+            reinterpret_cast<XrSwapchainImageBaseHeader*>(rgbaImages));
+        rgbaPrivate = XR_SUCCEEDED(result);
+        for (uint32_t index = 0; rgbaPrivate && index < rgbaImageCount; ++index) {
+            D3D11_TEXTURE2D_DESC description{};
+            rgbaImages[index].texture->GetDesc(&description);
+            uint32_t iosurfaceId = 0;
+            UINT iosurfaceIdSize = sizeof(iosurfaceId);
+            rgbaPrivate =
+                (description.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) == 0 &&
+                FAILED(rgbaImages[index].texture->GetPrivateData(
+                    kBasaltIOSurfaceIdGuid, &iosurfaceIdSize, &iosurfaceId));
+        }
+        const XrResult destroyResult = xrDestroySwapchain(rgbaSwapchain);
+        rgbaPrivate = rgbaPrivate && XR_SUCCEEDED(destroyResult);
+    }
+    swapchainInfo.format = DXGI_FORMAT_BC1_UNORM;
+    XrSwapchain compressedSwapchain = XR_NULL_HANDLE;
+    const XrResult compressedResult =
+        xrCreateSwapchain(session, &swapchainInfo, &compressedSwapchain);
+    if (!rgbaPrivate ||
+        compressedResult != XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED ||
+        compressedSwapchain != XR_NULL_HANDLE) {
+        if (compressedSwapchain != XR_NULL_HANDLE) {
+            xrDestroySwapchain(compressedSwapchain);
         }
         xrDestroySession(session);
         release(context);
         release(device);
         xrDestroyInstance(instance);
-        return fail("xrCreateSwapchain(unsupported RGBA transport)", result);
+        return fail("xrCreateSwapchain(private RGBA / unsupported BC1)",
+                    rgbaPrivate ? compressedResult : result);
     }
     // UE4 hands over a typeless BGRA format for its eye textures; the runtime
     // backs it with typed BGRA instead of rejecting the swapchain.
@@ -2287,6 +3379,12 @@ int main(int argc, char** argv) {
             projectionViews[index].fov = locatedViews[index].fov;
         }
     }
+    if (XR_SUCCEEDED(result) && expectInjectedHeadPose() &&
+        !checkPinnedFrameHeadPose(
+            session, localSpace, layerFrameState.predictedDisplayTime,
+            locatedViews, hapticInfo, vibration)) {
+        result = XR_ERROR_VALIDATION_FAILURE;
+    }
     frameEndInfo.layerCount = 1;
     frameEndInfo.layers = submittedLayers;
     if (XR_SUCCEEDED(result)) {
@@ -2536,32 +3634,50 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(options.renderFrames),
                 expectConnected() ? " and delivered to the control daemon" : "");
 
+    // Quad layers are composited by the runtime (d3d11_compositor_smoke
+    // covers them); here only frames that must not reach the daemon are
+    // submitted: an invalid quad and an extension layer type that was never
+    // enabled.
     XrCompositionLayerQuad quadLayer{};
     quadLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
     quadLayer.space = localSpace;
     quadLayer.subImage = projectionViews[0].subImage;
     quadLayer.pose.orientation.w = 1.0f;
-    quadLayer.size = {1.0f, 1.0f};
-    result = xrWaitFrame(session, nullptr, &layerFrameState);
-    if (XR_SUCCEEDED(result)) {
-        result = xrBeginFrame(session, nullptr);
-    }
-    frameEndInfo.displayTime = layerFrameState.predictedDisplayTime;
-    submittedLayers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadLayer);
-    if (XR_SUCCEEDED(result)) {
-        result = xrEndFrame(session, &frameEndInfo);
-        if (result != XR_ERROR_LAYER_INVALID) {
-            xrDestroySwapchain(secondSwapchain);
-            xrDestroySwapchain(swapchain);
-            xrDestroySession(session);
-            release(context);
-            release(device);
-            xrDestroyInstance(instance);
-            return fail("quad layer rejection", result);
+    quadLayer.size = {0.0f, 1.0f};
+    for (const XrResult expected :
+         {XR_ERROR_VALIDATION_FAILURE, XR_ERROR_LAYER_INVALID}) {
+        if (expected == XR_ERROR_LAYER_INVALID) {
+            // XR_KHR_composition_layer_cylinder's layer type.
+            quadLayer.type = static_cast<XrStructureType>(1000017000);
+            quadLayer.size = {1.0f, 1.0f};
         }
-        frameEndInfo.layerCount = 0;
-        frameEndInfo.layers = nullptr;
-        result = xrEndFrame(session, &frameEndInfo);
+        result = xrWaitFrame(session, nullptr, &layerFrameState);
+        if (XR_SUCCEEDED(result)) {
+            result = xrBeginFrame(session, nullptr);
+        }
+        frameEndInfo.displayTime = layerFrameState.predictedDisplayTime;
+        frameEndInfo.layerCount = 1;
+        frameEndInfo.layers = submittedLayers;
+        submittedLayers[0] =
+            reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadLayer);
+        if (XR_SUCCEEDED(result)) {
+            result = xrEndFrame(session, &frameEndInfo);
+            if (result != expected) {
+                xrDestroySwapchain(secondSwapchain);
+                xrDestroySwapchain(swapchain);
+                xrDestroySession(session);
+                release(context);
+                release(device);
+                xrDestroyInstance(instance);
+                return fail("invalid quad / unknown layer rejection", result);
+            }
+            frameEndInfo.layerCount = 0;
+            frameEndInfo.layers = nullptr;
+            result = xrEndFrame(session, &frameEndInfo);
+        }
+        if (XR_FAILED(result)) {
+            break;
+        }
     }
     if (XR_FAILED(result)) {
         xrDestroySwapchain(secondSwapchain);
@@ -2819,6 +3935,23 @@ int main(int argc, char** argv) {
         return fail("stopped session", result);
     }
 
+    // OpenComposite never destroys its hand trackers before the session;
+    // they stay usable until xrDestroySession and die with it.
+    if (handTrackingEnabled) {
+        XrHandJointLocationEXT joints[kHandJoints]{};
+        XrBool32 active = XR_TRUE;
+        result = locateHand(
+            handTracking, rightHandTracker, localSpace,
+            frameState.predictedDisplayTime > 0 ? frameState.predictedDisplayTime : 1,
+            joints, &active);
+        if (result != XR_SUCCESS) {
+            xrDestroySession(session);
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            return fail("xrLocateHandJointsEXT before xrDestroySession", result);
+        }
+    }
     result = xrDestroySession(session);
     if (XR_SUCCEEDED(result)) {
         const XrResult cascadeResult = xrDestroySpace(localSpace);
@@ -2828,6 +3961,33 @@ int main(int argc, char** argv) {
             xrDestroyInstance(instance);
             return fail("session-cascaded xrDestroySpace(LOCAL)", cascadeResult);
         }
+    }
+    if (XR_SUCCEEDED(result) && handTrackingEnabled) {
+        const XrResult leftDestroy = handTracking.destroy(leftHandTracker);
+        const XrResult rightDestroy = handTracking.destroy(rightHandTracker);
+        if (leftDestroy != XR_ERROR_HANDLE_INVALID ||
+            rightDestroy != XR_ERROR_HANDLE_INVALID) {
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            std::fprintf(stderr, "FAIL: hand trackers outlived their session (%d %d)\n",
+                         leftDestroy, rightDestroy);
+            return 1;
+        }
+        std::puts("PASS: XR_EXT_hand_tracking trackers live until xrDestroySession, "
+                  "then are invalid");
+    }
+    // A second session would start a second control-daemon handshake, so the
+    // OpenComposite-style restart runs only in headless mode.
+    if (XR_SUCCEEDED(result) && !expectConnected() &&
+        !checkOpenCompositeSessionRestart(
+            instance, sessionInfo, attachedActionSets,
+            static_cast<uint32_t>(std::size(attachedActionSets)),
+            overlayPoseAction, leftHandPath)) {
+        release(context);
+        release(device);
+        xrDestroyInstance(instance);
+        return 1;
     }
     if (XR_SUCCEEDED(result)) {
         result = xrDestroyInstance(instance);
