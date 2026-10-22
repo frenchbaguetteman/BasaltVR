@@ -122,10 +122,16 @@ public enum AlvrClientControlDecoder {
 
 public final class AlvrSessionHandshakeResult: @unchecked Sendable {
     static let maximumRetainedButtonPaths = 64
+    /// ALVR v20 clients send `KeepAlive` every 500 ms while streaming and
+    /// drop the server after 2 s without one. Silence this long means the
+    /// client is gone even if TCP never reported it (Wi-Fi out of range).
+    public static let defaultReceiveTimeoutNanoseconds: UInt64 = 5_000_000_000
     public let clientState: AlvrClientConnectionState
     public let negotiatedSettings: AlvrNegotiatedSettings?
     public let streamReady: Bool
     private let socket: Int32
+    private let receiveTimeoutNanoseconds: UInt64
+    private var lastReceiveNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     private var keepaliveTimer: DispatchSourceTimer?
     private let controlQueue: DispatchQueue
     private let controlQueueKey = DispatchSpecificKey<Void>()
@@ -135,8 +141,9 @@ public final class AlvrSessionHandshakeResult: @unchecked Sendable {
     private var viewsConfigHandler: ((AlvrViewsConfig) -> Void)?
     private var buttonsHandler: (([AlvrButtonEntry]) -> Void)?
     private var interactionProfileHandler: ((_ deviceID: UInt64, _ profileID: UInt64) -> Void)?
-    private var disconnectHandler: (() -> Void)?
-    private var disconnected = false
+    private var disconnectHandler: ((_ reason: String) -> Void)?
+    private var disconnectReason: String?
+    private var disconnected: Bool { disconnectReason != nil }
     private var pendingIDRRequest = false
     private var latestViewsConfig: AlvrViewsConfig?
     private var latestButtons: [UInt64: AlvrButtonValue] = [:]
@@ -144,11 +151,13 @@ public final class AlvrSessionHandshakeResult: @unchecked Sendable {
 
     init(clientState: AlvrClientConnectionState,
          negotiatedSettings: AlvrNegotiatedSettings?,
-         streamReady: Bool, socket: Int32) {
+         streamReady: Bool, socket: Int32,
+         receiveTimeoutNanoseconds: UInt64 = defaultReceiveTimeoutNanoseconds) {
         self.clientState = clientState
         self.negotiatedSettings = negotiatedSettings
         self.streamReady = streamReady
         self.socket = socket
+        self.receiveTimeoutNanoseconds = receiveTimeoutNanoseconds
         let socketFlags = fcntl(socket, F_GETFL)
         if socketFlags >= 0 {
             _ = fcntl(socket, F_SETFL, socketFlags | O_NONBLOCK)
@@ -162,10 +171,17 @@ public final class AlvrSessionHandshakeResult: @unchecked Sendable {
                            repeating: .milliseconds(500))
             timer.setEventHandler { [weak self] in
                 guard let self else { return }
+                let silence = DispatchTime.now().uptimeNanoseconds &- lastReceiveNanoseconds
+                if silence >= receiveTimeoutNanoseconds {
+                    handleDisconnect(reason: String(
+                        format: "no ALVR control packets for %.1f s", Double(silence) / 1e9))
+                    return
+                }
                 do {
                     try AlvrControlProbe.sendKeepAlive(to: socket)
                 } catch {
-                    self.handleDisconnect()
+                    self.handleDisconnect(
+                        reason: "keepalive failed: \(error.localizedDescription)")
                 }
             }
             timer.resume()
@@ -184,9 +200,9 @@ public final class AlvrSessionHandshakeResult: @unchecked Sendable {
         keepaliveTimer?.cancel()
         readSource?.cancel()
         if DispatchQueue.getSpecific(key: controlQueueKey) != nil {
-            close(socket)
+            Darwin.close(socket)
         } else {
-            _ = controlQueue.sync { close(socket) }
+            _ = controlQueue.sync { Darwin.close(socket) }
         }
     }
 
@@ -231,13 +247,31 @@ public final class AlvrSessionHandshakeResult: @unchecked Sendable {
         }
     }
 
-    /// Called once when the live ALVR control socket reaches EOF or fails.
-    /// Installing the handler after the failure still reports it immediately.
-    public func onDisconnect(_ handler: @escaping () -> Void) {
+    /// Called once when the live ALVR control socket reaches EOF, fails, or
+    /// stays silent past the receive timeout. Installing the handler after
+    /// the failure still reports it immediately. `close()` does not call it.
+    public func onDisconnect(_ handler: @escaping (_ reason: String) -> Void) {
         controlQueue.async { [weak self] in
             guard let self else { return }
             disconnectHandler = handler
-            if disconnected { handler() }
+            if let disconnectReason { handler(disconnectReason) }
+        }
+    }
+
+    /// Ends this control session from the streamer side. The client sees EOF
+    /// and returns to its connection loop, ready for a new handshake.
+    public func close() {
+        let work = { [self] in
+            guard !disconnected else { return }
+            let handler = disconnectHandler
+            disconnectHandler = nil
+            handleDisconnect(reason: "closed by Basalt")
+            disconnectHandler = handler
+        }
+        if DispatchQueue.getSpecific(key: controlQueueKey) != nil {
+            work()
+        } else {
+            controlQueue.sync(execute: work)
         }
     }
 
@@ -257,27 +291,37 @@ public final class AlvrSessionHandshakeResult: @unchecked Sendable {
     }
 
     public func sendH264DecoderConfig(_ parameterSets: Data) {
+        sendDecoderConfig(parameterSets, codec: .h264)
+    }
+
+    /// Sends ALVR's `DecoderConfig`: the codec and the Annex-B parameter sets
+    /// that the Quest uses to (re)create its decoder.
+    public func sendDecoderConfig(_ parameterSets: Data, codec: VideoCodec) {
         guard streamReady, !parameterSets.isEmpty else { return }
-        controlQueue.sync { [socket] in
-            try? AlvrControlProbe.sendH264DecoderConfig(parameterSets, to: socket)
+        controlQueue.sync { [self] in
+            guard !disconnected else { return }
+            try? AlvrControlProbe.sendDecoderConfig(parameterSets, codec: codec, to: socket)
         }
     }
 
     private func drainControlSocket() {
+        guard !disconnected else { return }
         var bytes = [UInt8](repeating: 0, count: 16_384)
         while true {
             let count = recv(socket, &bytes, bytes.count, 0)
             if count > 0 {
                 receiveBuffer.append(contentsOf: bytes[0..<count])
+                lastReceiveNanoseconds = DispatchTime.now().uptimeNanoseconds
             } else if count == 0 {
-                handleDisconnect()
+                handleDisconnect(reason: "the headset closed the ALVR control connection")
                 return
             } else if errno == EAGAIN || errno == EWOULDBLOCK {
                 break
             } else if errno == EINTR {
                 continue
             } else {
-                handleDisconnect()
+                handleDisconnect(reason: "ALVR control read failed: "
+                    + String(cString: strerror(errno)))
                 return
             }
         }
@@ -286,7 +330,7 @@ public final class AlvrSessionHandshakeResult: @unchecked Sendable {
             let length = receiveBuffer.prefix(4).reduce(0) { ($0 << 8) | Int($1) }
             guard length > 0, length <= AlvrControlProbe.maximumPacketBytes else {
                 receiveBuffer.removeAll()
-                handleDisconnect()
+                handleDisconnect(reason: "invalid ALVR control packet length \(length)")
                 return
             }
             guard receiveBuffer.count >= 4 + length else { return }
@@ -317,9 +361,9 @@ public final class AlvrSessionHandshakeResult: @unchecked Sendable {
         }
     }
 
-    private func handleDisconnect() {
+    private func handleDisconnect(reason: String) {
         guard !disconnected else { return }
-        disconnected = true
+        disconnectReason = reason
         keepaliveTimer?.cancel()
         readSource?.cancel()
         Darwin.shutdown(socket, SHUT_RDWR)
@@ -328,7 +372,7 @@ public final class AlvrSessionHandshakeResult: @unchecked Sendable {
         latestViewsConfig = nil
         latestButtons.removeAll()
         latestInteractionProfiles.removeAll()
-        disconnectHandler?()
+        disconnectHandler?(reason)
     }
 }
 
@@ -389,7 +433,9 @@ public enum AlvrControlProbe {
         requestedViewHeight: UInt32? = nil,
         preferredRefreshRate: Float = 90,
         latencyPreset: StreamLatencyPreset = .balanced,
-        wired: Bool = false
+        wired: Bool = false,
+        controllerPrediction: ControllerPrediction = .full,
+        codec: VideoCodec = .h264
     ) async throws -> AlvrSessionHandshakeResult {
         try await Task.detached(priority: .utility) {
             try negotiateBlocking(host: host, port: port, timeoutSeconds: timeoutSeconds,
@@ -397,7 +443,9 @@ public enum AlvrControlProbe {
                                   requestedViewHeight: requestedViewHeight,
                                   preferredRefreshRate: preferredRefreshRate,
                                   latencyPreset: latencyPreset,
-                                  wired: wired)
+                                  wired: wired,
+                                  controllerPrediction: controllerPrediction,
+                                  codec: codec)
         }.value
     }
 
@@ -414,7 +462,9 @@ public enum AlvrControlProbe {
                                           requestedViewHeight: UInt32?,
                                           preferredRefreshRate: Float,
                                           latencyPreset: StreamLatencyPreset,
-                                          wired: Bool) throws
+                                          wired: Bool,
+                                          controllerPrediction: ControllerPrediction,
+                                          codec: VideoCodec) throws
         -> AlvrSessionHandshakeResult {
         let fd = try openSocket(host: host, port: port, timeoutSeconds: timeoutSeconds)
         do {
@@ -441,7 +491,8 @@ public enum AlvrControlProbe {
                 settings = try AlvrNegotiatedSettings.beatSaberDefaults(for: capabilities)
             }
             let streamConfig = try AlvrStreamConfigEncoder.framedPacket(
-                settings: settings, wired: wired)
+                settings: settings, wired: wired, controllerPrediction: controllerPrediction,
+                codec: codec)
             do {
                 try writeExactly(streamConfig, to: fd,
                                  deadline: Date().addingTimeInterval(TimeInterval(timeoutSeconds)))
@@ -548,15 +599,24 @@ public enum AlvrControlProbe {
                          deadline: Date().addingTimeInterval(0.4))
     }
 
-    fileprivate static func sendH264DecoderConfig(_ parameterSets: Data,
-                                                  to fd: Int32) throws {
+    fileprivate static func sendDecoderConfig(_ parameterSets: Data, codec: VideoCodec,
+                                              to fd: Int32) throws {
+        try writeExactly(
+            framedPayload(decoderConfigPayload(parameterSets: parameterSets, codec: codec)),
+            to: fd, deadline: Date().addingTimeInterval(0.4))
+    }
+
+    /// Bincode `ServerControlPacket::DecoderConfig(DecoderInitializationConfig
+    /// { codec, config_buffer })` (`alvr/packets/src/lib.rs`): variant 1 and
+    /// the `CodecType` as little-endian u32, then the buffer as a
+    /// little-endian u64 length and bytes.
+    static func decoderConfigPayload(parameterSets: Data, codec: VideoCodec) -> Data {
         var payload = Data()
         appendLittleEndian(UInt32(1), to: &payload) // ServerControlPacket::DecoderConfig
-        appendLittleEndian(UInt32(0), to: &payload) // CodecType::H264
+        appendLittleEndian(codec.alvrCodecType, to: &payload) // CodecType
         appendLittleEndian(UInt64(parameterSets.count), to: &payload)
         payload.append(parameterSets)
-        try writeExactly(framedPayload(payload), to: fd,
-                         deadline: Date().addingTimeInterval(0.4))
+        return payload
     }
 
     private static func appendLittleEndian<T: FixedWidthInteger>(_ value: T,
@@ -627,41 +687,6 @@ public enum AlvrControlProbe {
 private extension Data {
     var hexPrefix: String {
         prefix(16).map { String(format: "%02x", $0) }.joined()
-    }
-}
-
-/// Prevents overlapping probes and suppresses new probes after a successful
-/// diagnostic handshake. Failed attempts may be retried on a later beacon.
-public final class AlvrControlProbeGate: @unchecked Sendable {
-    private enum State { case probing, completed }
-    private let lock = NSLock()
-    private var states: [String: State] = [:]
-    private var retainedSessions: [String: AlvrSessionHandshakeResult] = [:]
-
-    public init() {}
-
-    public func begin(clientKey: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard states[clientKey] == nil else { return false }
-        states[clientKey] = .probing
-        return true
-    }
-
-    public func finish(clientKey: String, succeeded: Bool) {
-        lock.lock()
-        if succeeded {
-            states[clientKey] = .completed
-        } else if case .probing = states[clientKey] {
-            states[clientKey] = nil
-        }
-        lock.unlock()
-    }
-
-    public func retain(_ session: AlvrSessionHandshakeResult, clientKey: String) {
-        lock.lock()
-        retainedSessions[clientKey] = session
-        lock.unlock()
     }
 }
 

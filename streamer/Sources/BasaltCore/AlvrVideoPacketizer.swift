@@ -111,8 +111,34 @@ public enum AlvrAudioPacketizer {
     }
 }
 
+/// Diagnostic trace of every runtime haptic forwarded to ALVR, enabled by
+/// `BASALT_HAPTIC_LOG` (any value but empty or `0`). The OpenXR runtime logs
+/// the game's raw values under the same variable.
+public enum AlvrHapticsLog {
+    public static func isEnabled(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        guard let value = environment["BASALT_HAPTIC_LOG"] else { return false }
+        return !value.isEmpty && value != "0"
+    }
+
+    public static func line(hand: AlvrHand, durationNanoseconds: UInt64,
+                            frequency: Float, amplitude: Float,
+                            uptimeNanoseconds: UInt64) -> String {
+        let kind = durationNanoseconds == 0 && amplitude == 0 ? "stop" : "pulse"
+        let handName = hand == .left ? "left" : "right"
+        return "haptic t=\(uptimeNanoseconds / 1_000_000)ms \(handName) \(kind) "
+            + "duration=\(durationNanoseconds)ns frequency=\(frequency) amplitude=\(amplitude)"
+    }
+}
+
 /// Fixed-size ALVR v20 haptics stream header (stream ID 1). Haptics shares
-/// the video socket but keeps its own packet-index sequence.
+/// the video socket but keeps its own packet-index sequence. The payload is
+/// bincode of `alvr_packets::Haptics { device_id: u64, duration: Duration,
+/// frequency: f32, amplitude: f32 }`, Duration as `secs: u64, nanos: u32`.
+/// The ALVR v20.14.1 client passes these to xrApplyHapticFeedback as-is:
+/// duration in nanoseconds, frequency in Hz (0 is unspecified), amplitude
+/// clamped to 0...1. Zero duration and amplitude is the stop the runtime sends.
 public enum AlvrHapticsPacketizer {
     public static let streamID: UInt16 = 1
 

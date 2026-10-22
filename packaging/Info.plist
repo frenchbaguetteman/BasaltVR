@@ -6,7 +6,7 @@
     <key>CFBundleDisplayName</key>
     <string>BasaltVR</string>
     <key>CFBundleExecutable</key>
-    <string>BasaltVRLauncher</string>
+    <string>BasaltVR</string>
     <key>CFBundleIconFile</key>
     <string>BasaltVR.icns</string>
     <key>CFBundleIdentifier</key>
@@ -34,6 +34,6 @@
         <string>arm64</string>
     </array>
     <key>NSMicrophoneUsageDescription</key>
-    <string>BasaltVR captures game audio from your selected loopback device and streams it to your VR headset.</string>
+    <string>BasaltVR reads game sound from a loopback input such as BlackHole (macOS counts it as a microphone) and sends it to your VR headset.</string>
 </dict>
 </plist>

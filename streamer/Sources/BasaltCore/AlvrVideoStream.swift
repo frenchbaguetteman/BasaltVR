@@ -265,16 +265,21 @@ public struct AlvrVideoSendReport: Equatable, Sendable {
     public let shardCount: Int
     public let isIDR: Bool
     public let durationNanoseconds: UInt64
+    /// Mac-side time from the arrival of the tracking packet whose timestamp
+    /// this frame carries to the end of this write; nil when that packet is
+    /// no longer in the sender's recent history (or the timestamp is 0).
+    public let trackingAgeNanoseconds: UInt64?
 
     public init(timestampNanoseconds: UInt64, accessUnitBytes: Int,
                 wireBytes: Int, shardCount: Int, isIDR: Bool,
-                durationNanoseconds: UInt64) {
+                durationNanoseconds: UInt64, trackingAgeNanoseconds: UInt64? = nil) {
         self.timestampNanoseconds = timestampNanoseconds
         self.accessUnitBytes = accessUnitBytes
         self.wireBytes = wireBytes
         self.shardCount = shardCount
         self.isIDR = isIDR
         self.durationNanoseconds = durationNanoseconds
+        self.trackingAgeNanoseconds = trackingAgeNanoseconds
     }
 }
 
@@ -293,6 +298,66 @@ public struct AlvrAudioSendReport: Equatable, Sendable {
     }
 }
 
+/// Decides whether a video access unit handed to the sender now is written
+/// or dropped. At most one access unit is written and one waits behind it.
+///
+/// A write in flight only counts as "busy" once it has run longer than
+/// `busyAfterNanoseconds` (one frame period at the negotiated refresh rate).
+/// A normal write takes 0.3-1.6 ms, and the next frame needs ~11 ms to
+/// encode, so dropping it because such a write had just started was needless
+/// (0.7-1.7% of frames on an idle link). A longer write is a real stall
+/// (a paused USB link, a saturated Wi-Fi queue): frames are then dropped, as
+/// before, so stale frames never pile up and `VideoLossRecoveryGate` keeps
+/// the reference chain intact. A frame that waits does so for less than one
+/// frame period plus the rest of the write, so latency does not grow.
+///
+/// Not thread-safe; the sender holds its state lock. Times are Mac uptime
+/// nanoseconds.
+struct AlvrVideoSendAdmission: Sendable {
+    /// One access unit written plus one waiting.
+    static let maximumOutstanding = 2
+
+    var busyAfterNanoseconds: UInt64
+    /// Access units accepted and not yet finished (0, 1, or 2).
+    private(set) var outstanding = 0
+    /// When the access unit at the head of the queue became the one written.
+    private var headSince: UInt64 = 0
+
+    init(busyAfterNanoseconds: UInt64) {
+        self.busyAfterNanoseconds = busyAfterNanoseconds
+    }
+
+    /// One frame period at `hertz`, or nil for a rate outside 30-240 Hz.
+    static func busyAfterNanoseconds(refreshRate hertz: Float) -> UInt64? {
+        guard hertz.isFinite, hertz >= 30, hertz <= 240 else { return nil }
+        return UInt64((1_000_000_000 / Double(hertz)).rounded())
+    }
+
+    /// True when `admit(now:)` would drop an access unit handed over now.
+    func wouldDrop(now: UInt64) -> Bool {
+        switch outstanding {
+        case 0: return false
+        case 1: return now &- headSince > busyAfterNanoseconds
+        default: return true
+        }
+    }
+
+    /// Accepts an access unit unless it would be dropped.
+    mutating func admit(now: UInt64) -> Bool {
+        guard !wouldDrop(now: now) else { return false }
+        if outstanding == 0 { headSince = now }
+        outstanding += 1
+        return true
+    }
+
+    /// The access unit at the head of the queue was written (or abandoned).
+    mutating func complete(now: UInt64) {
+        guard outstanding > 0 else { return }
+        outstanding -= 1
+        if outstanding > 0 { headSince = now }
+    }
+}
+
 /// Sends ALVR-sharded H.264 access units over the v20 stream socket. ALVR
 /// uses UDP over Wi-Fi and a length-framed TCP byte stream through adb USB
 /// forwarding when the negotiated session has `wired` enabled.
@@ -304,16 +369,33 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
     public var onCongestion: (() -> Void)?
     public var onStatistics: ((AlvrClientStatistics) -> Void)?
     public var onHeadPose: ((_ timestampNanoseconds: UInt64, _ pose: AlvrHeadPose) -> Void)?
-    public var onControllerMotion: ((_ timestampNanoseconds: UInt64, _ hand: AlvrHand,
-                                     _ motion: AlvrControllerMotion) -> Void)?
-    public var onControllerMask: ((_ timestampNanoseconds: UInt64, _ activeMask: UInt32) -> Void)?
+    /// Every complete tracking packet (shards joined): controller or hand
+    /// motions and hand skeletons. The head pose and timestamp also arrive
+    /// earlier, from the first shard, through `onHeadPose` and
+    /// `onTrackingTimestamp`.
+    public var onTrackingSample: ((AlvrTrackingSample) -> Void)?
+    /// Every decoded tracking packet, with or without poses, in arrival order.
+    public var onTrackingTimestamp: ((_ timestampNanoseconds: UInt64) -> Void)?
     public var onFrameSent: ((AlvrVideoSendReport) -> Void)?
     public var onAudioSent: ((AlvrAudioSendReport) -> Void)?
     public var onAudioDropped: (() -> Void)?
+    /// Called once when the USB TCP stream can no longer carry frames: a
+    /// write failed (for example Broken pipe after the Quest slept or ALVR
+    /// closed), the headset closed its end, or the framing broke. The
+    /// session owner must replace the whole ALVR session; `close()` does not
+    /// call it.
+    public var onTransportClosed: ((_ reason: String) -> Void)?
     public let transport: AlvrStreamTransport
-    /// The upper bound is deliberately several frame intervals: an IDR can be
-    /// much larger than a P-frame, but stale frames must not queue indefinitely.
-    static let tcpAccessUnitDeadlineNanoseconds: UInt64 = 50_000_000
+    /// How long a USB (TCP) write may make no progress at all before the
+    /// stream counts as dead. The adb USB link and the Quest's reader pause
+    /// for up to ~1.5 s in both directions while ALVR keeps rendering; such a
+    /// pause must only delay frames. Stale frames never queue meanwhile:
+    /// `send` keeps at most one frame waiting and drops new frames once the
+    /// write in flight is older than one frame period. Matches the control
+    /// connection's silence timeout, so the video path never gives up first.
+    public static let defaultTCPStallTimeoutNanoseconds =
+        AlvrSessionHandshakeResult.defaultReceiveTimeoutNanoseconds
+    private let tcpStallTimeoutNanoseconds: UInt64
     static let udpSendBufferBytes: Int32 = 64 * 1_024
     static let tcpSendBufferBytes: Int32 = 1 * 1_024 * 1_024
     static let tcpReceiveBufferBytes: Int32 = 1 * 1_024 * 1_024
@@ -325,19 +407,34 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
     private var nextHapticsPacketIndex: UInt32 = 0
     private var nextAudioPacketIndex: UInt32 = 0
     private let stateLock = NSLock()
-    private var sendInFlight = false
+    /// One frame period at 72 Hz, the Quest default, until the session
+    /// negotiates its refresh rate (`setInFlightBusyThreshold`).
+    public static let defaultInFlightBusyAfterNanoseconds: UInt64 =
+        AlvrVideoSendAdmission.busyAfterNanoseconds(refreshRate: 72)!
+    /// Guarded by `stateLock`.
+    private var videoAdmission: AlvrVideoSendAdmission
     private var audioSendInFlight = false
     private var lastCongestionRecovery = DispatchTime(uptimeNanoseconds: 0)
     private var latestTrackingTimestamp: UInt64?
     private var latestTrackingArrival = DispatchTime(uptimeNanoseconds: 0)
+    private var trackingArrivals = TrackingArrivalHistory()
     private var trackingReadyCallback: (() -> Void)?
     private var tcpReceiveBuffer = Data()
+    /// Only touched on `queue`.
+    private var trackingReassembler = AlvrTrackingReassembler()
     private var transportFailed = false
+    /// Only touched on `queue`, which also runs every write and read.
+    private var socketClosed = false
 
     public init(host: String, remotePort: UInt16 = defaultPort,
                 localPort: UInt16 = defaultPort,
-                transport: AlvrStreamTransport = .udp) throws {
+                transport: AlvrStreamTransport = .udp,
+                tcpStallTimeoutNanoseconds: UInt64 = defaultTCPStallTimeoutNanoseconds,
+                inFlightBusyAfterNanoseconds: UInt64 = defaultInFlightBusyAfterNanoseconds) throws {
         self.transport = transport
+        self.tcpStallTimeoutNanoseconds = tcpStallTimeoutNanoseconds
+        self.videoAdmission = AlvrVideoSendAdmission(
+            busyAfterNanoseconds: inFlightBusyAfterNanoseconds)
         let socketType = transport == .udp ? SOCK_DGRAM : SOCK_STREAM
         let fd = Darwin.socket(AF_INET, socketType, 0)
         guard fd >= 0 else { throw Self.socketError("video socket() failed") }
@@ -396,7 +493,9 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
             // unit. Wired ALVR is different: upstream requests the maximum OS
             // TCP buffers, and a 64 KiB buffer makes ordinary IDRs repeatedly
             // block. One MiB matches the Quest client's observed receive window;
-            // the whole-access-unit deadline below still bounds hidden delay.
+            // `send` keeps at most one access unit waiting behind the one in
+            // flight, which bounds hidden delay while the headset is slow to
+            // read.
             var sendBufferSize = transport == .tcp
                 ? Self.tcpSendBufferBytes : Self.udpSendBufferBytes
             setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sendBufferSize,
@@ -419,61 +518,118 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
             source.resume()
             readSource = source
         } catch {
-            close(fd)
+            Darwin.close(fd)
             throw error
         }
     }
 
     deinit {
-        readSource?.cancel()
         if DispatchQueue.getSpecific(key: queueKey) != nil {
-            close(socket)
+            closeSocket()
         } else {
-            _ = queue.sync { close(socket) }
+            queue.sync { closeSocket() }
         }
+    }
+
+    /// Closes the stream socket now, so a replacement session can bind the
+    /// same UDP port. Idempotent; queued writes become no-ops and later
+    /// sends report a drop. A write waiting on a paused USB stream notices
+    /// within one poll interval. Does not call `onTransportClosed`.
+    public func close() {
+        stateLock.lock()
+        transportFailed = true
+        stateLock.unlock()
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            closeSocket()
+        } else {
+            queue.sync { closeSocket() }
+        }
+    }
+
+    private func closeSocket() {
+        guard !socketClosed else { return }
+        socketClosed = true
+        readSource?.cancel()
+        readSource = nil
+        Darwin.close(socket)
+    }
+
+    /// Makes a write in flight count as busy after one frame period at
+    /// `hertz`, the negotiated headset refresh rate. Returns false (and keeps
+    /// the previous threshold) for a rate outside 30-240 Hz.
+    @discardableResult
+    public func setInFlightBusyThreshold(refreshRate hertz: Float) -> Bool {
+        guard let threshold = AlvrVideoSendAdmission.busyAfterNanoseconds(
+            refreshRate: hertz) else { return false }
+        stateLock.lock()
+        videoAdmission.busyAfterNanoseconds = threshold
+        stateLock.unlock()
+        return true
+    }
+
+    /// True when `send` would drop a frame handed to it now: the write in
+    /// flight has run longer than one frame period (for example a paused
+    /// USB link), a frame already waits behind it, or the transport failed.
+    /// A write that started moments ago does not count: the next frame waits
+    /// behind it. Callers skip *encoding* a frame while busy, which keeps
+    /// the H.264 reference chain intact (see `VideoLossRecoveryGate`).
+    public var isBusy: Bool {
+        let now = DispatchTime.now().uptimeNanoseconds
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return transportFailed || videoAdmission.wouldDrop(now: now)
     }
 
     @discardableResult
     public func send(annexB: Data, timestampNanoseconds: UInt64, isIDR: Bool) -> Bool {
         stateLock.lock()
-        guard !sendInFlight, !transportFailed else {
+        guard !transportFailed,
+              videoAdmission.admit(now: DispatchTime.now().uptimeNanoseconds) else {
             stateLock.unlock()
             onFrameDropped?()
             return false
         }
-        sendInFlight = true
         stateLock.unlock()
         queue.async { [self] in
             defer {
+                let now = DispatchTime.now().uptimeNanoseconds
                 stateLock.lock()
-                sendInFlight = false
+                videoAdmission.complete(now: now)
                 stateLock.unlock()
             }
+            // A frame that waited behind a write that failed the transport.
+            guard !socketClosed, !isTransportFailed else { return }
             do {
                 let startedAt = DispatchTime.now().uptimeNanoseconds
-                let deadline = startedAt &+ Self.tcpAccessUnitDeadlineNanoseconds
                 let shards = try AlvrVideoPacketizer.shards(
                     annexB: annexB, timestampNanoseconds: timestampNanoseconds,
                     isIDR: isIDR, packetIndex: nextPacketIndex)
                 nextPacketIndex &+= 1
                 var wireBytes = 0
                 for shard in shards {
-                    guard try sendShard(shard, deadline: deadline) else { return }
+                    guard try sendShard(shard) else { return }
                     wireBytes += shard.count
                 }
-                let duration = DispatchTime.now().uptimeNanoseconds &- startedAt
+                let finishedAt = DispatchTime.now().uptimeNanoseconds
+                let duration = finishedAt &- startedAt
+                stateLock.lock()
+                let arrival = trackingArrivals.arrival(ofTimestamp: timestampNanoseconds)
+                stateLock.unlock()
                 onFrameSent?(AlvrVideoSendReport(
                     timestampNanoseconds: timestampNanoseconds,
                     accessUnitBytes: annexB.count,
                     wireBytes: wireBytes,
                     shardCount: shards.count,
                     isIDR: isIDR,
-                    durationNanoseconds: duration))
+                    durationNanoseconds: duration,
+                    trackingAgeNanoseconds: arrival.map {
+                        finishedAt >= $0 ? finishedAt - $0 : 0
+                    }))
             } catch {
-                if transport == .tcp {
-                    failTCPTransport()
-                }
                 onError?(error)
+                if transport == .tcp {
+                    failTCPTransport(reason: error.localizedDescription)
+                }
             }
         }
         return true
@@ -486,18 +642,16 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
                 stateLock.lock()
                 let failed = transportFailed
                 stateLock.unlock()
-                guard !failed else { return }
+                guard !failed, !socketClosed else { return }
                 let packet = try AlvrHapticsPacketizer.packet(
                     hand: hand, durationNanoseconds: durationNanoseconds,
                     frequency: frequency, amplitude: amplitude,
                     packetIndex: nextHapticsPacketIndex)
                 nextHapticsPacketIndex &+= 1
-                let deadline = DispatchTime.now().uptimeNanoseconds
-                    &+ Self.tcpAccessUnitDeadlineNanoseconds
-                _ = try sendShard(packet, deadline: deadline, reportsVideoCongestion: false)
+                _ = try sendShard(packet, reportsVideoCongestion: false)
             } catch {
-                if transport == .tcp { failTCPTransport() }
                 onError?(error)
+                if transport == .tcp { failTCPTransport(reason: error.localizedDescription) }
             }
         }
     }
@@ -521,18 +675,16 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
                 audioSendInFlight = false
                 stateLock.unlock()
             }
+            guard !socketClosed else { return }
             do {
                 let startedAt = DispatchTime.now().uptimeNanoseconds
-                let deadline = startedAt
-                    &+ Self.tcpAccessUnitDeadlineNanoseconds
                 let shards = try AlvrAudioPacketizer.shards(
                     pcm16Stereo: pcm16Stereo, packetIndex: nextAudioPacketIndex)
                 nextAudioPacketIndex &+= 1
                 var wireBytes = 0
                 for shard in shards {
                     guard try sendShard(
-                        shard, deadline: deadline,
-                        reportsVideoCongestion: false) else {
+                        shard, reportsVideoCongestion: false) else {
                         onAudioDropped?()
                         return
                     }
@@ -544,8 +696,8 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
                     durationNanoseconds:
                         DispatchTime.now().uptimeNanoseconds &- startedAt))
             } catch {
-                if transport == .tcp { failTCPTransport() }
                 onError?(error)
+                if transport == .tcp { failTCPTransport(reason: error.localizedDescription) }
             }
         }
         return true
@@ -575,13 +727,14 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
     }
 
     private func drainUplink() {
+        guard !socketClosed else { return }
         var buffer = [UInt8](repeating: 0, count: transport == .tcp ? 64 * 1024 : 2_048)
         while true {
             let count = recv(socket, &buffer, buffer.count, 0)
             if count > 0 {
                 if transport == .tcp {
                     tcpReceiveBuffer.append(contentsOf: buffer[0..<count])
-                    drainTCPFrames()
+                    guard drainTCPFrames() else { return }
                 } else {
                     handleUplink(Data(buffer[0..<count]))
                 }
@@ -589,48 +742,76 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
                 continue
             } else if count < 0, errno == EAGAIN || errno == EWOULDBLOCK {
                 return
+            } else if transport == .tcp {
+                // EOF stays readable, so returning here would spin the read
+                // source. The headset end is gone: ALVR closed or paused (the
+                // Quest slept), or the cable was pulled.
+                failTCPTransport(reason: count == 0
+                    ? "the headset closed the USB stream"
+                    : "USB stream read failed: \(String(cString: strerror(errno)))")
+                return
             } else {
+                // A connected UDP socket reports ICMP errors (for example
+                // ECONNREFUSED while the client restarts) here. The control
+                // connection decides when a Wi-Fi session is gone.
                 return
             }
         }
     }
 
-    private func drainTCPFrames() {
+    /// Returns false once the stream framing is broken and the transport
+    /// has been failed.
+    private func drainTCPFrames() -> Bool {
         while tcpReceiveBuffer.count >= 4 {
             let prefix = tcpReceiveBuffer.prefix(4)
             let payloadLength = prefix.reduce(0) { ($0 << 8) | Int($1) }
             let packetLength = payloadLength + 4
             guard packetLength >= 18, packetLength <= 4 * 1_024 * 1_024 else {
-                stateLock.lock()
-                transportFailed = true
-                stateLock.unlock()
-                onError?(BasaltError("Invalid ALVR TCP stream packet length \(packetLength)"))
-                readSource?.cancel()
-                return
+                let error = BasaltError("Invalid ALVR TCP stream packet length \(packetLength)")
+                tcpReceiveBuffer.removeAll()
+                onError?(error)
+                failTCPTransport(reason: error.localizedDescription)
+                return false
             }
-            guard tcpReceiveBuffer.count >= packetLength else { return }
+            guard tcpReceiveBuffer.count >= packetLength else { return true }
             let packet = Data(tcpReceiveBuffer.prefix(packetLength))
             tcpReceiveBuffer.removeFirst(packetLength)
             handleUplink(packet)
         }
+        return true
     }
 
     private func handleUplink(_ data: Data) {
+        // Tracking (stream 0) packets with hand skeletons span shards; join
+        // them for the full sample. Shard 0 alone still feeds the head pose
+        // below without waiting.
+        let bytes = [UInt8](data)
+        var sample: AlvrTrackingSample?
+        if bytes.count >= 18, bytes[4] == 0, bytes[5] == 0,
+           Int((0..<4).reduce(UInt32(0)) { ($0 << 8) | UInt32(bytes[$1]) }) + 4 == bytes.count,
+           let body = trackingReassembler.add(bytes) {
+            sample = try? AlvrTrackingDecoder.decode(body)
+        }
+        handleUplinkHeader(data)
+        if let sample { onTrackingSample?(sample) }
+    }
+
+    private func handleUplinkHeader(_ data: Data) {
         guard let packet = try? AlvrUplinkPacketDecoder.decode(data) else { return }
         switch packet {
-        case .tracking(let timestamp, let headPose, let leftController,
-                       let rightController, let controllerMask):
+        case .tracking(let timestamp, let headPose, _, _, _):
             stateLock.lock()
             let isFirstTrackingPacket = latestTrackingTimestamp == nil
             latestTrackingTimestamp = timestamp
             latestTrackingArrival = .now()
+            trackingArrivals.record(
+                timestampNanoseconds: timestamp,
+                arrivalNanoseconds: latestTrackingArrival.uptimeNanoseconds)
             let callback = trackingReadyCallback
             stateLock.unlock()
             if isFirstTrackingPacket { callback?() }
+            onTrackingTimestamp?(timestamp)
             if let headPose { onHeadPose?(timestamp, headPose) }
-            if let leftController { onControllerMotion?(timestamp, .left, leftController) }
-            if let rightController { onControllerMotion?(timestamp, .right, rightController) }
-            onControllerMask?(timestamp, controllerMask)
         case .statistics(let statistics):
             onStatistics?(statistics)
         case .other:
@@ -641,8 +822,14 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
     /// UDP packets are atomic and can be discarded before entering a hidden
     /// queue. TCP packets must be written completely because abandoning a
     /// partial length-framed shard would desynchronize the whole USB stream.
-    private func sendShard(_ shard: Data, deadline: UInt64,
+    /// While the headset is not reading, the wait keeps draining the uplink
+    /// (this queue's other job), so tracking and statistics still reach the
+    /// runtime. Returns false when the transport was closed or failed during
+    /// the wait; throws only after `tcpStallTimeoutNanoseconds` with no
+    /// progress, or on a socket error.
+    private func sendShard(_ shard: Data,
                            reportsVideoCongestion: Bool = true) throws -> Bool {
+        guard !socketClosed else { return false }
         if transport == .udp {
             let count = shard.withUnsafeBytes {
                 Darwin.send(socket, $0.baseAddress, shard.count, 0)
@@ -658,27 +845,33 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
         }
 
         var offset = 0
+        var lastProgress = DispatchTime.now().uptimeNanoseconds
         while offset < shard.count {
-            guard DispatchTime.now().uptimeNanoseconds < deadline else {
-                throw BasaltError("Timed out writing one ALVR USB video access unit")
-            }
+            guard !socketClosed, !isTransportFailed else { return false }
             let count = shard.withUnsafeBytes {
                 Darwin.send(socket, $0.baseAddress!.advanced(by: offset), shard.count - offset, 0)
             }
             if count > 0 {
                 offset += count
+                lastProgress = DispatchTime.now().uptimeNanoseconds
                 continue
             }
             if count < 0, errno == EINTR { continue }
             if count < 0, errno == EAGAIN || errno == EWOULDBLOCK {
-                let remaining = deadline > DispatchTime.now().uptimeNanoseconds
-                    ? deadline - DispatchTime.now().uptimeNanoseconds : 0
-                guard remaining > 0 else {
-                    throw BasaltError("Timed out writing one ALVR USB video access unit")
+                let stalled = DispatchTime.now().uptimeNanoseconds &- lastProgress
+                guard stalled < tcpStallTimeoutNanoseconds else {
+                    throw BasaltError(String(
+                        format: "ALVR USB stream stalled: the headset read nothing for %.1f s",
+                        Double(stalled) / 1e9))
                 }
-                var descriptor = pollfd(fd: socket, events: Int16(POLLOUT), revents: 0)
+                let remaining = tcpStallTimeoutNanoseconds - stalled
+                var descriptor = pollfd(
+                    fd: socket, events: Int16(POLLOUT | POLLIN), revents: 0)
                 let milliseconds = Int32(max(1, min(50, remaining / 1_000_000)))
                 guard poll(&descriptor, 1, milliseconds) > 0 else { continue }
+                if descriptor.revents & Int16(POLLIN) != 0 {
+                    drainUplink()
+                }
                 continue
             }
             throw Self.socketError("Failed writing ALVR USB video stream")
@@ -686,17 +879,29 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
         return true
     }
 
+    private var isTransportFailed: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return transportFailed
+    }
+
     /// TCP cannot recover after even one partially written shard: continuing
     /// would make the peer parse later bytes as the missing payload. Shutdown
-    /// wakes the read source and guarantees this connection is never reused.
-    private func failTCPTransport() {
+    /// guarantees this connection is never reused. The owner is told once so
+    /// it can replace the whole ALVR session instead of dropping every later
+    /// frame as "network busy". Runs on `queue`.
+    private func failTCPTransport(reason: String) {
         stateLock.lock()
         let wasFailed = transportFailed
         transportFailed = true
         stateLock.unlock()
         guard !wasFailed else { return }
-        Darwin.shutdown(socket, SHUT_RDWR)
-        readSource?.cancel()
+        if !socketClosed {
+            Darwin.shutdown(socket, SHUT_RDWR)
+            readSource?.cancel()
+            readSource = nil
+        }
+        onTransportClosed?(reason)
     }
 
     private func reportCongestion() {
@@ -720,8 +925,13 @@ public final class AlvrVideoStreamRouter: @unchecked Sendable {
     private let lock = NSLock()
     private var sender: AlvrVideoStreamSender?
     private var controlSession: AlvrSessionHandshakeResult?
+    /// The codec of every access unit passed to `send`; it selects the
+    /// parameter-set NAL types and the `DecoderConfig` codec field.
+    public let codec: VideoCodec
 
-    public init() {}
+    public init(codec: VideoCodec = .h264) {
+        self.codec = codec
+    }
 
     public func install(_ sender: AlvrVideoStreamSender,
                         controlSession: AlvrSessionHandshakeResult) {
@@ -731,21 +941,71 @@ public final class AlvrVideoStreamRouter: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Detaches `sender` if it is still the installed stream, so media
+    /// callbacks stop reaching a dead ALVR session. Returns whether it was.
+    @discardableResult
+    public func uninstall(_ sender: AlvrVideoStreamSender) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.sender === sender else { return false }
+        self.sender = nil
+        controlSession = nil
+        return true
+    }
+
+    /// True while an ALVR client session is installed. Without one, video
+    /// work is wasted, so callers can drop frames before composing them.
+    public var hasStream: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return sender != nil
+    }
+
+    /// The newest fresh Quest tracking timestamp of the installed stream.
+    public func timestampForVideoFrame() -> UInt64? {
+        lock.lock()
+        let sender = self.sender
+        lock.unlock()
+        return sender?.timestampForVideoFrame()
+    }
+
+    /// True when an installed stream would drop a frame submitted now: its
+    /// write in flight is older than one frame period, the transport failed,
+    /// or (desktop frames, which
+    /// take the newest tracking timestamp) no fresh timestamp exists. False
+    /// without a stream.
+    public func isBusy(requiringTrackingTimestamp: Bool) -> Bool {
+        lock.lock()
+        let sender = self.sender
+        lock.unlock()
+        guard let sender else { return false }
+        return sender.isBusy
+            || (requiringTrackingTimestamp && sender.timestampForVideoFrame() == nil)
+    }
+
     /// Runtime frames supply the exact Quest tracking timestamp used to
     /// locate that frame. Desktop frames omit it and retain the original
     /// behavior of sampling the newest tracking timestamp at send time.
+    ///
+    /// Returns false when a stream is installed but the frame did not reach
+    /// it (no tracking timestamp, or the sender dropped it): the headset's
+    /// reference chain is then broken. True when it was handed over, or when
+    /// no stream is installed.
+    @discardableResult
     public func send(annexB: Data, isIDR: Bool,
-                     timestampNanoseconds suppliedTimestamp: UInt64? = nil) {
+                     timestampNanoseconds suppliedTimestamp: UInt64? = nil) -> Bool {
         lock.lock()
         let sender = self.sender
         let controlSession = self.controlSession
         lock.unlock()
-        if isIDR, let parameterSets = H264ParameterSets.extract(from: annexB) {
-            controlSession?.sendH264DecoderConfig(parameterSets)
+        if isIDR, let parameterSets = VideoParameterSets.extract(from: annexB, codec: codec) {
+            controlSession?.sendDecoderConfig(parameterSets, codec: codec)
         }
-        guard let sender,
-              let timestamp = suppliedTimestamp ?? sender.timestampForVideoFrame() else { return }
-        sender.send(annexB: annexB, timestampNanoseconds: timestamp, isIDR: isIDR)
+        guard let sender else { return true }
+        guard let timestamp = suppliedTimestamp ?? sender.timestampForVideoFrame() else {
+            return false
+        }
+        return sender.send(annexB: annexB, timestampNanoseconds: timestamp, isIDR: isIDR)
     }
 
     @discardableResult
@@ -761,6 +1021,19 @@ public enum H264ParameterSets {
     /// Extracts SPS (type 7) and PPS (type 8) NAL units, preserving Annex-B
     /// start codes for ALVR's MediaCodec initialization buffer.
     public static func extract(from annexB: Data) -> Data? {
+        VideoParameterSets.extract(from: annexB, codec: .h264)
+    }
+}
+
+public enum VideoParameterSets {
+    /// Extracts the parameter-set NAL units of an IDR access unit — SPS and
+    /// PPS (H.264 types 7, 8) or VPS, SPS, and PPS (HEVC types 32, 33, 34) —
+    /// with 4-byte Annex-B start codes, in stream order. This is ALVR's
+    /// `DecoderConfig` buffer: the Quest passes it to MediaCodec as `csd-0`
+    /// (`client_core/src/video_decoder/android.rs`), and the stock server
+    /// sends the same leading VPS+SPS+PPS (H.264: SPS+PPS) NAL units
+    /// (`server_openvr/cpp/alvr_server/NalParsing.cpp`).
+    public static func extract(from annexB: Data, codec: VideoCodec) -> Data? {
         let bytes = [UInt8](annexB)
         var starts = [(offset: Int, codeLength: Int)]()
         var index = 0
@@ -782,8 +1055,8 @@ public enum H264ParameterSets {
             let naluStart = start.offset + start.codeLength
             let naluEnd = position + 1 < starts.count ? starts[position + 1].offset : bytes.count
             guard naluStart < naluEnd else { continue }
-            let type = bytes[naluStart] & 0x1F
-            guard type == 7 || type == 8 else { continue }
+            let type = codec.nalUnitType(headerByte: bytes[naluStart])
+            guard codec.parameterSetNALTypes.contains(type) else { continue }
             result.append(contentsOf: [0, 0, 0, 1])
             result.append(contentsOf: bytes[naluStart..<naluEnd])
         }

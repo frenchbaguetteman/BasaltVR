@@ -175,6 +175,17 @@ final class BottleManagerTests: XCTestCase {
             environment: ["KEY": "VALUE"])
         XCTAssertEqual(try decoder.decode(
             LaunchProfile.self, from: encoder.encode(profile)), profile)
+
+        // gameRoot is optional: profiles saved before it existed still load.
+        let legacy = Data("""
+            {"formatVersion":1,"name":"lab","bottleName":"test","source":"steam",\
+            "executable":"C:\\\\Lab.exe","arguments":[],"environment":{}}
+            """.utf8)
+        XCTAssertNil(try decoder.decode(LaunchProfile.self, from: legacy).gameRoot)
+        var rooted = profile
+        rooted.gameRoot = #"C:\Program Files (x86)\Steam\steamapps\common\The Lab"#
+        XCTAssertEqual(try decoder.decode(
+            LaunchProfile.self, from: encoder.encode(rooted)).gameRoot, rooted.gameRoot)
     }
 
     func testProfileAndOpenCompositeInstallStayInsideManagedPrefix() throws {
@@ -236,6 +247,9 @@ final class BottleManagerTests: XCTestCase {
         let configuration = try String(contentsOf:
             target.deletingLastPathComponent().appendingPathComponent("opencomposite.ini"))
         XCTAssertTrue(configuration.contains("initUsingVulkan=false"))
+        // The openxr branch of OpenComposite aborts on unknown options such as enableAudio.
+        XCTAssertFalse(configuration.contains("enableAudio"))
+        XCTAssertFalse(configuration.contains("invertUsingShaders"))
 
         let escaped = temporary.appendingPathComponent("openvr_api.dll")
         XCTAssertThrowsError(try manager.installOpenComposite(
@@ -250,6 +264,141 @@ final class BottleManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.installOpenComposite(
             profileName: profile.name, artifact: artifact,
             targetDLL: redirect.appendingPathComponent("openvr_api.dll")))
+    }
+
+    func testOpenCompositeConfigurationPresetsMatchOpenCompositeParser() throws {
+        XCTAssertEqual(OpenCompositeConfiguration.standard.iniText, """
+            ; Managed by BasaltVR. OpenComposite remains a separately built GPLv3 artifact.
+            initUsingVulkan=false
+
+            """)
+        XCTAssertEqual(OpenCompositeConfiguration.alyx.iniText, """
+            ; Managed by BasaltVR. OpenComposite remains a separately built GPLv3 artifact.
+            initUsingVulkan=false
+            invertUsingShaders=true
+
+            """)
+
+        var configuration = OpenCompositeConfiguration(preset: .alyx)
+        try configuration.apply("supersampleRatio=1.25")
+        try configuration.apply("invertUsingShaders=off")
+        try configuration.set("handColour", to: "#FF8800")
+        XCTAssertEqual(configuration.options.map(\.key), [
+            "initUsingVulkan", "invertUsingShaders", "supersampleRatio", "handColour",
+        ])
+        XCTAssertEqual(configuration.value(for: "invertUsingShaders"), "off")
+        XCTAssertTrue(configuration.iniText.contains("\nsupersampleRatio=1.25\n"))
+
+        for invalid in [
+            "enableAudio=false", "invertUsingShaders=yes", "supersampleRatio=fast",
+            "supersampleRatio=1.0\ninitUsingVulkan=true", "supersampleRatio=inf",
+            "handColour=#ff88", "handColour=orange", "initUsingVulkan", "=true",
+            "InitUsingVulkan=false",
+        ] {
+            XCTAssertThrowsError(try configuration.apply(invalid), invalid)
+        }
+        XCTAssertEqual(OpenCompositeConfiguration.Preset(rawValue: "default"), .standard)
+        XCTAssertEqual(OpenCompositeConfiguration.Preset(rawValue: "alyx"), .alyx)
+    }
+
+    func testOpenCompositeProxyInstallPlacesBothDLLsAndPresetConfiguration() throws {
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "BasaltOpenVRProxy-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: temporary) }
+        let root = temporary.appendingPathComponent("data", isDirectory: true)
+        let directory = root.appendingPathComponent("Bottles/Test", isDirectory: true)
+        let prefix = directory.appendingPathComponent("prefix", isDirectory: true)
+        let engineRoot = directory.appendingPathComponent("engine", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: engineRoot.appendingPathComponent("bin"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: prefix, withIntermediateDirectories: true)
+        let engine = BottleEngine(
+            id: "test-pinned", kind: .pinned,
+            wineBinary: engineRoot.appendingPathComponent("bin/wine"),
+            wineserverBinary: engineRoot.appendingPathComponent("bin/wineserver"),
+            root: engineRoot, supportsBasaltDXMT: true)
+        let bottle = ManagedBottle(
+            name: "Test", engine: engine, prefix: prefix, engineRoot: engineRoot,
+            wineBinary: engineRoot.appendingPathComponent("bin/wine"))
+        let metadataEncoder = JSONEncoder()
+        metadataEncoder.dateEncodingStrategy = .iso8601
+        try metadataEncoder.encode(bottle).write(
+            to: directory.appendingPathComponent("bottle.json"))
+        let manager = BottleManager(
+            root: root, repoRoot: temporary.appendingPathComponent("repo"))
+        try manager.saveProfile(LaunchProfile(
+            name: "alyx", bottleName: "Test", source: .steam,
+            executable: #"C:\Games\Half-Life Alyx\game\bin\win64\hlvr.exe"#))
+
+        func peImage(machine: UInt16, marker: UInt8) -> Data {
+            var image = [UInt8](repeating: 0, count: 0x48)
+            image[0] = 0x4d
+            image[1] = 0x5a
+            image[0x3c] = 0x40
+            image[0x40] = 0x50
+            image[0x41] = 0x45
+            image[0x44] = UInt8(machine & 0xff)
+            image[0x45] = UInt8(machine >> 8)
+            image[0x47] = marker
+            return Data(image)
+        }
+        let openComposite = temporary.appendingPathComponent("openvr_api_opencomposite.dll")
+        let proxy = temporary.appendingPathComponent("proxy-openvr_api.dll")
+        let proxy32 = temporary.appendingPathComponent("proxy32-openvr_api.dll")
+        let notPE = temporary.appendingPathComponent("not-pe.dll")
+        try peImage(machine: 0x8664, marker: 1).write(to: openComposite)
+        try peImage(machine: 0x8664, marker: 2).write(to: proxy)
+        try peImage(machine: 0x014c, marker: 3).write(to: proxy32)
+        try Data([0x4d, 0x5a, 0x01]).write(to: notPE)
+        XCTAssertEqual(BottleManager.peMachine(try Data(contentsOf: proxy)), 0x8664)
+        XCTAssertNil(BottleManager.peMachine(try Data(contentsOf: notPE)))
+
+        let binDirectory = prefix.appendingPathComponent(
+            "drive_c/Games/Half-Life Alyx/game/bin/win64", isDirectory: true)
+        let target = binDirectory.appendingPathComponent("openvr_api.dll")
+        let proxied = binDirectory.appendingPathComponent("openvr_api_opencomposite.dll")
+        let ini = binDirectory.appendingPathComponent("opencomposite.ini")
+        try FileManager.default.createDirectory(
+            at: binDirectory, withIntermediateDirectories: true)
+        let valveOriginal = Data([0x4d, 0x5a, 0x56])
+        try valveOriginal.write(to: target)
+
+        XCTAssertThrowsError(try manager.installOpenComposite(
+            profileName: "alyx", artifact: openComposite, targetDLL: target,
+            proxy: proxy32, configuration: .alyx))
+        XCTAssertThrowsError(try manager.installOpenComposite(
+            profileName: "alyx", artifact: openComposite, targetDLL: target,
+            proxy: notPE, configuration: .alyx))
+        XCTAssertThrowsError(try manager.installOpenComposite(
+            profileName: "alyx", artifact: notPE, targetDLL: target,
+            proxy: proxy, configuration: .alyx))
+        XCTAssertEqual(try Data(contentsOf: target), valveOriginal)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: proxied.path))
+
+        XCTAssertEqual(try manager.installOpenComposite(
+            profileName: "alyx", artifact: openComposite, targetDLL: target,
+            proxy: proxy, configuration: .alyx), target.standardizedFileURL)
+        XCTAssertEqual(try Data(contentsOf: target), try Data(contentsOf: proxy))
+        XCTAssertEqual(try Data(contentsOf: proxied), try Data(contentsOf: openComposite))
+        XCTAssertEqual(
+            try Data(contentsOf: target.appendingPathExtension("basalt-original")),
+            valveOriginal)
+        XCTAssertEqual(try String(contentsOf: ini), OpenCompositeConfiguration.alyx.iniText)
+
+        // Reinstalling keeps Valve's DLL as the backup, not the proxy.
+        _ = try manager.installOpenComposite(
+            profileName: "alyx", artifact: openComposite, targetDLL: target,
+            proxy: proxy, configuration: .alyx)
+        XCTAssertEqual(
+            try Data(contentsOf: target.appendingPathExtension("basalt-original")),
+            valveOriginal)
+
+        // A plain install replaces the proxy and removes the forwarded copy.
+        _ = try manager.installOpenComposite(
+            profileName: "alyx", artifact: openComposite, targetDLL: target)
+        XCTAssertEqual(try Data(contentsOf: target), try Data(contentsOf: openComposite))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: proxied.path))
+        XCTAssertEqual(try String(contentsOf: ini), OpenCompositeConfiguration.standard.iniText)
     }
 
     func testProfileLaunchCommandIsValidatedAndResolvedForGUIOwnership() throws {
@@ -335,7 +484,15 @@ final class BottleManagerTests: XCTestCase {
         try Data([0x4d, 0x5a]).write(to: beatSaber)
         try Data([0x4d, 0x5a]).write(to: steam)
         let originalHelper = Data([0x4d, 0x5a, 0x10])
-        let compatibilityShim = Data([0x4d, 0x5a, 0x20])
+        func shimBytes(_ build: UInt8) -> Data {
+            var data = Data([0x4d, 0x5a, build])
+            for unit in "steamwebhelper.basalt-original.exe".utf16 {
+                data.append(UInt8(unit & 0xff))
+                data.append(UInt8(unit >> 8))
+            }
+            return data
+        }
+        let compatibilityShim = shimBytes(0x20)
         try originalHelper.write(to: webHelper)
         try compatibilityShim.write(to: compatibilityArtifact)
         try FileManager.default.setAttributes(
@@ -373,6 +530,21 @@ final class BottleManagerTests: XCTestCase {
         XCTAssertEqual(command.environment["SteamAppId"], "620980")
         XCTAssertEqual(command.environment["SteamGameId"], "620980")
 
+        // The plain Steam client profile is the session's Steam itself, so it
+        // starts with the bootstrap flags (no checksum repair of the web helper
+        // shim) and with this session's runtime control path.
+        try manager.saveProfile(LaunchProfile(
+            name: "steam", bottleName: "Steam", source: .steam,
+            executable: #"C:\Program Files (x86)\Steam\steam.exe"#,
+            arguments: ["-cef-disable-gpu-compositing"]))
+        let client = try manager.profileLaunchCommand("steam", controlFile: control)
+        XCTAssertEqual(client.arguments, [
+            #"C:\Program Files (x86)\Steam\steam.exe"#,
+            "-inhibitbootstrap", "-noverifyfiles", "-no-cef-sandbox",
+            "-cef-disable-gpu-compositing",
+        ])
+        XCTAssertEqual(client.environment["BASALT_CONTROL"], command.environment["BASALT_CONTROL"])
+
         XCTAssertEqual(
             try manager.installSteamWebHelperCompatibility(forProfile: "beat-saber"),
             webHelper)
@@ -388,6 +560,23 @@ final class BottleManagerTests: XCTestCase {
         _ = try manager.installSteamWebHelperCompatibility(forProfile: "beat-saber")
         XCTAssertEqual(try Data(contentsOf: webHelper), compatibilityShim)
         XCTAssertEqual(try Data(contentsOf: preservedHelper), updatedHelper)
+
+        // A shim from another Basalt build (another checkout or worktree) is
+        // installed. It must be replaced, never preserved as the original:
+        // a preserved shim launches itself without end (a process storm).
+        let otherBuildShim = shimBytes(0x21)
+        try otherBuildShim.write(to: webHelper)
+        _ = try manager.installSteamWebHelperCompatibility(forProfile: "beat-saber")
+        XCTAssertEqual(try Data(contentsOf: webHelper), compatibilityShim)
+        XCTAssertEqual(try Data(contentsOf: preservedHelper), updatedHelper)
+
+        // A preserved "original" that is a shim (left by an older Basalt) is
+        // refused, and the installed helper is not touched.
+        try otherBuildShim.write(to: preservedHelper)
+        XCTAssertThrowsError(
+            try manager.installSteamWebHelperCompatibility(forProfile: "beat-saber"))
+        XCTAssertEqual(try Data(contentsOf: webHelper), compatibilityShim)
+        try updatedHelper.write(to: preservedHelper)
 
         let bootstrap = try XCTUnwrap(
             manager.steamBootstrapCommand(forProfile: "beat-saber"))
@@ -425,6 +614,70 @@ final class BottleManagerTests: XCTestCase {
                 forProfile: "bsmanager-instance"),
             prefix.appendingPathComponent(
                 "drive_c/Program Files (x86)/Steam/logs/connection_log.txt"))
+    }
+
+    func testBottleSteamLaunchInstallsShimAndUsesBasaltFlags() throws {
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "BasaltBottleSteam-\(UUID().uuidString)", isDirectory: true)
+        let root = temporary.appendingPathComponent("data", isDirectory: true)
+        let directory = root.appendingPathComponent("Bottles/Steam", isDirectory: true)
+        let prefix = directory.appendingPathComponent("prefix", isDirectory: true)
+        let engineRoot = directory.appendingPathComponent("engine", isDirectory: true)
+        let wine = engineRoot.appendingPathComponent("bin/wine")
+        let steam = prefix.appendingPathComponent(
+            "drive_c/Program Files (x86)/Steam/steam.exe")
+        let webHelper = prefix.appendingPathComponent(
+            "drive_c/Program Files (x86)/Steam/bin/cef/cef.win64/steamwebhelper.exe")
+        let compatibilityArtifact = temporary.appendingPathComponent(
+            "runtime/build/bin/steamwebhelper_compat.exe")
+        for url in [wine, webHelper, compatibilityArtifact] {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        }
+        try Data("#!/bin/sh\n".utf8).write(to: wine)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: wine.path)
+        try Data([0x4d, 0x5a]).write(to: steam)
+        let originalHelper = Data([0x4d, 0x5a, 0x10])
+        var compatibilityShim = Data([0x4d, 0x5a, 0x20])
+        for unit in "steamwebhelper.basalt-original.exe".utf16 {
+            compatibilityShim.append(UInt8(unit & 0xff))
+            compatibilityShim.append(UInt8(unit >> 8))
+        }
+        try originalHelper.write(to: webHelper)
+        try compatibilityShim.write(to: compatibilityArtifact)
+        addTeardownBlock { try? FileManager.default.removeItem(at: temporary) }
+
+        let engine = BottleEngine(
+            id: "test-pinned", kind: .pinned, wineBinary: wine,
+            wineserverBinary: engineRoot.appendingPathComponent("bin/wineserver"),
+            root: engineRoot, supportsBasaltDXMT: true)
+        let bottle = ManagedBottle(
+            name: "Steam", engine: engine, prefix: prefix,
+            engineRoot: engineRoot, wineBinary: wine)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(bottle).write(to: directory.appendingPathComponent("bottle.json"))
+        let manager = BottleManager(root: root, repoRoot: temporary)
+
+        // The Bottles page starts Steam without a launch profile. It must take
+        // the same path as a profile launch: shim first, then the Basalt flags.
+        XCTAssertEqual(
+            try manager.installSteamWebHelperCompatibility(bottleName: "Steam"),
+            webHelper)
+        XCTAssertEqual(try Data(contentsOf: webHelper), compatibilityShim)
+        XCTAssertEqual(
+            try Data(contentsOf: webHelper.deletingPathExtension()
+                .appendingPathExtension("basalt-original.exe")),
+            originalHelper)
+
+        let bootstrap = try manager.steamBootstrapCommand(bottleName: "Steam")
+        XCTAssertEqual(bootstrap.executable, wine.standardizedFileURL)
+        XCTAssertEqual(bootstrap.arguments, [
+            #"C:\Program Files (x86)\Steam\steam.exe"#,
+            "-inhibitbootstrap", "-noverifyfiles", "-no-cef-sandbox",
+        ])
+        XCTAssertEqual(bootstrap.currentDirectory, steam.deletingLastPathComponent())
     }
 
     func testImportsExternalPrefixIntoIsolatedManagedCopy() throws {

@@ -16,6 +16,8 @@ VR games under Wine and streams them to a Quest headset over ALVR.
 > requires developer tooling. Do not treat milestone passes as a broad compatibility guarantee.
 
 **Tested with:** Steam Beat Saber and BSManager on an M3 Max, streaming to a Quest 3 with ALVR.
+Valve's The Lab (OpenVR, through OpenComposite) on an M3 Pro with a Quest 3 over USB and Wi-Fi.
+See [compatibility](docs/COMPATIBILITY.md) for the exact setups and what is not yet tested.
 
 ## How it works
 
@@ -101,7 +103,8 @@ additionally needs `brew install cmake mingw-w64`.
 ```sh
 make doctor          # check the local toolchain
 make check           # the same quality gate CI runs
-make app             # build everything and run the management app
+make app             # build BasaltVR.app and install it to ~/Applications
+make run-app         # run the management app from source
 ```
 
 | Command | What it does |
@@ -122,7 +125,7 @@ pull request.
 | [`streamer/`](streamer) | Swift package: `basalt-streamer` (encode + ALVR transport), `basaltctl` (bottles and profiles), and the `BasaltVR` manager app |
 | [`runtime/`](runtime) | The Windows OpenXR runtime (C++, cross-built with MinGW), its Wine/DXMT test suites, and the Basalt DXMT fork patches |
 | [`packaging/`](packaging) | App bundle and release archive tooling |
-| [`scripts/`](scripts) | `doctor` and the `check` quality gate |
+| [`scripts/`](scripts) | `doctor`, the `check` quality gate, and the `play`, Steam, and Quest helper scripts |
 | [`docs/`](docs) | Design notes and user guides |
 
 ## Documentation
@@ -131,7 +134,10 @@ pull request.
 |-------|--------|
 | [Management app](docs/MANAGEMENT.md) | Building, running, and the current GUI workflow |
 | [Bottles and launch profiles](docs/BOTTLES.md) | `basaltctl`, isolated engines, OpenComposite, and launching games |
+| [OpenComposite](docs/OPENCOMPOSITE.md) | Building OpenComposite from source, the OpenVR proxy, patches, and presets |
 | [Streamer command line](docs/STREAMER.md) | `basalt-streamer` over USB and Wi-Fi, audio, stream settings, measurements, and security model |
+| [Performance](docs/PERFORMANCE.md) and [hand tracking](docs/HAND-TRACKING.md) | Tuning and diagnostics; Quest hand tracking and Touch grip poses |
+| [Compatibility](docs/COMPATIBILITY.md) | Verified games, hardware, and settings |
 | [OpenXR runtime](runtime/README.md) | What the runtime implements, how to build it, and its Wine, DXMT, and headset tests |
 | [Architecture](docs/ARCHITECTURE.md) | System design, component map, and milestone history |
 | [DXMT interop](docs/DXMT-INTEROP.md) | The D3D11 → Metal → IOSurface frame handoff and the Basalt DXMT fork |
@@ -153,6 +159,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development and pull-request expectat
 ## License
 
 BasaltVR code is available under the [MIT License](LICENSE). Components it orchestrates keep their
-own licenses (ALVR: MIT; pinned DXMT v0.80: MIT; OpenComposite: GPLv3 — shipped as a separate
-artifact, never linked in). See [third-party notices](THIRD_PARTY_NOTICES.md) for the distribution
-boundary.
+own licenses (ALVR: MIT; pinned DXMT v0.80: MIT; OpenComposite: GPLv3 — built locally or supplied
+as a separate artifact, never linked in or redistributed). See
+[third-party notices](THIRD_PARTY_NOTICES.md) for the distribution boundary.
