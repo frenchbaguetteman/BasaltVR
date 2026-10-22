@@ -1091,10 +1091,12 @@ XrResult XRAPI_CALL attachSessionActionSets(
             ReleaseSRWLockExclusive(&gInputLock);
             return XR_ERROR_HANDLE_INVALID;
         }
-        // Attachment is permanent for the life of the action set, even after
-        // its session is destroyed; a duplicate handle in this call is
-        // harmless and behaves like a single occurrence.
-        if (record->attached) {
+        // Attachment keeps a set immutable for its whole life, but the spec
+        // lets a set be attached again to a later session once its previous
+        // session is destroyed. OpenComposite does this whenever it restarts
+        // its session. A duplicate handle in this call is harmless and
+        // behaves like a single occurrence.
+        if (record->attachedSession != XR_NULL_HANDLE) {
             ReleaseSRWLockExclusive(&gInputLock);
             return XR_ERROR_ACTIONSETS_ALREADY_ATTACHED;
         }
@@ -1569,6 +1571,105 @@ XrResult XRAPI_CALL getInputSourceLocalizedName(
     return XR_SUCCESS;
 }
 
+namespace {
+
+// Pulse length for XR_MIN_HAPTIC_DURATION and every other duration <= 0 with
+// a non-zero amplitude. The ALVR client forwards durations verbatim to the
+// Quest runtime and cannot express XR_MIN_HAPTIC_DURATION, so this is the
+// runtime's "one tick": short like SteamVR's minimum pulse, yet long enough
+// for the Quest Touch actuator to render.
+constexpr uint64_t kMinHapticDurationNs = 5'000'000ULL;
+
+// What reaches the daemon for one xrApplyHapticFeedback call.
+struct HapticCommand {
+    uint64_t durationNs;
+    float frequency;
+    float amplitude;
+    bool stop;
+};
+
+// Only structural errors fail xrApplyHapticFeedback. Out-of-range values are
+// normalized, because OpenVR translation layers pass game values straight
+// through and abort the game on any failure. OpenComposite sends:
+//   TriggerHapticVibrationAction:
+//     duration  = (int)(fDurationSeconds * 1e9): 0 for a zero-length pulse,
+//                 and INT_MIN once the float overflows int (>= ~2.15 s);
+//     frequency = fFrequency: +inf when SteamVR's Hand.TriggerHapticPulse
+//                 computes 1 / seconds for a zero-length pulse;
+//     amplitude = fAmplitude, unclamped.
+//   legacy IVRSystem::TriggerHapticPulse(usDurationMicroSec):
+//     duration = usDurationMicroSec * 1000 ns, frequency unspecified,
+//     amplitude 1.
+// Amplitude is clamped to [0, 1] with NaN as 0. Zero amplitude is silence:
+// xrApplyHapticFeedback replaces any running vibration, so it is sent as a
+// stop, never as a pulse. Otherwise durations <= 0 (XR_MIN_HAPTIC_DURATION,
+// zero-length OpenVR pulses, the INT_MIN overflow) play the minimum pulse and
+// a non-finite or non-positive frequency means unspecified.
+HapticCommand normalizeHapticVibration(const XrHapticVibration& vibration) {
+    const float amplitude = std::isnan(vibration.amplitude)
+        ? 0.0f : (std::min)((std::max)(vibration.amplitude, 0.0f), 1.0f);
+    if (amplitude == 0.0f) {
+        return {0, 0.0f, 0.0f, true};
+    }
+    const uint64_t duration = vibration.duration <= 0
+        ? kMinHapticDurationNs : static_cast<uint64_t>(vibration.duration);
+    const float frequency =
+        std::isfinite(vibration.frequency) && vibration.frequency > 0.0f
+            ? vibration.frequency : XR_FREQUENCY_UNSPECIFIED;
+    return {duration, frequency, amplitude, false};
+}
+
+// BASALT_HAPTIC_LOG=1 writes every haptic call to stderr (the game or Steam
+// log under scripts/play.zsh): the game's values, the target hands (L/R; "--"
+// means nothing was sent), the result, and the mapped values sent per hand.
+// The cache is a plain interlocked value: a function-local static would make
+// MinGW's libstdc++ emit a thread-safe init guard that imports
+// libwinpthread-1.dll, which the loader cannot find next to the runtime.
+// Racing first calls compute the same answer.
+LONG volatile gHapticLogState = 0;  // 0 unknown, 1 off, 2 on
+
+bool hapticLogEnabled() {
+    LONG state = InterlockedCompareExchange(&gHapticLogState, 0, 0);
+    if (state == 0) {
+        char value[16]{};
+        const DWORD length =
+            GetEnvironmentVariableA("BASALT_HAPTIC_LOG", value, sizeof(value));
+        state = length > 0 && !(length == 1 && value[0] == '0') ? 2 : 1;
+        InterlockedExchange(&gHapticLogState, state);
+    }
+    return state == 2;
+}
+
+void logHaptic(const char* call, XrResult result, const bool hands[2],
+               const XrHapticVibration* requested, const HapticCommand& sent) {
+    if (!hapticLogEnabled()) {
+        return;
+    }
+    char handText[3] = {hands[0] ? 'L' : '-', hands[1] ? 'R' : '-', '\0'};
+    if (requested != nullptr) {
+        std::fprintf(stderr,
+                     "Basalt OpenXR: haptic t=%llums %s result=%d hands=%s "
+                     "requested(duration=%lldns frequency=%g amplitude=%g) "
+                     "mapped(%s duration=%lluns frequency=%g amplitude=%g)\n",
+                     static_cast<unsigned long long>(GetTickCount64()), call,
+                     static_cast<int>(result), handText,
+                     static_cast<long long>(requested->duration),
+                     static_cast<double>(requested->frequency),
+                     static_cast<double>(requested->amplitude),
+                     sent.stop ? "stop" : "pulse",
+                     static_cast<unsigned long long>(sent.durationNs),
+                     static_cast<double>(sent.frequency),
+                     static_cast<double>(sent.amplitude));
+    } else {
+        std::fprintf(stderr,
+                     "Basalt OpenXR: haptic t=%llums %s result=%d hands=%s mapped(stop)\n",
+                     static_cast<unsigned long long>(GetTickCount64()), call,
+                     static_cast<int>(result), handText);
+    }
+}
+
+}  // namespace
+
 XrResult XRAPI_CALL applyHapticFeedback(
     XrSession session,
     const XrHapticActionInfo* hapticActionInfo,
@@ -1582,12 +1683,7 @@ XrResult XRAPI_CALL applyHapticFeedback(
         return XR_ERROR_VALIDATION_FAILURE;
     }
     const auto* vibration = reinterpret_cast<const XrHapticVibration*>(hapticFeedback);
-    if (vibration->duration < XR_MIN_HAPTIC_DURATION ||
-        !std::isfinite(vibration->frequency) || vibration->frequency < 0.0f ||
-        !std::isfinite(vibration->amplitude) ||
-        vibration->amplitude < 0.0f || vibration->amplitude > 1.0f) {
-        return XR_ERROR_VALIDATION_FAILURE;
-    }
+    const HapticCommand command = normalizeHapticVibration(*vibration);
 
     basalt::ControlInputSnapshot input{};
     controlInputSnapshot(session, &input);
@@ -1617,21 +1713,22 @@ XrResult XRAPI_CALL applyHapticFeedback(
     }
     ReleaseSRWLockShared(&gInputLock);
     if (XR_FAILED(result)) {
+        logHaptic("apply", result, hands, vibration, command);
         return result;
     }
 
     if (!isSessionFocused(session)) {
+        logHaptic("apply", XR_SESSION_NOT_FOCUSED, hands, vibration, command);
         return XR_SESSION_NOT_FOCUSED;
     }
-    const uint64_t duration = vibration->duration == XR_MIN_HAPTIC_DURATION
-        ? 20'000'000ULL : static_cast<uint64_t>(vibration->duration);
     for (uint32_t hand = 0; hand < 2; ++hand) {
         if (hands[hand]) {
             controlSendHaptic(
-                session, static_cast<ControlHand>(hand), duration,
-                vibration->frequency, vibration->amplitude);
+                session, static_cast<ControlHand>(hand), command.durationNs,
+                command.frequency, command.amplitude);
         }
     }
+    logHaptic("apply", XR_SUCCESS, hands, vibration, command);
     return XR_SUCCESS;
 }
 
@@ -1673,19 +1770,24 @@ XrResult XRAPI_CALL stopHapticFeedback(
         }
     }
     ReleaseSRWLockShared(&gInputLock);
+    const HapticCommand stop{0, 0.0f, 0.0f, true};
     if (XR_FAILED(result)) {
+        logHaptic("stop", result, hands, nullptr, stop);
         return result;
     }
 
     if (!isSessionFocused(session)) {
+        logHaptic("stop", XR_SESSION_NOT_FOCUSED, hands, nullptr, stop);
         return XR_SESSION_NOT_FOCUSED;
     }
     for (uint32_t hand = 0; hand < 2; ++hand) {
         if (hands[hand]) {
             controlSendHaptic(
-                session, static_cast<ControlHand>(hand), 0, 0.0f, 0.0f);
+                session, static_cast<ControlHand>(hand), stop.durationNs,
+                stop.frequency, stop.amplitude);
         }
     }
+    logHaptic("stop", XR_SUCCESS, hands, nullptr, stop);
     return XR_SUCCESS;
 }
 

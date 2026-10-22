@@ -1,0 +1,16 @@
+diff --git a/OpenOVR/Reimpl/BaseSystem.cpp b/OpenOVR/Reimpl/BaseSystem.cpp
+index a0ca967..0aecbf0 100644
+--- a/OpenOVR/Reimpl/BaseSystem.cpp
++++ b/OpenOVR/Reimpl/BaseSystem.cpp
+@@ -130,7 +130,10 @@ bool BaseSystem::GetTimeSinceLastVsync(float* pfSecondsSinceLastVsync, uint64_t*
+ 
+ int32_t BaseSystem::GetD3D9AdapterIndex()
+ {
+-	STUBBED();
++	// The default adapter. Launching the September 2026 Half-Life: Alyx build reaches this
++	// (xrizer PR #426); aborting here would kill the game.
++	OOVR_LOG_ONCE("GetD3D9AdapterIndex: returning the default adapter");
++	return 0;
+ }
+ 
+ void BaseSystem::GetDXGIOutputInfo(int32_t* adapterIndex)

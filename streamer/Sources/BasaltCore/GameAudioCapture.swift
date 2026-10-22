@@ -259,6 +259,7 @@ public final class GameAudioCapture: NSObject, AVCaptureAudioDataOutputSampleBuf
     public init(deviceNameContains: String) throws {
         let selectedDevice = try GameAudioDeviceDiscovery.matchingInputDevice(deviceNameContains)
         device = selectedDevice
+        try MicrophoneAccess.ensureGranted(deviceName: selectedDevice.name)
         let captureDevices = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.microphone, .external], mediaType: .audio,
             position: .unspecified).devices
@@ -276,7 +277,9 @@ public final class GameAudioCapture: NSObject, AVCaptureAudioDataOutputSampleBuf
         } catch {
             throw BasaltError(
                 "Could not open '\(selectedDevice.name)': \(error.localizedDescription). "
-                    + "Grant Microphone access to the terminal if macOS requests it")
+                    + MicrophoneAccess.denialHint(
+                        state: MicrophoneAccess.currentState(),
+                        hostApp: MicrophoneAccess.hostAppName()))
         }
 
         super.init()

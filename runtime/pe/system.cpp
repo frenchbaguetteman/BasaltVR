@@ -73,6 +73,14 @@ XrResult XRAPI_CALL getSystemProperties(
     properties->graphicsProperties.maxLayerCount = XR_MIN_COMPOSITION_LAYERS_SUPPORTED;
     properties->trackingProperties.orientationTracking = XR_TRUE;
     properties->trackingProperties.positionTracking = XR_TRUE;
+    for (auto* structure = static_cast<XrBaseOutStructure*>(properties->next);
+         structure != nullptr; structure = structure->next) {
+        if (structure->type == XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT) {
+            reinterpret_cast<XrSystemHandTrackingPropertiesEXT*>(structure)
+                ->supportsHandTracking =
+                isHandTrackingExtensionEnabled(instance) ? XR_TRUE : XR_FALSE;
+        }
+    }
     return XR_SUCCESS;
 }
 
