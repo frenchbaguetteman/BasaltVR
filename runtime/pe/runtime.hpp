@@ -31,8 +31,17 @@ constexpr uint32_t kMaxSwapchainHeight = kMaxViewHeight * 2;
 // ALVR's hashed path ID for /user/hand/right/input/system/click.
 constexpr uint64_t kAlvrRightSystemClickPathId = 0x19729bd97073d474ULL;
 
+// Writes one "Basalt OpenXR: ..." diagnostic line to stderr and, when
+// BASALT_RUNTIME_LOG names a file (a Windows path, or a host path starting
+// with '/' which is opened through Wine's Z: drive), appends it there too. A
+// game that a launcher started (The Lab -> Robot Repair) has no stderr the
+// session log can see, so the file is the only record of its runtime.
+void runtimeLog(const char* format, ...);
+
 bool isValidInstance(XrInstance instance);
 bool isD3D11ExtensionEnabled(XrInstance instance);
+bool isVisibilityMaskExtensionEnabled(XrInstance instance);
+bool isHandTrackingExtensionEnabled(XrInstance instance);
 bool isD3D11RuntimeAvailable();
 bool isValidSession(XrSession session);
 ID3D11Device* retainSessionDevice(XrSession session);
@@ -65,6 +74,15 @@ void queueReferenceSpaceChange(
     const XrPosef& poseInPreviousSpace);
 bool isSpaceForSession(XrSpace space, XrSession session);
 bool isPoseWellFormed(const XrPosef& pose);
+// LOCAL-from-space at time, exactly as xrLocateSpace resolves it: LOCAL and
+// STAGE are their creation pose, VIEW needs a fresh head pose, and an action
+// space needs its controller pose. False when space is not a live space of
+// expectedSession or cannot be located right now.
+bool locateSpaceInLocal(
+    XrSpace space,
+    XrSession expectedSession,
+    XrTime time,
+    XrPosef* poseInLocal);
 bool getSwapchainSubmitState(
     XrSwapchain swapchain,
     XrSession* session,
@@ -230,6 +248,12 @@ XrResult XRAPI_CALL getReferenceSpaceBoundsRect(
     XrSession session,
     XrReferenceSpaceType referenceSpaceType,
     XrExtent2Df* bounds);
+XrResult XRAPI_CALL getVisibilityMask(
+    XrSession session,
+    XrViewConfigurationType viewConfigurationType,
+    uint32_t viewIndex,
+    XrVisibilityMaskTypeKHR visibilityMaskType,
+    XrVisibilityMaskKHR* visibilityMask);
 XrResult XRAPI_CALL enumerateReferenceSpaces(
     XrSession session,
     uint32_t spaceCapacityInput,
@@ -273,5 +297,18 @@ XrResult XRAPI_CALL releaseSwapchainImage(
     XrSwapchain swapchain,
     const XrSwapchainImageReleaseInfo* releaseInfo);
 void invalidateSwapchainForSession(XrSession session);
+
+// XR_EXT_hand_tracking (hand_tracking.cpp).
+XrResult XRAPI_CALL createHandTracker(
+    XrSession session,
+    const XrHandTrackerCreateInfoEXT* createInfo,
+    XrHandTrackerEXT* handTracker);
+XrResult XRAPI_CALL destroyHandTracker(XrHandTrackerEXT handTracker);
+XrResult XRAPI_CALL locateHandJoints(
+    XrHandTrackerEXT handTracker,
+    const XrHandJointsLocateInfoEXT* locateInfo,
+    XrHandJointLocationsEXT* locations);
+void invalidateHandTrackersForSession(XrSession session);
+void invalidateHandTrackersForInstance(XrInstance instance);
 
 }  // namespace basalt

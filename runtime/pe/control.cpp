@@ -78,6 +78,15 @@ struct ControllerInputRecord {
     XrVector3f rawAngularVelocity{};
 };
 
+// Latest HAND_SKELETON per hand, still in the raw Quest stage frame.
+struct HandSkeletonRecord {
+    bool tracked = false;
+    uint64_t questTimestamp = 0;
+    XrTime arrival = 0;
+    XrPosef rawJointPoses[basalt::kControlHandJointCount]{};
+    float jointRadii[basalt::kControlHandJointCount]{};
+};
+
 struct RecenterNotification {
     bool ready = false;
     XrSession session = XR_NULL_HANDLE;
@@ -130,11 +139,36 @@ XrTime gLocalSpaceChangeTime = 0;
 // recenter must not take effect at or before it: the application may already
 // have located part of that frame against the previous LOCAL definition.
 XrTime gLatestPredictedDisplayTime = 0;
+// One head sample per xrWaitFrame predictedDisplayTime. The first head query
+// for a predicted time pins the newest sample; every later xrLocateViews or
+// xrLocateSpace for that time returns the same pose and Quest timestamp, and
+// the frame is tagged with that timestamp. ALVR reprojects from the pose the
+// timestamp names, so it must be the pose the application rendered with.
+// OpenComposite locates each frame several times (projection views, eye
+// transforms, IPD, then the game's WaitGetPoses); head samples arrive at
+// about 216 Hz, so unpinned calls each saw a newer sample.
+struct FrameHeadSample {
+    XrTime displayTime = 0;
+    bool sampled = false;
+    bool diverged = false;
+    uint64_t questTimestamp = 0;
+    XrPosef rawHeadPose{};
+};
+// Covers the frames an application may have between xrWaitFrame and
+// xrEndFrame (kPendingFrameCapacity) with room to spare.
+constexpr size_t kFrameHeadSampleCapacity = 8;
+FrameHeadSample gFrameHeadSamples[kFrameHeadSampleCapacity]{};
+size_t gNextFrameHeadSample = 0;
+// Diagnostics, cumulative for the process: frames that pinned a head sample,
+// and those where a later query would have seen a newer sample unpinned.
+uint64_t gPinnedHeadFrames = 0;
+uint64_t gDivergedHeadFrames = 0;
 // Nonzero while the right system button is held; the recenter gesture fires
 // once per hold.
 XrTime gSystemButtonPressTime = 0;
 bool gSystemButtonRecentered = false;
 ControllerInputRecord gControllerInputs[2]{};
+HandSkeletonRecord gHandSkeletons[2]{};
 ButtonInputRecord gButtonInputs[basalt::kControlButtonCapacity]{};
 bool gViewConfigValid = false;
 float gViewConfigIpdMeters = 0.0f;
@@ -144,6 +178,15 @@ uint64_t gLastConsumedFrameNumber = 0;
 PendingFrame gPendingFrames[kPendingFrameCapacity]{};
 size_t gPendingHead = 0;
 size_t gPendingCount = 0;
+// Headset refresh period from HELLO_ACK; the 72 Hz default while headless.
+XrDuration gDisplayPeriod = BASALT_CONTROL_DEFAULT_DISPLAY_PERIOD_NS;
+
+XrDuration sanitizedDisplayPeriod(uint64_t period) {
+    return period >= BASALT_CONTROL_MIN_DISPLAY_PERIOD_NS &&
+                   period <= BASALT_CONTROL_MAX_DISPLAY_PERIOD_NS
+               ? static_cast<XrDuration>(period)
+               : static_cast<XrDuration>(BASALT_CONTROL_DEFAULT_DISPLAY_PERIOD_NS);
+}
 
 void resetSystemButtonLocked() {
     gSystemButtonPressTime = 0;
@@ -155,6 +198,9 @@ void resetInputsLocked() {
         record = {};
     }
     for (ButtonInputRecord& record : gButtonInputs) {
+        record = {};
+    }
+    for (HandSkeletonRecord& record : gHandSkeletons) {
         record = {};
     }
     resetSystemButtonLocked();
@@ -172,6 +218,10 @@ void resetTrackingStateLocked() {
     gPreviousLocalFromQuest = gLocalFromQuest;
     gLocalSpaceChangeTime = 0;
     gLatestPredictedDisplayTime = 0;
+    for (FrameHeadSample& sample : gFrameHeadSamples) {
+        sample = {};
+    }
+    gNextFrameHeadSample = 0;
     resetInputsLocked();
     gViewConfigValid = false;
     gViewConfigIpdMeters = 0.0f;
@@ -235,6 +285,20 @@ const XrPosef& localTransformForTimeLocked(XrTime locateTime) {
                    locateTime < gLocalSpaceChangeTime
         ? gPreviousLocalFromQuest
         : gLocalFromQuest;
+}
+
+// The pinning slot for a predictedDisplayTime xrWaitFrame returned, or null
+// for any other time (those keep seeing the newest sample).
+FrameHeadSample* findFrameHeadSampleLocked(XrTime displayTime) {
+    if (displayTime <= 0) {
+        return nullptr;
+    }
+    for (FrameHeadSample& sample : gFrameHeadSamples) {
+        if (sample.displayTime == displayTime) {
+            return &sample;
+        }
+    }
+    return nullptr;
 }
 
 void recenterLocalOriginLocked(
@@ -619,6 +683,75 @@ bool parseControllerMask(const uint8_t* payload, size_t payloadLength) {
     return true;
 }
 
+// HAND_SKELETON: u64 timestamp, u32 hand, u32 joint_valid_mask, then 26
+// joints of f32 orientation xyzw, f32 position xyz, f32 radius. The mask is
+// all-or-nothing; anything else is a protocol error.
+bool parseHandSkeleton(const uint8_t* payload, size_t payloadLength) {
+    constexpr uint32_t kAllJointsMask =
+        (1u << basalt::kControlHandJointCount) - 1u;
+    constexpr size_t kJointStride = 8 * sizeof(float);
+    static_assert(16 + basalt::kControlHandJointCount * kJointStride ==
+                      BASALT_CONTROL_HAND_SKELETON_PAYLOAD_LENGTH,
+                  "HAND_SKELETON payload layout");
+    static_assert(basalt::kControlHandJointCount == BASALT_CONTROL_HAND_JOINT_COUNT,
+                  "hand joint count");
+    if (payloadLength != BASALT_CONTROL_HAND_SKELETON_PAYLOAD_LENGTH) {
+        return false;
+    }
+    uint64_t timestamp = 0;
+    uint32_t hand = 0;
+    uint32_t validMask = 0;
+    std::memcpy(&timestamp, payload, sizeof(timestamp));
+    std::memcpy(&hand, payload + 8, sizeof(hand));
+    std::memcpy(&validMask, payload + 12, sizeof(validMask));
+    if (hand > 1 || (validMask != 0 && validMask != kAllJointsMask)) {
+        return false;
+    }
+    const bool tracked = validMask != 0;
+    XrPosef poses[basalt::kControlHandJointCount]{};
+    float radii[basalt::kControlHandJointCount]{};
+    if (tracked) {
+        for (uint32_t joint = 0; joint < basalt::kControlHandJointCount; ++joint) {
+            float values[8]{};
+            std::memcpy(values, payload + 16 + joint * kJointStride, sizeof(values));
+            for (float value : values) {
+                if (!std::isfinite(value)) {
+                    return false;
+                }
+            }
+            const double norm = std::sqrt(
+                static_cast<double>(values[0]) * values[0] +
+                static_cast<double>(values[1]) * values[1] +
+                static_cast<double>(values[2]) * values[2] +
+                static_cast<double>(values[3]) * values[3]);
+            if (norm < 0.5 || norm > 1.5 || !(values[7] > 0.0f) || values[7] > 0.1f) {
+                return false;
+            }
+            const float inverseNorm = static_cast<float>(1.0 / norm);
+            poses[joint].orientation = {
+                values[0] * inverseNorm, values[1] * inverseNorm,
+                values[2] * inverseNorm, values[3] * inverseNorm,
+            };
+            poses[joint].position = {values[4], values[5], values[6]};
+            radii[joint] = values[7];
+        }
+    }
+    // Like CONTROLLER_MOTION: an older sample, or any sample before the
+    // first head pose defines LOCAL, is accepted and ignored.
+    HandSkeletonRecord& record = gHandSkeletons[hand];
+    if (timestamp < record.questTimestamp || !gLocalOriginValid) {
+        return true;
+    }
+    record.questTimestamp = timestamp;
+    record.tracked = tracked;
+    record.arrival = tracked ? monotonicTime() : 0;
+    if (tracked) {
+        std::memcpy(record.rawJointPoses, poses, sizeof(poses));
+        std::memcpy(record.jointRadii, radii, sizeof(radii));
+    }
+    return true;
+}
+
 void markReceiverFailedLocked() {
     gReceiverFailed = true;
     gHeadPoseValid = false;
@@ -670,6 +803,8 @@ DWORD WINAPI receiverThreadProc(LPVOID) {
             accepted = parseViewConfig(payload, payloadLength);
         } else if (type == BASALT_MSG_CONTROLLER_MASK) {
             accepted = parseControllerMask(payload, payloadLength);
+        } else if (type == BASALT_MSG_HAND_SKELETON) {
+            accepted = parseHandSkeleton(payload, payloadLength);
         } else if (type == BASALT_MSG_FRAME_CONSUMED && payloadLength == 8) {
             uint64_t frameNumber = 0;
             std::memcpy(&frameNumber, payload, sizeof(frameNumber));
@@ -794,6 +929,7 @@ DisconnectState beginDisconnectLocked() {
     resetTrackingStateLocked();
     gPendingHead = 0;
     gPendingCount = 0;
+    gDisplayPeriod = BASALT_CONTROL_DEFAULT_DISPLAY_PERIOD_NS;
     WakeAllConditionVariable(&gAckCondition);
     WakeAllConditionVariable(&gFrameDeliveryCondition);
     return state;
@@ -922,13 +1058,48 @@ DWORD WINAPI waiterThreadProc(LPVOID) {
     }
 }
 
-// Reads "<port> <token> [<per-eye width> <per-eye height>]" from the
-// BASALT_CONTROL file.
+bool isControlFileSpace(char value) {
+    return value == ' ' || value == '\t' || value == '\r' || value == '\n' ||
+           value == '\v' || value == '\f';
+}
+
+bool parseDecimal(const char* text, unsigned long maximum, unsigned long* value) {
+    if (text == nullptr || *text < '0' || *text > '9') {
+        return false;
+    }
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || parsed > maximum) {
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
+bool featureListContains(const char* features, const char* feature) {
+    const size_t featureLength = std::strlen(feature);
+    const char* cursor = features;
+    while (cursor != nullptr && *cursor != '\0') {
+        const char* comma = std::strchr(cursor, ',');
+        const size_t length = comma != nullptr
+            ? static_cast<size_t>(comma - cursor) : std::strlen(cursor);
+        if (length == featureLength && std::strncmp(cursor, feature, length) == 0) {
+            return true;
+        }
+        cursor = comma != nullptr ? comma + 1 : nullptr;
+    }
+    return false;
+}
+
+// Reads "<port> <token> [<per-eye width> <per-eye height>] [<features>]"
+// from the BASALT_CONTROL file. The optional features field starts with a
+// lowercase letter and lists comma-separated names; unknown ones are ignored.
 bool readControlFile(
     uint16_t* port,
     char token[BASALT_CONTROL_TOKEN_LENGTH + 1],
     uint32_t* viewWidth,
-    uint32_t* viewHeight) {
+    uint32_t* viewHeight,
+    bool* handTracking = nullptr) {
     char path[MAX_PATH]{};
     const DWORD pathLength =
         GetEnvironmentVariableA("BASALT_CONTROL", path, sizeof(path));
@@ -942,7 +1113,7 @@ bool readControlFile(
     if (file == INVALID_HANDLE_VALUE) {
         return false;
     }
-    char contents[128]{};
+    char contents[512]{};
     DWORD bytesRead = 0;
     const BOOL readOk = ReadFile(file, contents, sizeof(contents) - 1, &bytesRead, nullptr);
     CloseHandle(file);
@@ -951,26 +1122,62 @@ bool readControlFile(
     }
     contents[bytesRead] = '\0';
 
-    char tokenBuffer[64]{};
-    unsigned int parsedPort = 0;
-    unsigned int parsedWidth = 0;
-    unsigned int parsedHeight = 0;
-    char extra = '\0';
-    const int parsed = std::sscanf(
-        contents, "%u %63s %u %u %c", &parsedPort, tokenBuffer,
-        &parsedWidth, &parsedHeight, &extra);
-    if ((parsed != 2 && parsed != 4) ||
-        parsedPort == 0 || parsedPort > 65535 ||
-        std::strlen(tokenBuffer) != BASALT_CONTROL_TOKEN_LENGTH) {
+    // Split in place into at most five whitespace-separated fields.
+    constexpr size_t kMaxFields = 5;
+    const char* fields[kMaxFields]{};
+    size_t fieldCount = 0;
+    char* cursor = contents;
+    for (;;) {
+        while (isControlFileSpace(*cursor)) {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        if (fieldCount == kMaxFields) {
+            return false;
+        }
+        fields[fieldCount++] = cursor;
+        while (*cursor != '\0' && !isControlFileSpace(*cursor)) {
+            ++cursor;
+        }
+        if (*cursor != '\0') {
+            *cursor++ = '\0';
+        }
+    }
+    const char* features = nullptr;
+    if (fieldCount == 3 || fieldCount == 5) {
+        features = fields[fieldCount - 1];
+        if (*features < 'a' || *features > 'z') {
+            return false;
+        }
+        --fieldCount;
+    }
+    if (fieldCount != 2 && fieldCount != 4) {
+        return false;
+    }
+
+    unsigned long parsedPort = 0;
+    unsigned long parsedWidth = 0;
+    unsigned long parsedHeight = 0;
+    if (!parseDecimal(fields[0], 65535, &parsedPort) || parsedPort == 0 ||
+        std::strlen(fields[1]) != BASALT_CONTROL_TOKEN_LENGTH ||
+        (fieldCount == 4 &&
+         (!parseDecimal(fields[2], UINT32_MAX, &parsedWidth) ||
+          !parseDecimal(fields[3], UINT32_MAX, &parsedHeight)))) {
         return false;
     }
     *port = static_cast<uint16_t>(parsedPort);
-    std::memcpy(token, tokenBuffer, BASALT_CONTROL_TOKEN_LENGTH + 1);
+    std::memcpy(token, fields[1], BASALT_CONTROL_TOKEN_LENGTH + 1);
     if (viewWidth != nullptr) {
-        *viewWidth = parsed == 4 ? parsedWidth : 0;
+        *viewWidth = static_cast<uint32_t>(parsedWidth);
     }
     if (viewHeight != nullptr) {
-        *viewHeight = parsed == 4 ? parsedHeight : 0;
+        *viewHeight = static_cast<uint32_t>(parsedHeight);
+    }
+    if (handTracking != nullptr) {
+        *handTracking = features != nullptr &&
+            featureListContains(features, BASALT_CONTROL_FEATURE_HAND_TRACKING);
     }
     return true;
 }
@@ -1007,10 +1214,18 @@ bool connectSocketLocked(uint16_t port) {
         gWsaStarted = true;
     }
 
-    const SOCKET connection = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    // Never inheritable: a game that launches its successor with
+    // CreateProcess(bInheritHandles=TRUE) and exits (The Lab -> Robot Repair
+    // via OpenComposite's LaunchInternalProcess) would otherwise leave this
+    // connection open inside the child, so the streamer never sees the old
+    // session end. socket() handles are inheritable by default.
+    const SOCKET connection = WSASocketW(
+        AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0,
+        WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
     if (connection == INVALID_SOCKET) {
         return false;
     }
+    SetHandleInformation(reinterpret_cast<HANDLE>(connection), HANDLE_FLAG_INHERIT, 0);
 
     const DWORD timeout = kSocketTimeoutMilliseconds;
     setsockopt(connection, SOL_SOCKET, SO_RCVTIMEO,
@@ -1085,6 +1300,14 @@ bool controlConfiguredViewSize(uint32_t* width, uint32_t* height) {
     *width = configuredWidth;
     *height = configuredHeight;
     return true;
+}
+
+bool controlHandTrackingAdvertised() {
+    uint16_t port = 0;
+    char token[BASALT_CONTROL_TOKEN_LENGTH + 1]{};
+    bool handTracking = false;
+    return readControlFile(&port, token, nullptr, nullptr, &handTracking) &&
+           handTracking;
 }
 
 uint32_t queryTextureIOSurfaceId(ID3D11Texture2D* texture) {
@@ -1164,22 +1387,25 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
             break;
         }
 
-        uint8_t ack[8]{};
+        uint8_t ack[16]{};
         size_t ackLength = 0;
         uint16_t acceptedVersion = 0;
+        uint64_t displayPeriod = 0;
         if (!recvExpectedMessage(
                 gSocket, BASALT_MSG_HELLO_ACK, ack, sizeof(ack), &ackLength) ||
-            ackLength != sizeof(acceptedVersion)) {
+            ackLength != sizeof(acceptedVersion) + sizeof(displayPeriod)) {
             closesocket(gSocket);
             gSocket = INVALID_SOCKET;
             break;
         }
         std::memcpy(&acceptedVersion, ack, sizeof(acceptedVersion));
+        std::memcpy(&displayPeriod, ack + sizeof(acceptedVersion), sizeof(displayPeriod));
         if (acceptedVersion != BASALT_CONTROL_PROTOCOL_VERSION) {
             closesocket(gSocket);
             gSocket = INVALID_SOCKET;
             break;
         }
+        gDisplayPeriod = sanitizedDisplayPeriod(displayPeriod);
 
         gWaiterWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         gFenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -1243,11 +1469,25 @@ bool controlActive(XrSession session) {
     return active;
 }
 
+XrDuration controlDisplayPeriod(XrSession session) {
+    AcquireSRWLockShared(&gControlLock);
+    const XrDuration period =
+        session != XR_NULL_HANDLE && gControlSession == session
+            ? gDisplayPeriod
+            : static_cast<XrDuration>(BASALT_CONTROL_DEFAULT_DISPLAY_PERIOD_NS);
+    ReleaseSRWLockShared(&gControlLock);
+    return period;
+}
+
 void controlNotePredictedDisplayTime(XrSession session, XrTime predictedDisplayTime) {
     AcquireSRWLockExclusive(&gControlLock);
     if (session != XR_NULL_HANDLE && gControlSession == session &&
         predictedDisplayTime > gLatestPredictedDisplayTime) {
         gLatestPredictedDisplayTime = predictedDisplayTime;
+        FrameHeadSample& slot = gFrameHeadSamples[gNextFrameHeadSample];
+        slot = {};
+        slot.displayTime = predictedDisplayTime;
+        gNextFrameHeadSample = (gNextFrameHeadSample + 1) % kFrameHeadSampleCapacity;
     }
     ReleaseSRWLockExclusive(&gControlLock);
 }
@@ -1287,23 +1527,63 @@ bool controlHeadPose(
     uint64_t* questTimestampNanoseconds,
     XrPosef* poseInLocal) {
     const XrTime now = monotonicTime();
-    AcquireSRWLockShared(&gControlLock);
+    // Exclusive: the first query for a predicted display time pins its sample.
+    AcquireSRWLockExclusive(&gControlLock);
     const bool fresh = session != XR_NULL_HANDLE && gControlSession == session &&
                        gSocket != INVALID_SOCKET && !gReceiverFailed &&
                        gHeadPoseValid && gHeadPoseArrival > 0 &&
                        now >= gHeadPoseArrival &&
                        now - gHeadPoseArrival <= kHeadPoseFreshness;
     if (fresh) {
+        uint64_t questTimestamp = gHeadPoseQuestTimestamp;
+        XrPosef rawHeadPose = gRawHeadPose;
+        FrameHeadSample* pinned = findFrameHeadSampleLocked(locateTime);
+        if (pinned != nullptr && !pinned->sampled) {
+            pinned->sampled = true;
+            pinned->questTimestamp = questTimestamp;
+            pinned->rawHeadPose = rawHeadPose;
+            ++gPinnedHeadFrames;
+        } else if (pinned != nullptr) {
+            if (!pinned->diverged && pinned->questTimestamp != questTimestamp) {
+                pinned->diverged = true;
+                ++gDivergedHeadFrames;
+            }
+            questTimestamp = pinned->questTimestamp;
+            rawHeadPose = pinned->rawHeadPose;
+        }
         if (questTimestampNanoseconds != nullptr) {
-            *questTimestampNanoseconds = gHeadPoseQuestTimestamp;
+            *questTimestampNanoseconds = questTimestamp;
         }
         if (poseInLocal != nullptr) {
             *poseInLocal = poseCompose(
-                localTransformForTimeLocked(locateTime), gRawHeadPose);
+                localTransformForTimeLocked(locateTime), rawHeadPose);
         }
     }
-    ReleaseSRWLockShared(&gControlLock);
+    ReleaseSRWLockExclusive(&gControlLock);
     return fresh;
+}
+
+bool controlPinnedHeadTimestamp(
+    XrSession session,
+    XrTime displayTime,
+    uint64_t* questTimestampNanoseconds) {
+    AcquireSRWLockShared(&gControlLock);
+    const FrameHeadSample* pinned = session != XR_NULL_HANDLE &&
+                                            gControlSession == session
+        ? findFrameHeadSampleLocked(displayTime) : nullptr;
+    const bool found = pinned != nullptr && pinned->sampled;
+    if (found && questTimestampNanoseconds != nullptr) {
+        *questTimestampNanoseconds = pinned->questTimestamp;
+    }
+    ReleaseSRWLockShared(&gControlLock);
+    return found;
+}
+
+void controlHeadSampleStats(uint64_t* pinnedFrames, uint64_t* divergedFrames) {
+    AcquireSRWLockShared(&gControlLock);
+    *pinnedFrames = gPinnedHeadFrames;
+    *divergedFrames = gDivergedHeadFrames;
+    ReleaseSRWLockShared(&gControlLock);
 }
 
 bool controlInputSnapshot(
@@ -1349,6 +1629,40 @@ bool controlInputSnapshot(
     }
     ReleaseSRWLockShared(&gControlLock);
     return connected;
+}
+
+bool controlHandSkeleton(
+    XrSession session,
+    uint32_t hand,
+    XrTime locateTime,
+    ControlHandSkeleton* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    out->active = false;
+    if (hand > 1) {
+        return false;
+    }
+    const XrTime now = monotonicTime();
+    AcquireSRWLockShared(&gControlLock);
+    const HandSkeletonRecord& record = gHandSkeletons[hand];
+    const bool active = session != XR_NULL_HANDLE && gControlSession == session &&
+                        gSocket != INVALID_SOCKET && !gReceiverFailed &&
+                        record.tracked && record.arrival > 0 &&
+                        now >= record.arrival &&
+                        now - record.arrival <= kControllerPoseFreshness;
+    if (active) {
+        const XrPosef& localFromQuest = localTransformForTimeLocked(locateTime);
+        out->questTimestampNanoseconds = record.questTimestamp;
+        for (uint32_t joint = 0; joint < kControlHandJointCount; ++joint) {
+            out->jointPosesInLocal[joint] =
+                poseCompose(localFromQuest, record.rawJointPoses[joint]);
+            out->jointRadii[joint] = record.jointRadii[joint];
+        }
+    }
+    ReleaseSRWLockShared(&gControlLock);
+    out->active = active;
+    return active;
 }
 
 bool controlViewConfig(
@@ -1501,31 +1815,32 @@ void controlUnregisterSwapchain(XrSwapchain swapchain) {
     }
 }
 
-void controlFrameReady(
+uint64_t controlFrameReady(
     int64_t displayTime,
     uint64_t questTrackingTimestampNanoseconds,
     const ControlFrameView* views,
-    uint32_t viewCount) {
+    uint32_t viewCount,
+    bool exportViews) {
     if (viewCount == 0 || viewCount > kMaxFrameViews) {
-        return;
+        return 0;
     }
 
     AcquireSRWLockExclusive(&gControlLock);
     if (gSocket == INVALID_SOCKET || gReceiverFailed ||
         gFence == nullptr || gContext4 == nullptr) {
         ReleaseSRWLockExclusive(&gControlLock);
-        return;
+        return 0;
     }
 
     ControlFrameView preparedViews[kMaxFrameViews]{};
     for (uint32_t index = 0; index < viewCount; ++index) {
         preparedViews[index] = views[index];
-        if (!prepareSwapchainViewForExport(
+        if (exportViews && !prepareSwapchainViewForExport(
                 gContext4, &preparedViews[index])) {
             DisconnectState state = beginDisconnectLocked();
             ReleaseSRWLockExclusive(&gControlLock);
             finishDisconnect(state, false);
-            return;
+            return 0;
         }
     }
 
@@ -1538,7 +1853,7 @@ void controlFrameReady(
         DisconnectState state = beginDisconnectLocked();
         ReleaseSRWLockExclusive(&gControlLock);
         finishDisconnect(state, false);
-        return;
+        return 0;
     }
     slot = &gPendingFrames[(gPendingHead + gPendingCount) % kPendingFrameCapacity];
     ++gPendingCount;
@@ -1583,12 +1898,44 @@ void controlFrameReady(
         DisconnectState state = beginDisconnectLocked();
         ReleaseSRWLockExclusive(&gControlLock);
         finishDisconnect(state, false);
-        return;
+        return 0;
     }
     if (wake != nullptr) {
         SetEvent(wake);
     }
     ReleaseSRWLockExclusive(&gControlLock);
+    return frameNumber;
+}
+
+bool controlWaitForFrameConsumed(XrSession session, uint64_t frameNumber) {
+    if (frameNumber == 0) {
+        return true;
+    }
+    AcquireSRWLockExclusive(&gControlLock);
+    bool timedOut = false;
+    while (gControlSession == session && gSocket != INVALID_SOCKET &&
+           !gReceiverFailed && gLastConsumedFrameNumber < frameNumber) {
+        if (!SleepConditionVariableSRW(
+                &gFrameDeliveryCondition, &gControlLock,
+                kFrameConsumeMilliseconds, 0)) {
+            timedOut = true;
+            break;
+        }
+    }
+    const bool consumed = gControlSession == session &&
+                          gSocket != INVALID_SOCKET && !gReceiverFailed &&
+                          gLastConsumedFrameNumber >= frameNumber;
+    DisconnectState state;
+    if (timedOut && gControlSession == session) {
+        // Same policy as the frame budget: a daemon that stops consuming is
+        // dropped instead of letting the compositor overwrite a read image.
+        state = beginDisconnectLocked();
+    }
+    ReleaseSRWLockExclusive(&gControlLock);
+    if (state.socket != INVALID_SOCKET) {
+        finishDisconnect(state, false);
+    }
+    return consumed;
 }
 
 }  // namespace basalt

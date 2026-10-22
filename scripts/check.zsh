@@ -19,6 +19,7 @@ run_step "Environment" "$script_dir/doctor.zsh" --core
 print
 print "==> Repository hygiene"
 zsh -n packaging/*.zsh runtime/scripts/*.zsh scripts/*.zsh
+"$script_dir/test-quest-adb.zsh"
 plutil -lint packaging/Info.plist
 swift package --package-path streamer dump-package >/dev/null
 (

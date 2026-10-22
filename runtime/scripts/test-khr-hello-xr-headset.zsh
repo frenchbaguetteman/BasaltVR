@@ -4,6 +4,10 @@
 # This is an opt-in, interactive M4 compatibility gate: it uses the same
 # disposable pinned Wine/DXMT stack as the lower-level integration tests and
 # never opens or modifies a CrossOver/Steam bottle.
+#
+# Quest link: BASALT_HEADSET_TRANSPORT=usb|wifi|auto (default auto). Wi-Fi needs no
+# Trust tap: open ALVR on the Quest and the streamer connects by itself. Use
+# BASALT_HEADSET_MBPS to change the bitrate (default 12).
 
 set -euo pipefail
 
@@ -16,6 +20,16 @@ toolchain_file=${runtime_dir}/cmake/toolchains/mingw-x86_64.cmake
 fps=${BASALT_HEADSET_FPS:-72}
 megabits=${BASALT_HEADSET_MBPS:-12}
 resolution=${BASALT_HEADSET_RESOLUTION:-balanced}
+# usb, wifi, or auto (USB when a USB Quest is attached, else Wi-Fi). If adb is not
+# installed, auto keeps the old behaviour: --wired.
+transport=${BASALT_HEADSET_TRANSPORT:-auto}
+if [[ ${transport} != (auto|usb|wifi) ]]; then
+    print -u2 "BASALT_HEADSET_TRANSPORT must be auto, usb, or wifi"
+    exit 2
+fi
+# Extra basalt-streamer flags for A/B runs, split on spaces, for example
+# BASALT_HEADSET_STREAMER_ARGS='--idr-interval 10 --entropy cavlc'.
+extra_streamer_args=(${=BASALT_HEADSET_STREAMER_ARGS:-})
 
 if [[ ${fps} != <-> ]] || (( fps < 1 || fps > 240 )); then
     print -u2 "BASALT_HEADSET_FPS must be an integer from 1 to 240"
@@ -127,18 +141,59 @@ WINEPREFIX=${wine_prefix} WINEDEBUG=-all "${wine_root}/bin/wine" reg.exe add \
 cp "${build_dir}/bin/khr_hello_xr_d3d11.exe" "${probe_dir}/khr_hello_xr_d3d11.exe"
 
 streamer_bin=${repo_dir}/streamer/.build/release/basalt-streamer
+
+# Pick the Quest link. quest-adb.zsh chooses one adb serial (USB wins over adb-over-Wi-Fi).
+source "${repo_dir}/scripts/quest-adb.zsh"
+link_args=(--wired)
+wifi_log=
+if [[ ${transport} == wifi ]]; then
+    link_args=(--wireless)
+elif [[ ${transport} == auto ]]; then
+    if quest_find_adb 2>/dev/null; then
+        if quest_pick_serial && [[ ${QUEST_LINK} == usb ]]; then
+            link_args=(--wired)
+        else
+            link_args=(--wireless)
+        fi
+    fi
+fi
+if [[ ${link_args[1]} == --wireless ]]; then
+    wifi_log=${control_dir}/streamer.log
+    : >"${wifi_log}"
+    print "Quest link: Wi-Fi. Open ALVR on the Quest and tap nothing else: there is no Trust step."
+    print "If your Mac asks to allow incoming connections or Local Network access, click Allow."
+else
+    print "Quest link: USB."
+fi
+
 print ""
 print "Starting ALVR and waiting for the Quest..."
-"${streamer_bin}" \
-    --wired \
-    --runtime "${control_file}" \
-    --fps "${fps}" \
-    --mbps "${megabits}" \
-    --resolution "${resolution}" &
+if [[ -n ${wifi_log} ]]; then
+    "${streamer_bin}" \
+        "${link_args[@]}" \
+        --runtime "${control_file}" \
+        --fps "${fps}" \
+        --mbps "${megabits}" \
+        --resolution "${resolution}" \
+        "${extra_streamer_args[@]}" > >(tee "${wifi_log}") 2>&1 &
+else
+    "${streamer_bin}" \
+        "${link_args[@]}" \
+        --runtime "${control_file}" \
+        --fps "${fps}" \
+        --mbps "${megabits}" \
+        --resolution "${resolution}" \
+        "${extra_streamer_args[@]}" &
+fi
 streamer_pid=$!
 
-for _ in {1..300}; do
-    if [[ -s ${control_file} ]]; then
+# USB writes the control file after the headset handshake. Wi-Fi writes it at once,
+# so for Wi-Fi also wait (up to 3 minutes) until the Quest has connected.
+wait_ticks=300
+[[ -n ${wifi_log} ]] && wait_ticks=1800
+for _ in {1..${wait_ticks}}; do
+    if [[ -s ${control_file} ]] &&
+       { [[ -z ${wifi_log} ]] || grep -q 'ALVR control accepted' "${wifi_log}" 2>/dev/null; }; then
         break
     fi
     if ! kill -0 ${streamer_pid} 2>/dev/null; then
@@ -148,7 +203,8 @@ for _ in {1..300}; do
     fi
     sleep 0.1
 done
-if [[ ! -s ${control_file} ]]; then
+if [[ ! -s ${control_file} ]] ||
+   { [[ -n ${wifi_log} ]] && ! grep -q 'ALVR control accepted' "${wifi_log}" 2>/dev/null; }; then
     print -u2 "FAIL: timed out waiting for ALVR StreamReady/runtime control file."
     exit 1
 fi
