@@ -423,6 +423,10 @@ public final class BottleManager: @unchecked Sendable {
         }
 
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: false)
+        // A half-made bottle keeps its name taken and has no delete action, so
+        // every failure after this point removes the directory again.
+        var created = false
+        defer { if !created { try? fileManager.removeItem(at: directory) } }
         let prefix = directory.appendingPathComponent("prefix", isDirectory: true)
         let selectedEngineRoot: URL
         let selectedWine: URL
@@ -448,7 +452,10 @@ public final class BottleManager: @unchecked Sendable {
             engineRoot: selectedEngineRoot, wineBinary: selectedWine)
         try saveBottle(bottle)
 
-        guard initializePrefix else { return bottle }
+        guard initializePrefix else {
+            created = true
+            return bottle
+        }
 
         let bootBinary = selectedEngineRoot.appendingPathComponent("bin/wineboot")
         let boot: CommandOutput
@@ -465,6 +472,7 @@ public final class BottleManager: @unchecked Sendable {
             throw BottleToolError("wineboot failed for '\(name)': \(boot.trimmedOutput)")
         }
         bottle = try loadBottle(name)
+        created = true
         return bottle
     }
 
@@ -487,18 +495,23 @@ public final class BottleManager: @unchecked Sendable {
         // launch will update the cloned prefix with the selected engine.
         let bottle = try createBottle(
             name: name, engineID: engineID, initializePrefix: false)
-        let destination = URL(fileURLWithPath: bottle.prefixPath, isDirectory: true)
-        let copy = try runner.run(
-            executable: URL(fileURLWithPath: "/bin/cp"),
-            arguments: ["-cR", source.path + "/.", destination.path],
-            environment: [:], currentDirectory: nil)
-        guard copy.status == 0 else {
-            throw BottleToolError(
-                "Could not copy the external prefix: "
-                    + copy.trimmedOutput)
+        do {
+            let destination = URL(fileURLWithPath: bottle.prefixPath, isDirectory: true)
+            let copy = try runner.run(
+                executable: URL(fileURLWithPath: "/bin/cp"),
+                arguments: ["-cR", source.path + "/.", destination.path],
+                environment: [:], currentDirectory: nil)
+            guard copy.status == 0 else {
+                throw BottleToolError(
+                    "Could not copy the external prefix: "
+                        + copy.trimmedOutput)
+            }
+            try suppressSteamAutoLaunch(in: destination)
+            return try loadBottle(name)
+        } catch {
+            try? fileManager.removeItem(at: paths.bottleDirectory(name))
+            throw error
         }
-        try suppressSteamAutoLaunch(in: destination)
-        return try loadBottle(name)
     }
 
     /// Prevent Wine maintenance commands from processing Steam's login Run
@@ -1087,6 +1100,9 @@ public final class BottleManager: @unchecked Sendable {
               shim[shim.index(after: shim.startIndex)] == 0x5a else {
             throw BottleToolError("Steam UI compatibility artifact is not a Windows PE executable")
         }
+        guard Self.isSteamWebHelperShim(shim) else {
+            throw BottleToolError("Steam UI compatibility artifact is not Basalt's helper launcher")
+        }
 
         let candidates = [
             prefix.appendingPathComponent(
@@ -1117,13 +1133,15 @@ public final class BottleManager: @unchecked Sendable {
         }
         let installed = try Data(contentsOf: helper)
 
-        if installed != shim {
+        if !Self.isSteamWebHelperShim(installed) {
             guard installed.count >= 2, installed[installed.startIndex] == 0x4d,
                   installed[installed.index(after: installed.startIndex)] == 0x5a else {
                 throw BottleToolError("Steam's web helper is not a Windows PE executable")
             }
             // This is either the initial install or a newer helper written by
-            // Steam. Preserve that exact version for the shim to launch.
+            // Steam. Preserve that exact version for the shim to launch. Any
+            // build of Basalt's own shim, including an older one, is skipped so
+            // it can never replace the original and relaunch itself.
             try copyFile(helper, to: backup)
         } else {
             guard fileManager.fileExists(atPath: backup.path) else {
@@ -1137,10 +1155,22 @@ public final class BottleManager: @unchecked Sendable {
               original[original.index(after: original.startIndex)] == 0x5a else {
             throw BottleToolError("Steam's preserved web helper is not a Windows PE executable")
         }
-        if installed != shim {
-            try copyFile(artifact, to: helper)
+        guard !Self.isSteamWebHelperShim(original) else {
+            throw BottleToolError(
+                "Steam's preserved web helper was overwritten by the compatibility shim; verify Steam's files, then try again")
         }
+        try copyFile(artifact, to: helper)
         return helper
+    }
+
+    /// Every build of the shim embeds the UTF-16 name of the helper it
+    /// launches, which Steam's own helper never contains. Comparing bytes with
+    /// the current artifact is not enough: rebuilds change the PE timestamp.
+    static func isSteamWebHelperShim(_ executable: Data) -> Bool {
+        let marker = Data("steamwebhelper.basalt-original.exe".utf16.flatMap {
+            [UInt8($0 & 0xff), UInt8($0 >> 8)]
+        })
+        return executable.range(of: marker) != nil
     }
 
     public func steamBootstrapCommand(forProfile name: String) throws -> BottleLaunchCommand? {

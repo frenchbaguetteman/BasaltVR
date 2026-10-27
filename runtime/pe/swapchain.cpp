@@ -44,6 +44,10 @@ struct SwapchainRecord {
         kSwapchainImageCount>
         exportTextures{};
     std::array<ImageState, kSwapchainImageCount> imageStates{};
+    // Wait and release apply to the oldest acquired image (OpenXR FIFO), so
+    // each acquire is stamped with a monotonically increasing sequence.
+    std::array<uint64_t, kSwapchainImageCount> acquireSequence{};
+    uint64_t nextAcquireSequence = 1;
     uint32_t nextAcquireIndex = 0;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -123,6 +127,19 @@ SwapchainRecord* findSwapchainLocked(XrSwapchain swapchain) {
         }
     }
     return nullptr;
+}
+
+// Returns kSwapchainImageCount when no image is in the requested state.
+uint32_t oldestImageInStateLocked(const SwapchainRecord& record, ImageState state) {
+    uint32_t oldest = kSwapchainImageCount;
+    for (uint32_t index = 0; index < kSwapchainImageCount; ++index) {
+        if (record.imageStates[index] == state &&
+            (oldest == kSwapchainImageCount ||
+             record.acquireSequence[index] < record.acquireSequence[oldest])) {
+            oldest = index;
+        }
+    }
+    return oldest;
 }
 
 }  // namespace
@@ -402,6 +419,7 @@ XrResult XRAPI_CALL acquireSwapchainImage(
             (record->nextAcquireIndex + offset) % kSwapchainImageCount;
         if (record->imageStates[candidate] == ImageState::Available) {
             record->imageStates[candidate] = ImageState::Acquired;
+            record->acquireSequence[candidate] = record->nextAcquireSequence++;
             record->nextAcquireIndex = (candidate + 1) % kSwapchainImageCount;
             *index = candidate;
             ReleaseSRWLockExclusive(&gSwapchainLock);
@@ -425,12 +443,11 @@ XrResult XRAPI_CALL waitSwapchainImage(
         ReleaseSRWLockExclusive(&gSwapchainLock);
         return XR_ERROR_HANDLE_INVALID;
     }
-    for (ImageState& state : record->imageStates) {
-        if (state == ImageState::Acquired) {
-            state = ImageState::Waited;
-            ReleaseSRWLockExclusive(&gSwapchainLock);
-            return XR_SUCCESS;
-        }
+    const uint32_t index = oldestImageInStateLocked(*record, ImageState::Acquired);
+    if (index < kSwapchainImageCount) {
+        record->imageStates[index] = ImageState::Waited;
+        ReleaseSRWLockExclusive(&gSwapchainLock);
+        return XR_SUCCESS;
     }
     ReleaseSRWLockExclusive(&gSwapchainLock);
     return XR_ERROR_CALL_ORDER_INVALID;
@@ -449,14 +466,13 @@ XrResult XRAPI_CALL releaseSwapchainImage(
         ReleaseSRWLockExclusive(&gSwapchainLock);
         return XR_ERROR_HANDLE_INVALID;
     }
-    for (uint32_t index = 0; index < kSwapchainImageCount; ++index) {
-        if (record->imageStates[index] == ImageState::Waited) {
-            record->imageStates[index] = ImageState::Available;
-            record->everReleased = true;
-            record->lastReleasedIndex = index;
-            ReleaseSRWLockExclusive(&gSwapchainLock);
-            return XR_SUCCESS;
-        }
+    const uint32_t index = oldestImageInStateLocked(*record, ImageState::Waited);
+    if (index < kSwapchainImageCount) {
+        record->imageStates[index] = ImageState::Available;
+        record->everReleased = true;
+        record->lastReleasedIndex = index;
+        ReleaseSRWLockExclusive(&gSwapchainLock);
+        return XR_SUCCESS;
     }
     ReleaseSRWLockExclusive(&gSwapchainLock);
     return XR_ERROR_CALL_ORDER_INVALID;

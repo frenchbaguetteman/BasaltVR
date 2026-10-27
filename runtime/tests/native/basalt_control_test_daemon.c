@@ -240,6 +240,17 @@ static bool handle_haptic(int fd, const uint8_t* payload, size_t length) {
         }
         return send_right_system_click(fd, 0.0f);
     }
+    // Model a replacement ALVR session: InputReset, then the retained input
+    // state again under a restarted Quest clock (timestamps below the old 2).
+    if (duration != 0 && __builtin_fabsf(amplitude - 0.625f) < 0.0001f) {
+        return send_message(fd, BASALT_MSG_INPUT_RESET, NULL, 0) &&
+               send_touch_profile(fd, 0) &&
+               send_touch_profile(fd, 1) &&
+               send_left_squeeze(fd, 0.25f) &&
+               send_head_pose(fd, 1) &&
+               send_controller_motion(fd, 1, 0) &&
+               send_controller_mask(fd, 1, 1);
+    }
     // Interleave a sparse button delta with reverse haptic traffic. The next
     // xrSyncActions must observe this as a change, without disturbing other
     // retained inputs.
@@ -689,9 +700,9 @@ int main(int argc, char** argv) {
                 g_frames_received, expect_frames);
         return 1;
     }
-    if (g_haptics_received != 5) {
+    if (g_haptics_received != 6) {
         fprintf(stderr,
-                "FAIL: received %" PRIu64 " haptic commands, expected exactly 5\n",
+                "FAIL: received %" PRIu64 " haptic commands, expected exactly 6\n",
                 g_haptics_received);
         return 1;
     }

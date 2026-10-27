@@ -48,6 +48,16 @@ All notable changes to BasaltVR are documented here.
 
 ### Fixed
 
+- Reinstalling the Steam UI compatibility launcher after a rebuild no longer overwrites Steam's
+  preserved web helper with an older launcher build, which made the helper relaunch itself.
+- A bottle whose creation or import fails is removed instead of being left half-made with its
+  name taken.
+- Quitting after closing the window now still stops the game, Steam, and the bottle's Wine
+  processes. Stop no longer freezes the window while Wine shuts down; the next launch waits for it.
+- The session log keeps each process's stdout and stderr lines whole and in order, and prefixes
+  every Steam/game line rather than only the first line of each chunk.
+- Diagnostic reports no longer include audio device names (only BlackHole or another device) or
+  `[U:1:…]` Steam IDs.
 - Open BSManager now launches with `start /wait`. A bare `start` exited immediately, and the
   utility exit handler then stopped every Wine process in the bottle, closing BSManager before its
   window appeared.
@@ -65,6 +75,25 @@ All notable changes to BasaltVR are documented here.
 - Pressing Stop while a session is still starting now cancels the launch. Previously it could
   go on to start Steam, the streamer, and the game, report a spurious failure, or, after a
   delayed Steam sign-in timeout, tear down a session started afterwards.
+- The runtime advertises and accepts `LOCAL_FLOOR` and `STAGE` reference spaces, and only `VIEW`
+  follows the head. Previously a VIEW-relative query against a floor space returned a constant
+  pose, so OpenVR titles using a standing space rendered a frozen camera.
+- An action set can be attached to a new session after its previous session is destroyed
+  (OpenComposite rebuilds its session and re-attaches); it stays immutable.
+- Swapchains may be up to twice the per-eye maximum width and height, so a side-by-side image with
+  both eyes (UE4) is accepted, and `DXGI_FORMAT_B8G8R8A8_TYPELESS` is accepted as BGRA.
+- Runtime stereo composition honours each eye's `imageRect`; side-by-side submissions no longer
+  show the whole image squeezed into each eye.
+- `xrGetReferenceSpaceBoundsRect` reports unavailable bounds for STAGE and LOCAL_FLOOR instead
+  of rejecting them, which made OpenComposite abort at startup.
+- Controller velocity is reported against LOCAL_FLOOR and STAGE, not only LOCAL.
+- `xrEndFrame` accepts (validated) quad layers instead of failing the whole frame; quads are not
+  yet composed, and the frame's projection layer is still streamed.
+- After the headset reconnects with a restarted clock, head tracking resumes instead of
+  dropping every pose whose timestamp is lower than the previous session's.
+- Recentering also queues reference-space-change events for existing STAGE and LOCAL_FLOOR
+  spaces; a full event queue never drops session-state changes and reports
+  `XrEventDataEventsLost`; swapchain wait/release follow acquire order.
 - Stopping the streamer during the USB headset handshake, or a failed start, now restores the Mac
   audio output and removes the adb forwards instead of leaving them behind.
 - A closed USB video stream no longer spins the streamer at 100% CPU.
@@ -87,6 +116,10 @@ All notable changes to BasaltVR are documented here.
 - Added one-command environment, test, build, documentation-link, and repository-hygiene checks.
 - Added maintainer, support, triage, compatibility-report, and contributor workflows.
 - Hardened GitHub Actions configuration and release preflight validation.
+- `make check` checks whitespace in every commit since the merge base with `origin/main` (or the
+  pull request's base), not only uncommitted edits, and syntax-checks the app launcher script.
+- The release packager refuses an incomplete DXMT artifact set instead of shipping it as included,
+  and the DXMT fork build rebuilds a patched checkout that sits on an outdated upstream commit.
 
 ## 0.1.0 - 2026-07-28
 

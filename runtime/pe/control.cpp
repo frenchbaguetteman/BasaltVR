@@ -542,6 +542,12 @@ bool parseInputReset(size_t payloadLength) {
         return false;
     }
     resetInputsLocked();
+    // A replacement ALVR session restarts the Quest clock, so head samples
+    // must not be ordered against the old session's timestamps. Keep the
+    // LOCAL origin: the user's world frame has not moved.
+    gHeadPoseValid = false;
+    gHeadPoseQuestTimestamp = 0;
+    gHeadPoseArrival = 0;
     return true;
 }
 
@@ -752,7 +758,7 @@ bool requestMessage(
 
 // --- connection lifecycle ---------------------------------------------------
 
-// Joining must happen without the lock held (the waiter takes it to send),
+// Joining must happen without the lock held (the waiter takes it per frame),
 // so disconnect splits into a locked teardown that hands out the thread
 // handle and an unlocked join.
 struct DisconnectState {
@@ -838,6 +844,27 @@ void finishDisconnect(DisconnectState& state, bool sendTeardown) {
     release(state.context4);
 }
 
+// Called by the waiter thread when it can no longer honour the frame-done
+// contract. Another disconnect may already own teardown (and the join).
+void disconnectFromWaiter() {
+    AcquireSRWLockExclusive(&gControlLock);
+    const bool stopping = gWaiterStop;
+    DisconnectState state;
+    if (!stopping) {
+        state = beginDisconnectLocked();
+        // A thread cannot join itself; the handle alone is safe to close
+        // while running.
+        if (state.waiterThread != nullptr) {
+            CloseHandle(state.waiterThread);
+            state.waiterThread = nullptr;
+        }
+    }
+    ReleaseSRWLockExclusive(&gControlLock);
+    if (!stopping) {
+        finishDisconnect(state, false);
+    }
+}
+
 // The waiter thread: pops queued frames in order, waits the fence value on
 // the CPU, and only then sends FrameReady — the Phase-1 frame-done contract.
 // The receiver advances gLastConsumedFrameNumber only after the daemon has
@@ -874,49 +901,22 @@ DWORD WINAPI waiterThreadProc(LPVOID) {
             FAILED(fence->SetEventOnCompletion(frame.frameNumber, fenceEvent)) ||
             WaitForSingleObject(fenceEvent, kFenceWaitMilliseconds) != WAIT_OBJECT_0) {
             // The frame-done contract broke; stop sending rather than lie.
-            AcquireSRWLockExclusive(&gControlLock);
-            const bool stopping = gWaiterStop;
-            DisconnectState state;
-            if (!stopping) {
-                state = beginDisconnectLocked();
-                // A thread cannot join itself; the handle alone is safe to
-                // close while running.
-                if (state.waiterThread != nullptr) {
-                    CloseHandle(state.waiterThread);
-                    state.waiterThread = nullptr;
-                }
-            }
-            ReleaseSRWLockExclusive(&gControlLock);
-            if (!stopping) {
-                finishDisconnect(state, false);
-            }
+            disconnectFromWaiter();
             return 0;
         }
 
-        AcquireSRWLockExclusive(&gControlLock);
-        bool sent = false;
-        if (!gWaiterStop && gSocket != INVALID_SOCKET) {
-            sent = sendMessage(
-                gSocket, BASALT_MSG_FRAME_READY, frame.payload, frame.payloadLength);
-        } else {
-            sent = true;  // shutting down; nothing to report
+        // Send outside gControlLock so a slow socket cannot stall tracking
+        // and xrWaitFrame for the send timeout. The socket stays open until
+        // teardown has shut it down and joined this thread.
+        AcquireSRWLockShared(&gControlLock);
+        const SOCKET socket = gWaiterStop ? INVALID_SOCKET : gSocket;
+        ReleaseSRWLockShared(&gControlLock);
+        if (socket == INVALID_SOCKET) {
+            continue;  // shutting down; nothing to report
         }
-        ReleaseSRWLockExclusive(&gControlLock);
-        if (!sent) {
-            AcquireSRWLockExclusive(&gControlLock);
-            const bool stopping = gWaiterStop;
-            DisconnectState state;
-            if (!stopping) {
-                state = beginDisconnectLocked();
-                if (state.waiterThread != nullptr) {
-                    CloseHandle(state.waiterThread);
-                    state.waiterThread = nullptr;
-                }
-            }
-            ReleaseSRWLockExclusive(&gControlLock);
-            if (!stopping) {
-                finishDisconnect(state, false);
-            }
+        if (!sendMessage(
+                socket, BASALT_MSG_FRAME_READY, frame.payload, frame.payloadLength)) {
+            disconnectFromWaiter();
             return 0;
         }
     }

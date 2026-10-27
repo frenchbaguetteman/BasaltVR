@@ -41,7 +41,6 @@ void invalidatePathsForInstance(XrInstance instance);
 bool isKnownPath(XrPath path);
 bool pathStringEquals(XrPath path, const char* string);
 bool isTopLevelUserPath(XrPath path);
-bool isBindingSourcePath(XrPath path);
 
 bool getActionForSpace(
     XrAction action,
@@ -242,11 +241,8 @@ XrResult XRAPI_CALL createReferenceSpace(
 XrResult XRAPI_CALL destroySpace(XrSpace space);
 void invalidateSpacesForSession(XrSession session);
 uint64_t locatedViewsQuestTimestamp(XrSession session, XrTime displayTime);
-bool getReferenceSpace(
-    XrSpace space,
-    XrSession* session,
-    XrReferenceSpaceType* referenceSpaceType,
-    XrPosef* poseInReferenceSpace);
+bool sessionHasReferenceSpace(
+    XrSession session, XrReferenceSpaceType referenceSpaceType);
 XrResult XRAPI_CALL enumerateSwapchainFormats(
     XrSession session,
     uint32_t formatCapacityInput,

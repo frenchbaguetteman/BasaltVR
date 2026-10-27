@@ -20,8 +20,8 @@ WhiskyWine 7.7 with Apple D3DMetal fails the gate and therefore sees zero runtim
 extensions; pinned DXMT v0.80 under Wine 11.10 passes it.
 
 The runtime now also provides FIFO session events, the required session control calls, an
-absolute-deadline 72 Hz `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame` contract, and bounded `VIEW`/`LOCAL`
-reference-space handles. Headless sessions stop at `SYNCHRONIZED` with `shouldRender` false.
+absolute-deadline 72 Hz `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame` contract, and bounded `VIEW`,
+`LOCAL`, `LOCAL_FLOOR`, and `STAGE` reference-space handles. Headless sessions stop at `SYNCHRONIZED` with `shouldRender` false.
 Sessions authenticated to the native `RuntimeLink` progress through `VISIBLE`/`FOCUSED` with
 `shouldRender` true and unwind those states during clean exit.
 
@@ -54,7 +54,8 @@ runtime logs `right system button pressed` to stderr when ALVR forwards the butt
 flags, session ownership of the layer space and each subimage swapchain, per-view poses and
 FOV, in-bounds image rects (`XR_ERROR_SWAPCHAIN_RECT_INVALID`), the 16-layer minimum limit
 (`XR_ERROR_LAYER_LIMIT_EXCEEDED`), and that every referenced swapchain has a released image.
-Quad and extension layers are still rejected. With the Basalt DXMT fork and an authenticated
+Quad layers are validated and accepted but not yet composed (a frame with only quads submits
+nothing); extension layers are still rejected. With the Basalt DXMT fork and an authenticated
 control connection, accepted projection layers are fence-gated and forwarded by IOSurfaceID to
 the native Swift streamer for stereo composition and encoding. This path is machine-verified and
 has a Basalt-shaped visible wired-headset diagnostic. The pinned official Khronos `hello_xr`
@@ -129,9 +130,10 @@ script registers Basalt's manifest only in that prefix, and
 then uses the official Khronos loader to exercise reference spaces, session and interaction-profile
 events, frame call ordering, exact profile bindings/localized names, action-set priority, action
 spaces, velocity, controller loss/recovery, haptics, static `xrLocateSpace`/`xrLocateViews`,
-projection-layer submission (accept, quad/limit/rect/never-released rejection), and two independent
-three-image D3D11 swapchains. It also verifies that a two-slice texture-array swapchain is rejected
-so engines can take a per-eye multipass fallback. It does not modify `/Applications`,
+projection-layer submission (accept, quad acceptance/validation, limit/rect/never-released
+rejection), FIFO swapchain wait/release order, and two independent three-image D3D11 swapchains.
+It also creates and submits a two-slice texture-array swapchain (Unity's Single Pass Instanced
+shape), whose slices the runtime copies into per-eye IOSurface exports. It does not modify `/Applications`,
 Whisky, CrossOver, or a game bottle. Rosetta 2 is required on Apple Silicon. Override the
 generated prefix only with
 `BASALT_DXMT_WINEPREFIX`; never point that variable at a game bottle.

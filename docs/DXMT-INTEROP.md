@@ -164,7 +164,7 @@ Framing: little-endian, `u32 length` + `u16 message type` + payload; strict prot
 | `ControllerMotion` (daemon → runtime) | Quest timestamp, hand, quaternion/position, linear/angular velocity | latest ALVR-corrected Touch grip sample; runtime-local receipt time gates freshness |
 | `ButtonState` (daemon → runtime) | ALVR path id, binary/scalar tag, value | sparse retained delta; `xrSyncActions` snapshots it into resolved Touch actions |
 | `InteractionProfile` (daemon → runtime) | hand, ALVR profile id | retained independently of pose freshness; Quest Touch is exposed through OpenXR |
-| `InputReset` (daemon → runtime) | empty | ALVR control loss/replacement atomically clears retained controller presence/pose/velocity, profile, and button state |
+| `InputReset` (daemon → runtime) | empty | ALVR control loss/replacement atomically clears retained controller presence/pose/velocity, profile, and button state, and the head pose with its Quest timestamp ordering (LOCAL keeps its origin) |
 | `ViewConfig` (daemon → runtime) | IPD and asymmetric left/right/up/down FOV for each eye | retained Quest calibration used by `xrLocateViews` and stereo projection |
 | `ControllerMask` (daemon → runtime) | Quest tracking timestamp, active-hand bit mask (bit 0 left, bit 1 right), zero reserved field | authoritative per-packet presence; a newer missing-hand bit immediately clears that hand's pose and velocity, and only newer presence/motion can recover it |
 | `Haptic` | hand, duration, frequency, amplitude | runtime→daemon; daemon packetizes this as ALVR stream ID 1 on the serialized video socket |
@@ -227,8 +227,8 @@ e.g. `v0.80-basalt.1` — so the runtime can detect and pin it.
    localized Touch actions, rendered for roughly 14 seconds, and cleanly traversed
    `STOPPING→IDLE→EXITING`. The companion live Quest scene is physically verified with fused,
    level/world-fixed stereo, tracked controller response, analog squeeze, and haptics at 72 fps.
-   The runtime rejects two-slice texture-array swapchains so engines select the supported per-eye
-   `arraySize=1` multipass path.
+   The runtime accepts two-slice texture-array swapchains and copies each slice into a per-eye
+   IOSurface export; patch 0004 still steers Unity to its per-eye `arraySize=1` multipass path.
 
 ## Open decisions
 

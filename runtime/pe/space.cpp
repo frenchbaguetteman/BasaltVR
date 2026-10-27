@@ -48,6 +48,15 @@ struct SpaceRecord {
     XrPosef pose{};
 };
 
+bool isSupportedReferenceSpace(XrReferenceSpaceType type) {
+    for (XrReferenceSpaceType supported : kSupportedReferenceSpaces) {
+        if (supported == type) {
+            return true;
+        }
+    }
+    return false;
+}
+
 SRWLOCK gSpaceLock = SRWLOCK_INIT;
 struct LocatedViewsSample {
     XrSession session = XR_NULL_HANDLE;
@@ -194,11 +203,7 @@ XrResult XRAPI_CALL createReferenceSpace(
         createInfo->type != XR_TYPE_REFERENCE_SPACE_CREATE_INFO) {
         return XR_ERROR_VALIDATION_FAILURE;
     }
-    bool knownType = false;
-    for (XrReferenceSpaceType supported : kSupportedReferenceSpaces) {
-        knownType = knownType || supported == createInfo->referenceSpaceType;
-    }
-    if (!knownType) {
+    if (!isSupportedReferenceSpace(createInfo->referenceSpaceType)) {
         return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
     }
     if (!poseValid(createInfo->poseInReferenceSpace)) {
@@ -411,13 +416,16 @@ XrResult XRAPI_CALL locateSpace(
         location->pose = poseCompose(poseInvert(baseInLocal), targetInLocal);
 
         // ALVR has already predicted the transmitted controller pose. Expose
-        // its raw velocity for the common action-in-LOCAL query without
+        // its raw velocity for action-in-world-space queries without
         // extrapolating the pose a second time. The action-space origin may
         // be offset from the controller origin, adding omega cross radius.
+        // LOCAL, LOCAL_FLOOR and STAGE are static offsets of one frame, so
+        // rotating into the base is exact; a VIEW base would also need the
+        // head's own motion.
         if (target.kind == SpaceKind::kAction && targetActionResolved &&
             targetHand < 2 && input.controllers[targetHand].poseActive &&
             base.kind == SpaceKind::kReference &&
-            base.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
+            base.referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW) {
             const ControlControllerState& controller =
                 input.controllers[targetHand];
             const XrVector3f radiusInLocal{
@@ -569,8 +577,7 @@ XrResult XRAPI_CALL getReferenceSpaceBoundsRect(
     if (bounds == nullptr) {
         return XR_ERROR_VALIDATION_FAILURE;
     }
-    if (referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW &&
-        referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL) {
+    if (!isSupportedReferenceSpace(referenceSpaceType)) {
         return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
     }
 
@@ -642,32 +649,20 @@ bool isPoseWellFormed(const XrPosef& pose) {
     return poseValid(pose);
 }
 
-bool getReferenceSpace(
-    XrSpace space,
-    XrSession* session,
-    XrReferenceSpaceType* referenceSpaceType,
-    XrPosef* poseInReferenceSpace) {
-    if (space == XR_NULL_HANDLE) {
-        return false;
-    }
+bool sessionHasReferenceSpace(
+    XrSession session, XrReferenceSpaceType referenceSpaceType) {
     AcquireSRWLockShared(&gSpaceLock);
-    const SpaceRecord* record = findSpaceLocked(space);
-    if (record != nullptr && record->kind != SpaceKind::kReference) {
-        record = nullptr;
-    }
-    if (record != nullptr) {
-        if (session != nullptr) {
-            *session = record->session;
-        }
-        if (referenceSpaceType != nullptr) {
-            *referenceSpaceType = record->referenceSpaceType;
-        }
-        if (poseInReferenceSpace != nullptr) {
-            *poseInReferenceSpace = record->pose;
+    bool found = false;
+    for (const SpaceRecord& record : gSpaces) {
+        if (record.handle != XR_NULL_HANDLE && record.session == session &&
+            record.kind == SpaceKind::kReference &&
+            record.referenceSpaceType == referenceSpaceType) {
+            found = true;
+            break;
         }
     }
     ReleaseSRWLockShared(&gSpaceLock);
-    return record != nullptr;
+    return found;
 }
 
 }  // namespace basalt
