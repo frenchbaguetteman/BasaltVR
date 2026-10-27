@@ -72,12 +72,17 @@ private struct BasaltCLI {
         --source direct|steam|bsmanager|itch --exe PATH [--cwd PATH] \
         [--arg VALUE ...] [--env KEY=VALUE ...]
       basaltctl [--root PATH] [--repo PATH] opencomposite install PROFILE \
-        --artifact /path/openvr_api.dll --target /managed/prefix/.../openvr_api.dll
+        --artifact /path/openvr_api.dll --target /managed/prefix/.../openvr_api.dll \
+        [--proxy /path/basalt/openvr_api.dll] [--preset default|alyx] \
+        [--ini KEY=VALUE ...]
       basaltctl [--root PATH] [--repo PATH] run PROFILE --control-file PATH [-- ARG ...]
+      basaltctl [--root PATH] [--repo PATH] steam start PROFILE [--log PATH]
 
     `bottle prepare` installs the Basalt DXMT fork and OpenXR runtime into an
     existing managed pinned-engine bottle. OpenComposite is deliberately supplied
-    by the user and remains a separate GPLv3 artifact.
+    by the user and remains a separate GPLv3 artifact. With --proxy, the Basalt
+    proxy becomes openvr_api.dll and OpenComposite is installed beside it as
+    openvr_api_opencomposite.dll; Half-Life: Alyx needs --proxy and --preset alyx.
     """
 
     static func main() {
@@ -111,6 +116,8 @@ private struct BasaltCLI {
                 try openCompositeCommand(&cursor, manager: manager)
             case "run":
                 try runCommand(&cursor, manager: manager)
+            case "steam":
+                try steamCommand(&cursor, manager: manager)
             default:
                 throw BottleToolError("Unknown command '\(command)'\n\n\(usage)")
             }
@@ -270,11 +277,32 @@ private struct BasaltCLI {
             throw BottleToolError(
                 "opencomposite install requires --artifact and --target")
         }
+        let proxy = try cursor.value(after: "--proxy")
+        let presetName = try cursor.value(after: "--preset") ?? "default"
+        guard let preset = OpenCompositeConfiguration.Preset(rawValue: presetName) else {
+            let names = OpenCompositeConfiguration.Preset.allCases.map(\.rawValue)
+            throw BottleToolError(
+                "Unknown OpenComposite preset '\(presetName)'; use \(names.joined(separator: " or "))")
+        }
+        let assignments = try cursor.repeatedValues(after: "--ini")
         try rejectRemainder(cursor)
+        if preset == .alyx, proxy == nil {
+            throw BottleToolError(
+                "--preset alyx requires --proxy: Half-Life: Alyx needs Valve's VRControlPanel export, which OpenComposite lacks")
+        }
+        var configuration = OpenCompositeConfiguration(preset: preset)
+        for assignment in assignments { try configuration.apply(assignment) }
         let installed = try manager.installOpenComposite(
             profileName: profile, artifact: URL(fileURLWithPath: artifact),
-            targetDLL: URL(fileURLWithPath: target))
-        print("Installed OpenComposite at \(installed.path)")
+            targetDLL: URL(fileURLWithPath: target),
+            proxy: proxy.map { URL(fileURLWithPath: $0) },
+            configuration: configuration)
+        if proxy != nil {
+            print("Installed the OpenVR proxy at \(installed.path)")
+            print("Installed OpenComposite at \(installed.deletingLastPathComponent().appendingPathComponent(BottleManager.openCompositeProxiedDLLName).path)")
+        } else {
+            print("Installed OpenComposite at \(installed.path)")
+        }
     }
 
     private static func runCommand(_ cursor: inout ArgumentCursor,
@@ -292,6 +320,43 @@ private struct BasaltCLI {
         guard result.status == 0 else {
             throw BottleToolError("Profile '\(profile)' exited with status \(result.status)")
         }
+    }
+
+    /// `steam start PROFILE`: installs the Steam web helper compatibility shim
+    /// (black Steam window fix), then starts Steam with the Basalt flags and
+    /// returns at once. Steam keeps running after this command ends.
+    private static func steamCommand(_ cursor: inout ArgumentCursor,
+                                     manager: BottleManager) throws {
+        let action = try cursor.require("steam action")
+        guard action == "start" else {
+            throw BottleToolError("Unknown steam action '\(action)' (use: start)")
+        }
+        let profile = try cursor.require("profile name")
+        let log = try cursor.value(after: "--log")
+        try rejectRemainder(cursor)
+        guard try manager.installSteamWebHelperCompatibility(forProfile: profile) != nil,
+              let command = try manager.steamBootstrapCommand(forProfile: profile) else {
+            throw BottleToolError("Profile '\(profile)' is not a Steam profile")
+        }
+        let process = Process()
+        process.executableURL = command.executable
+        process.arguments = command.arguments
+        process.currentDirectoryURL = command.currentDirectory
+        var environment = ProcessInfo.processInfo.environment
+        command.environment.forEach { environment[$0.key] = $0.value }
+        process.environment = environment
+        process.standardInput = FileHandle.nullDevice
+        if let log {
+            FileManager.default.createFile(atPath: log, contents: nil)
+            let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: log))
+            process.standardOutput = handle
+            process.standardError = handle
+        } else {
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+        }
+        try process.run()
+        print("Started Steam (pid \(process.processIdentifier))")
     }
 
     private static func rejectRemainder(_ cursor: ArgumentCursor) throws {

@@ -102,21 +102,50 @@ public struct AlvrNegotiatedSettings: Equatable, Sendable {
     public let enableHDR: Bool
 }
 
+/// How far ahead the ALVR client predicts controller poses.
+public enum ControllerPrediction: String, CaseIterable, Sendable {
+    /// The same horizon as the head (the measured pipeline latency).
+    case full
+    /// ALVR's default: `steamvr_pipeline_frames` less than the head.
+    case alvr
+}
+
 /// Encodes ALVR v20's bincode `StreamConfigPacket`: two UTF-8 strings,
 /// each represented by a little-endian u64 byte length followed by bytes.
 public enum AlvrStreamConfigEncoder {
-    public static func payload(settings: AlvrNegotiatedSettings, wired: Bool = false) throws -> Data {
+    /// `controllerPrediction` `.full` sends
+    /// `headset.controllers.content.steamvr_pipeline_frames = 0`. The ALVR
+    /// client predicts controllers `steamvr_pipeline_frames` frames (default
+    /// 3.0 in v20.11, 2.1 in v20.14) less than the head, because SteamVR is
+    /// expected to extrapolate the rest; Basalt's runtime does not, so with the
+    /// ALVR default the controllers lag the head by 2–3 frames.
+    ///
+    /// `codec` is sent as `video.preferred_codec`, as the stock server's full
+    /// session settings carry it. The v20 client takes the codec that it
+    /// decodes from each `DecoderConfig` packet, not from this field.
+    public static func payload(settings: AlvrNegotiatedSettings, wired: Bool = false,
+                               controllerPrediction: ControllerPrediction = .full,
+                               codec: VideoCodec = .h264) throws -> Data {
         // ALVR v20's fuzzy merge requires the session_settings key. These
         // values come from the selected, explicit latency preset; balanced is
         // the validated baseline and low trims only 0.2 buffered frame.
-        let sessionObject: [String: Any] = [
-            "session_settings": [
-                "video": [
-                    "max_buffering_frames": settings.maximumBufferingFrames,
-                    "buffering_history_weight": settings.bufferingHistoryWeight,
-                ],
+        var sessionSettings: [String: Any] = [
+            "video": [
+                "max_buffering_frames": settings.maximumBufferingFrames,
+                "buffering_history_weight": settings.bufferingHistoryWeight,
+                // A session-JSON Choice is {"variant": name}
+                // (`alvr/session/src/lib.rs`).
+                "preferred_codec": ["variant": codec.alvrVariantName],
             ],
         ]
+        if controllerPrediction == .full {
+            // Partial JSON: the client merges it onto its own defaults, and a
+            // Switch without "enabled" keeps the default (enabled).
+            sessionSettings["headset"] = [
+                "controllers": ["content": ["steamvr_pipeline_frames": 0.0]],
+            ]
+        }
+        let sessionObject: [String: Any] = ["session_settings": sessionSettings]
         let session = try JSONSerialization.data(withJSONObject: sessionObject,
                                                   options: [.sortedKeys])
         let negotiatedObject: [String: Any] = [
@@ -139,8 +168,12 @@ public enum AlvrStreamConfigEncoder {
     }
 
     public static func framedPacket(settings: AlvrNegotiatedSettings,
-                                    wired: Bool = false) throws -> Data {
-        let payload = try payload(settings: settings, wired: wired)
+                                    wired: Bool = false,
+                                    controllerPrediction: ControllerPrediction = .full,
+                                    codec: VideoCodec = .h264)
+        throws -> Data {
+        let payload = try payload(settings: settings, wired: wired,
+                                  controllerPrediction: controllerPrediction, codec: codec)
         guard payload.count <= AlvrControlProbe.maximumPacketBytes else {
             throw BasaltError("ALVR stream configuration is too large")
         }

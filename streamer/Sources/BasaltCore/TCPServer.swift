@@ -31,6 +31,22 @@ public final class TCPServer: @unchecked Sendable {
     private var connections: [NWConnection] = []
     private var pendingBytes: [ObjectIdentifier: Int] = [:]
     private var startupContinuation: CheckedContinuation<Void, Error>?
+    private let clientCountLock = NSLock()
+    private var clientCount = 0
+
+    /// True while at least one preview client is connected. Safe to read
+    /// from any thread; producers use it to skip work nobody will receive.
+    public var hasClients: Bool {
+        clientCountLock.lock()
+        defer { clientCountLock.unlock() }
+        return clientCount > 0
+    }
+
+    private func updateClientCount() {
+        clientCountLock.lock()
+        clientCount = connections.count
+        clientCountLock.unlock()
+    }
 
     public init(port: UInt16, bindHost: String) throws {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
@@ -94,6 +110,7 @@ public final class TCPServer: @unchecked Sendable {
                         self.pendingBytes[ObjectIdentifier(connection)] = nil
                         if let index = self.connections.firstIndex(where: { $0 === connection }) {
                             self.connections.remove(at: index)
+                            self.updateClientCount()
                             print("Client disconnected")
                         }
                     }
@@ -110,6 +127,7 @@ public final class TCPServer: @unchecked Sendable {
                     return
                 }
                 self.connections.append(connection)
+                self.updateClientCount()
                 connection.start(queue: self.queue)
             }
         }
@@ -143,6 +161,7 @@ public final class TCPServer: @unchecked Sendable {
             self.listener.cancel()
             for connection in self.connections { connection.cancel() }
             self.connections.removeAll()
+            self.updateClientCount()
             self.pendingBytes.removeAll()
         }
         if DispatchQueue.getSpecific(key: queueKey) != nil {

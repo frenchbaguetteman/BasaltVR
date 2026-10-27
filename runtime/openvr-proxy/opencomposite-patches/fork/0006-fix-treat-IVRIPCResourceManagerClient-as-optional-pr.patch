@@ -1,0 +1,56 @@
+From 339509b9caf534fa2ced71dc71331ec3c9c3a1a6 Mon Sep 17 00:00:00 2001
+From: Mac <charmillionaire@192.168.1.100>
+Date: Mon, 12 Oct 2026 21:22:27 +0800
+Subject: [PATCH 6/6] fix: treat IVRIPCResourceManagerClient as optional probe,
+ return NotFound
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+问题：Half-Life: Alyx 启动弹窗
+  'OpenComposite DLLMain ERROR: unknown/unsupported interface IVRIPCResourceManagerClient_004'
+
+根因：该接口是 SteamVR 的**可选能力探测**，用于'零拷贝呈现'
+（把 swapchain 以共享纹理形式交给应用，而不是走 IVRCompositor::Submit）。
+SteamVR 不给它时，应用应回退到普通 Submit 路径；但我们此前走
+'unknown/unsupported interface' 的 ABORT 分支，直接把游戏打断。
+
+修复：在 VR_GetGenericInterface 中识别该接口前缀，
+返回 VRInitError_Init_InterfaceNotFound + nullptr（与既有 IXrProto_001
+处理方式一致），让游戏自行回退。
+
+核对 Alyx 请求的全部接口，现已 100% 覆盖：
+  IVRApplications_007 / IVRChaperone_004 / IVRCompositor_029 /
+  IVRHeadsetView_001 / IVRInputInternal_002 / IVRInput_011 /
+  IVRMailbox_001 / IVROverlayView_003 / IVROverlay_028 /
+  IVRRenderModels_006 / IVRSystem_026
+---
+ OCOVR/openvr_api.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/OCOVR/openvr_api.cpp b/OCOVR/openvr_api.cpp
+index a49444a8ec84ed014ecaf4df2fc05bd03cdbf5c3..10297e526cc4a9d5487b6eb69bb5fd279c03ed58 100644
+--- a/OCOVR/openvr_api.cpp
++++ b/OCOVR/openvr_api.cpp
+@@ -96,6 +96,18 @@ VR_INTERFACE void* VR_CALLTYPE VR_GetGenericInterface(const char* interfaceVersi
+ 		return NULL;
+ 	}
+ 
++	// Hack for Half-Life: Alyx (and other recent SteamVR titles)
++	// IVRIPCResourceManagerClient is an *optional* capability probe: SteamVR uses it for
++	// "zero-copy presentation" (handing swapchains to the app as shared textures instead of
++	// submitting them via IVRCompositor::Submit). Apps are expected to cope when it is absent
++	// and fall back to regular Submit. If we instead abort here, the game dies at startup.
++	// So: report the interface as not found, exactly like the IXrProto_001 case above.
++	if (!strncmp(interfaceVersion, "IVRIPCResourceManagerClient_", strlen("IVRIPCResourceManagerClient_"))) {
++		if (error)
++			*error = VRInitError_Init_InterfaceNotFound;
++		return nullptr;
++	}
++
+ 	// Hack (kinda) for Vivecraft
+ 	// They actually used our API! I think they were the only application that ever did so (though only to detect
+ 	//  if OC was present or not, and it seems that information is no longer used).
+-- 
+2.39.5
+

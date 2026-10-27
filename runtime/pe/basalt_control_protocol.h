@@ -26,7 +26,10 @@
  *     u16 protocol_version, char token[32], u64 session_id,
  *     u16 renderer_length, char renderer[]   — adapter/DXMT description
  *   HELLO_ACK (daemon → runtime)
- *     u16 accepted_protocol_version
+ *     u16 accepted_protocol_version, u64 display_period_ns
+ *     — the headset refresh period xrWaitFrame paces to (the Quest rate the
+ *     daemon negotiated). Outside BASALT_CONTROL_{MIN,MAX}_DISPLAY_PERIOD_NS
+ *     the runtime keeps BASALT_CONTROL_DEFAULT_DISPLAY_PERIOD_NS (72 Hz).
  *   CREATE_SWAPCHAIN (runtime → daemon)
  *     u64 swapchain_id, u32 width, u32 height, u32 dxgi_format,
  *     u32 image_count, u32 iosurface_id[image_count]
@@ -70,9 +73,13 @@
  *     u32 reason (BASALT_TEARDOWN_*)
  */
 
-#define BASALT_CONTROL_PROTOCOL_VERSION 9u
+#define BASALT_CONTROL_PROTOCOL_VERSION 10u
 #define BASALT_CONTROL_TOKEN_LENGTH 32u
 #define BASALT_CONTROL_MAX_MESSAGE_LENGTH 4096u
+/* Display period bounds for HELLO_ACK: 240 Hz to 30 Hz; default 72 Hz. */
+#define BASALT_CONTROL_MIN_DISPLAY_PERIOD_NS 4166666u
+#define BASALT_CONTROL_MAX_DISPLAY_PERIOD_NS 33333334u
+#define BASALT_CONTROL_DEFAULT_DISPLAY_PERIOD_NS 13888889u
 /* Per-eye view size bounds. The maximum is also the runtime's advertised and
  * accepted swapchain limit. */
 #define BASALT_CONTROL_MIN_VIEW_DIMENSION 256u
