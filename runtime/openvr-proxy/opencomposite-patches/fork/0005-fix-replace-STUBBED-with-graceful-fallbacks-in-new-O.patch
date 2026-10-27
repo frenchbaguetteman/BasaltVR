@@ -1,0 +1,153 @@
+From b3332d3df56cc25f57e4a111f2c9ddcd4a93b4bd Mon Sep 17 00:00:00 2001
+From: Mac <charmillionaire@192.168.1.100>
+Date: Mon, 12 Oct 2026 20:44:15 +0800
+Subject: [PATCH 5/6] fix: replace STUBBED() with graceful fallbacks in new
+ OpenVR 2.x methods
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+问题：游戏启动即弹窗 'Hit stubbed file ... BaseSystem.cpp:906 func SetSDKVersion'
+根因：STUBBED() 内部调用 OOVR_ABORT，是'弹窗并中断'语义，不是'打日志'。
+      上轮为补齐接口直接套用了 STUBBED()，导致新版游戏调用这些方法时被强制打断。
+
+共修复 11 处（分布在 5 个文件）：
+- BaseSystem::SetSDKVersion            → 静默接受，返回 VRInitError_None（游戏启动必调）
+- BaseSystem::PollNextEventWithPoseAndOverlays → 退化为 PollNextEventWithPose
+- BaseSystem::ComputeDistortionSet     → 返回 false（本就不做畸变校正）
+- BaseSystem::GetEyeTrackedFoveationCenter(ForProjection) → 零向量 + false
+- BaseCompositor::GetSubmitTexture     → 返回 106 + 标记无需 flush
+- BaseApplications::RegisterSubprocess → 返回 VRApplicationError_None
+- BaseInput::GetEyeTrackingDataForNextFrame / RelativeToNow → VRInputError_InvalidHandle
+- BaseOverlay::CreateSubviewOverlay / SetSubviewPosition → VROverlayError_InvalidParameter
+
+统一改用 OOVR_LOG_ONCE / OOVR_LOGF 记录，避免刷屏且不再中断游戏。
+---
+ OpenOVR/Reimpl/BaseApplications.cpp |  3 ++-
+ OpenOVR/Reimpl/BaseCompositor.cpp   |  4 +++-
+ OpenOVR/Reimpl/BaseInput.cpp        |  5 +++--
+ OpenOVR/Reimpl/BaseOverlay.cpp      |  6 ++++--
+ OpenOVR/Reimpl/BaseSystem.cpp       | 21 +++++++++++++++------
+ 5 files changed, 27 insertions(+), 12 deletions(-)
+
+diff --git a/OpenOVR/Reimpl/BaseApplications.cpp b/OpenOVR/Reimpl/BaseApplications.cpp
+index dc08288a2e4ff220ede8dcdc4c647d28a22213eb..e8fc36a2b57096eb0dc4c1dddb93899163d4f8fa 100644
+--- a/OpenOVR/Reimpl/BaseApplications.cpp
++++ b/OpenOVR/Reimpl/BaseApplications.cpp
+@@ -180,6 +180,7 @@ uint32_t BaseApplications::GetCurrentSceneProcessId()
+ 
+ BaseApplications::EVRApplicationError BaseApplications::RegisterSubprocess(uint32_t nPid)
+ {
+-	STUBBED();
++	// 告知"注册成功"，避免打断游戏的多进程启动流程
++	OOVR_LOGF("RegisterSubprocess(pid=%u) - accepted", nPid);
+ 	return VRApplicationError_None;
+ }
+diff --git a/OpenOVR/Reimpl/BaseCompositor.cpp b/OpenOVR/Reimpl/BaseCompositor.cpp
+index f8941593226eb65121318019d2974b1b27ba61a2..849195e9676c21057acd92a8ebe22fff08e9e0d7 100644
+--- a/OpenOVR/Reimpl/BaseCompositor.cpp
++++ b/OpenOVR/Reimpl/BaseCompositor.cpp
+@@ -604,6 +604,8 @@ ovr_enum_t BaseCompositor::GetPosesForFrame(uint32_t unPosePredictionID, Tracked
+ 
+ BaseCompositor::ovr_enum_t BaseCompositor::GetSubmitTexture(vr::Texture_t *pOutTexture, bool *pNeedsFlush, OOVR_EVRCompositorTextureUsage eUsage, const vr::Texture_t *pTexture, const vr::VRTextureBounds_t *pBounds, vr::EVRSubmitFlags nSubmitFlags)
+ {
+-	STUBBED();
++	// 我们无法把纹理交回给调用方共享，如实返回错误码即可（不能 ABORT）
++	OOVR_LOG_ONCE("GetSubmitTexture not supported");
++	if (pNeedsFlush) *pNeedsFlush = false;
+ 	return 106; // VRCompositorError_SharedTexturesNotSupported
+ }
+diff --git a/OpenOVR/Reimpl/BaseInput.cpp b/OpenOVR/Reimpl/BaseInput.cpp
+index 57b300c94ff7a9a95a639bb3bd263f6bedf39edf..c0ea5a848dfa1888a8ed2d9ed8456de7d64adbd4 100644
+--- a/OpenOVR/Reimpl/BaseInput.cpp
++++ b/OpenOVR/Reimpl/BaseInput.cpp
+@@ -2819,12 +2819,13 @@ ITrackedDevice::TrackedDeviceType BaseInput::ParseAndRemoveHandPrefix(std::strin
+ 
+ vr::EVRInputError BaseInput::GetEyeTrackingDataForNextFrame(vr::VRActionHandle_t action, vr::ETrackingUniverseOrigin eOrigin, vr::VREyeTrackingData_t *pEyeTrackingData, uint32_t ulEyeTrackingDataSize)
+ {
+-	STUBBED();
++	// 无眼动追踪能力，返回"无效句柄"让游戏自行降级
++	OOVR_LOG_ONCE("GetEyeTrackingDataForNextFrame not supported");
+ 	return vr::VRInputError_InvalidHandle;
+ }
+ 
+ vr::EVRInputError BaseInput::GetEyeTrackingDataRelativeToNow(vr::VRActionHandle_t action, vr::ETrackingUniverseOrigin eOrigin, float fPredictedSecondsFromNow, vr::VREyeTrackingData_t *pEyeTrackingData, uint32_t ulEyeTrackingDataSize)
+ {
+-	STUBBED();
++	OOVR_LOG_ONCE("GetEyeTrackingDataRelativeToNow not supported");
+ 	return vr::VRInputError_InvalidHandle;
+ }
+diff --git a/OpenOVR/Reimpl/BaseOverlay.cpp b/OpenOVR/Reimpl/BaseOverlay.cpp
+index bc95956b38149ea799a1f99e52aa671f50d68a8d..7ec7f1ac19c6a1331e3e04835245129216727443 100644
+--- a/OpenOVR/Reimpl/BaseOverlay.cpp
++++ b/OpenOVR/Reimpl/BaseOverlay.cpp
+@@ -977,12 +977,14 @@ EVROverlayError BaseOverlay::WaitFrameSync(uint32_t nTimeoutMs)
+ 
+ vr::EVROverlayError BaseOverlay::CreateSubviewOverlay(vr::VROverlayHandle_t parentOverlayHandle, const char *pchSubviewOverlayKey, const char *pchSubviewOverlayName, vr::VROverlayHandle_t *pSubviewOverlayHandle)
+ {
+-	STUBBED();
++	// 不支持子 overlay，如实返回错误码（不能 ABORT，否则会中断游戏）
++	OOVR_LOG_ONCE("CreateSubviewOverlay not supported");
++	if (pSubviewOverlayHandle) *pSubviewOverlayHandle = vr::k_ulOverlayHandleInvalid;
+ 	return vr::VROverlayError_InvalidParameter;
+ }
+ 
+ vr::EVROverlayError BaseOverlay::SetSubviewPosition(vr::VROverlayHandle_t ulOverlayHandle, float fX, float fY)
+ {
+-	STUBBED();
++	OOVR_LOG_ONCE("SetSubviewPosition not supported");
+ 	return vr::VROverlayError_InvalidParameter;
+ }
+diff --git a/OpenOVR/Reimpl/BaseSystem.cpp b/OpenOVR/Reimpl/BaseSystem.cpp
+index 868a99b2f9b38f195ebcde1dbe936529bd1cf5bd..a0ca967664292f1f86a0aef99dd72b375d99bf9e 100644
+--- a/OpenOVR/Reimpl/BaseSystem.cpp
++++ b/OpenOVR/Reimpl/BaseSystem.cpp
+@@ -879,30 +879,39 @@ void BaseSystem::ResetSeatedZeroPose()
+ 
+ bool BaseSystem::ComputeDistortionSet(vr::EVREye eEye, vr::EVRDistortionChannel eChannel, bool bAsNormalizedDeviceCoordinates, uint32_t nNumCoordinates, const vr::DistortionCoordinate_t *pInput, vr::DistortionCoordinate_t *pOutput)
+ {
+-	STUBBED();
++	// OpenComposite 不做自定义畸变校正，直接告知调用方"本组坐标不适用"
++	OOVR_LOG_ONCE("ComputeDistortionSet not implemented - returning false");
+ 	return false;
+ }
+ 
+ bool BaseSystem::GetEyeTrackedFoveationCenter(vr::HmdVector2_t *pNdcLeft, vr::HmdVector2_t *pNdcRight)
+ {
+-	STUBBED();
++	// 无眼动追踪支持：返回零向量并告知不可用
++	if (pNdcLeft) { pNdcLeft->v[0] = 0.0f; pNdcLeft->v[1] = 0.0f; }
++	if (pNdcRight) { pNdcRight->v[0] = 0.0f; pNdcRight->v[1] = 0.0f; }
++	OOVR_LOG_ONCE("GetEyeTrackedFoveationCenter not implemented");
+ 	return false;
+ }
+ 
+ bool BaseSystem::GetEyeTrackedFoveationCenterForProjection(const vr::HmdMatrix44_t *pProjMat, vr::HmdVector2_t *pNdc)
+ {
+-	STUBBED();
++	if (pNdc) { pNdc->v[0] = 0.0f; pNdc->v[1] = 0.0f; }
++	OOVR_LOG_ONCE("GetEyeTrackedFoveationCenterForProjection not implemented");
+ 	return false;
+ }
+ 
+ bool BaseSystem::PollNextEventWithPoseAndOverlays(vr::ETrackingUniverseOrigin eOrigin, vr::VREvent_t *pEvent, uint32_t uncbVREvent, vr::TrackedDevicePose_t *pTrackedDevicePose, vr::VROverlayHandle_t *pulOverlayHandle)
+ {
+-	STUBBED();
+-	return false;
++	// 新版多了 overlay handle 出参，我们暂不提供，退化为普通轮询
++	if (pulOverlayHandle != nullptr)
++		*pulOverlayHandle = vr::k_ulOverlayHandleInvalid;
++	return PollNextEventWithPose(eOrigin, pEvent, uncbVREvent, pTrackedDevicePose);
+ }
+ 
+ vr::EVRInitError BaseSystem::SetSDKVersion(uint32_t nVersionMajor, uint32_t nVersionMinor, uint32_t nVersionBuild)
+ {
+-	STUBBED();
++	// 游戏用它告知期望的 SDK 版本；我们无需据此做任何事，静默接受即可。
++	// 注意：绝不能 STUBBED()（会 ABORT 弹窗中断游戏启动）
++	OOVR_LOGF("SetSDKVersion(%u.%u.%u) - ignored", nVersionMajor, nVersionMinor, nVersionBuild);
+ 	return vr::VRInitError_None;
+ }
+-- 
+2.39.5
+

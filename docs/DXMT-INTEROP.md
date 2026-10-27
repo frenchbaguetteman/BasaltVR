@@ -1,7 +1,7 @@
 # DXMT texture export and IOSurface handoff protocol
 
 Status: **zero-copy path proven end to end, 2026-07-18** — sections 1 and 2
-(IOSurface-backed textures and the IOSurfaceID republish) are built as `v0.80-basalt.1`
+(IOSurface-backed textures and the IOSurfaceID republish) are built as `v0.80-basalt.2`
 (`runtime/dxmt-fork`, `runtime/scripts/build-dxmt-fork.zsh`) and validated by the fork
 phase of `test-dxmt.zsh`: OpenXR swapchain textures under the gate republish nonzero,
 per-image-distinct IOSurfaceIDs, NT-handle reopen still works via the IOSurface's own
@@ -89,6 +89,12 @@ cost the project should accept deliberately, not by default.
 - The DXMT fork can allocate both RGBA8 and BGRA8 IOSurfaces, but Basalt's current OpenXR runtime
   advertises only BGRA8/BGRA8-sRGB swapchains: `CVPixelBufferCreateWithIOSurface` rejects the
   RGBA layout, while the BGRA layout is the zero-copy CoreVideo/VideoToolbox transport format.
+  A projection frame goes zero-copy when its swapchains are exported BGRA images
+  (`B8G8R8A8_UNORM`, `_UNORM_SRGB`, or `B8G8R8A8_TYPELESS`, which is backed by UNORM) with one
+  mip, at most twice the per-view size, and positive (unflipped) image rects; the streamer crops
+  each eye by the `FrameReady` image rect, so UE4's side-by-side image stays zero-copy. Quad
+  layers, flipped (negative extent) rects, other formats, mip chains, depth, and larger images go
+  through the runtime compositor, which draws them into its own exported BGRA images.
 - PE-side data flow: `WMTTextureInfo` already round-trips through the call and has an unused
   `uint32_t reserved` out-field plus an out `mach_port` (`winemetal.h:518-532`) — the unix
   side writes `IOSurfaceGetID(surface)` into it; no new PE plumbing.
@@ -147,15 +153,19 @@ launcher passes to the bottle via environment (`BASALT_CONTROL=path`). The dimen
 the runtime advertise the selected stream resolution as OpenXR's recommended swapchain size,
 avoiding an expensive render-then-downscale step. Legacy two-field files fall back to
 1680×1760, which is also the maximum (`BASALT_CONTROL_MAX_VIEW_*`); `RuntimeLink` refuses a
-larger stream resolution rather than let the game render at a size the streamer does not encode. The token (random 16 bytes, hex) must be echoed in `Hello` so a stray local process
-cannot impersonate the game.
+larger stream resolution rather than let the game render at a size the streamer does not encode.
+An optional last field lists comma-separated features (`<port> <token> [<width> <height>]
+[<feature>,...]`); the only known feature, `hand_tracking`, makes the runtime advertise
+`XR_EXT_hand_tracking`, and unknown features are ignored. The token (random 16 bytes, hex) must be
+echoed in `Hello` so a stray local process cannot impersonate the game.
 
-Framing: little-endian, `u32 length` + `u16 message type` + payload; strict protocol version 9 in
-`Hello`. Messages (runtime → daemon unless noted):
+Framing: little-endian, `u32 length` + `u16 message type` + payload; strict protocol version 11 in
+`Hello` (v10 added the display period in `HelloAck`; v11 added `HandSkeleton`). The runtime DLL in
+the bottle and the streamer must come from the same build. Messages (runtime → daemon unless noted):
 
 | Type | Payload | Notes |
 |------|---------|-------|
-| `Hello` | proto version, token, DXMT version string, session id | daemon replies `HelloAck` (accepted version) or closes |
+| `Hello` | proto version, token, DXMT version string, session id | daemon replies `HelloAck` (accepted version, headset display period in ns that `xrWaitFrame` paces to; out of range keeps 72 Hz) or closes |
 | `CreateSwapchain` | swapchain id, width, height, DXGI format, image count, per-image `IOSurfaceID` | daemon: `IOSurfaceLookup` each ID, validate dimensions/format/plane count against the message, `CFRetain` + `IOSurfaceIncrementUseCount`, reply `SwapchainAck {generation}` |
 | `DestroySwapchain` | swapchain id | daemon releases retains, replies ack; runtime keeps D3D11 textures alive until the ack |
 | `FrameReady` | frame number, display time, exact Quest tracking timestamp used by `xrLocateViews`, layer list: {swapchain id, image index, image rect, pose, fov} per eye | sent only after the Phase-1 fence wait; daemon wraps the IOSurface in a `CVPixelBuffer`, preserves the tracking timestamp through VideoToolbox, and feeds compose→encode→ALVR |
@@ -167,6 +177,7 @@ Framing: little-endian, `u32 length` + `u16 message type` + payload; strict prot
 | `InputReset` (daemon → runtime) | empty | ALVR control loss/replacement atomically clears retained controller presence/pose/velocity, profile, and button state, and the head pose with its Quest timestamp ordering (LOCAL keeps its origin) |
 | `ViewConfig` (daemon → runtime) | IPD and asymmetric left/right/up/down FOV for each eye | retained Quest calibration used by `xrLocateViews` and stereo projection |
 | `ControllerMask` (daemon → runtime) | Quest tracking timestamp, active-hand bit mask (bit 0 left, bit 1 right), zero reserved field | authoritative per-packet presence; a newer missing-hand bit immediately clears that hand's pose and velocity, and only newer presence/motion can recover it |
+| `HandSkeleton` (daemon → runtime) | Quest tracking timestamp, hand, joint-valid mask (0 = not tracked, else all 26 bits), 26 joints of quaternion/position/radius in `XR_EXT_hand_tracking` order | latest sample per hand, in the same Quest stage frame as `ControllerMotion`; a hand-tracked hand also gets an emulated grip `ControllerMotion` and emulated `ButtonState` values |
 | `Haptic` | hand, duration, frequency, amplitude | runtime→daemon; daemon packetizes this as ALVR stream ID 1 on the serialized video socket |
 | `Teardown` | reason | either direction; daemon then drops all retains |
 
@@ -187,6 +198,11 @@ Lifetime rules:
   running exactly as today (headless, `shouldRender` false, no session loss in the
   prototype); reconnect is a later concern. The daemon ignores `FrameReady` for unknown
   swapchain ids (races with teardown are benign).
+- The runtime creates its control socket non-inheritable, so a child game process (The Lab
+  starts Robot Repair through OpenComposite) cannot hold its parent's connection open. A
+  connection that arrives while another is live waits for its first message: an authenticated
+  `Hello` replaces the live session, and anything else is dropped (at most 4 pending
+  connections, 5 s `Hello` timeout).
 - One runtime receiver thread owns all socket reads, publishes
   head/controller/mask/button/profile/view/reset state, and demultiplexes
   swapchain/frame acknowledgements to condition-variable waiters. A separate send lock keeps messages
@@ -207,7 +223,7 @@ a stock `.so` fails at call time): `d3d11.dll`, `dxgi.dll`, `d3d10core.dll`,
 directly against that Wine's `winemac.so`/`ntdll.so`, so the fork **must be built against
 the pinned Gcenx Wine 11.10** that `test-dxmt.zsh` installs. Tag the fork distinctly
 (`vcs_tag` via `version.h.in`, surfaced in the device description, `dxmt_info.cpp:38`) —
-e.g. `v0.80-basalt.1` — so the runtime can detect and pin it.
+e.g. `v0.80-basalt.2` — so the runtime can detect and pin it.
 
 ## Acceptance tests
 
@@ -234,7 +250,8 @@ e.g. `v0.80-basalt.1` — so the runtime can detect and pin it.
 
 1. ~~**Fork base**: v0.80 tag (MIT, matches pinned validation — recommended) vs `73d42c55`
    (LGPL 2.1+, newer fixes).~~ Resolved 2026-07-18: forked from the v0.80 tag as
-   `v0.80-basalt.1`; patches and pinned build script live in `runtime/dxmt-fork`.
+   `v0.80-basalt.1`; patches and pinned build script live in `runtime/dxmt-fork`. The tag is
+   now `v0.80-basalt.2` (adds patches 0005–0006).
 2. **Phase 2 shared-event export** (Metal SPI exposure) — only after Phase 1 latency is
    measured and found wanting.
 3. ~~`GetPrivateData` GUID vs a Basalt COM extension interface.~~ Resolved 2026-07-18:

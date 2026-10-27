@@ -1,0 +1,261 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 17fd03e..54874e9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -27,7 +27,12 @@ set(GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
+ 
+ # Platform-dependent flags
+ # Support Vulkan on Linux instead of DirectX
+-if (WIN32)
++if (MINGW)
++	# CMake's MSVC flags define these; strict-mode MinGW only defines _WIN32.
++	add_compile_definitions(WIN32 _WINDOWS)
++	# BasaltVR cross-build: D3D11 only, so no prebuilt Vulkan SDK is needed.
++	set(GRAPHICS_API_SUPPORT_FLAGS -DSUPPORT_DX -DSUPPORT_DX11)
++elseif (WIN32)
+ 	set(GRAPHICS_API_SUPPORT_FLAGS -DSUPPORT_DX -DSUPPORT_DX11 -DSUPPORT_DX12 -DSUPPORT_VK -DSUPPORT_GL)
+ elseif (ANDROID)
+ 	set(GRAPHICS_API_SUPPORT_FLAGS -DSUPPORT_VK -DSUPPORT_GLES)
+@@ -64,7 +69,11 @@ else ()
+ 	# In general using private symbols is a great idea, and it's something we'd want to do anyway.
+ 	# There is also -Bsymbolic set when linking the final shared library, see the bottom of this file
+ 	# FIXME the Vulkan functions still get exported, hopefully they won't fight with the application's ones.
++    if (MINGW)
++	# PE exports are explicit; add_definitions would also hand this flag to windres.
++    else ()
+     add_definitions(-fvisibility=hidden)
++    endif ()
+ 	add_compile_options(-Wall -Wextra -Wpedantic -pedantic-errors -Wno-unused-parameter -Wno-missing-field-initializers -Wno-format-security)
+ 	set(ERROR_ON_WARNING_FLAG -Werror)
+ endif ()
+@@ -86,7 +95,9 @@ target_include_directories(OpenVR INTERFACE OpenVRHeaders) # TODO make this priv
+ # === Vulkan ===
+ add_library(Vulkan INTERFACE)
+ 
+-if (WIN32)
++if (MINGW)
++	# SUPPORT_VK is off; nothing uses Vulkan.
++elseif (WIN32)
+ 	# On Windows, use the bundled copy
+ 	target_include_directories(Vulkan INTERFACE libs/vulkan/Include) # TODO make this private and put the public headers elsewhere
+ 	if ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
+@@ -115,9 +126,14 @@ else ()
+ endif ()
+ 
+ # === OpenXR ===
++if (MINGW)
++	add_compile_definitions(XR_OS_WINDOWS XR_USE_PLATFORM_WIN32 XR_USE_GRAPHICS_API_D3D11)
++else ()
+ add_compile_definitions(XR_USE_GRAPHICS_API_OPENGL XR_USE_GRAPHICS_API_VULKAN)
++endif ()
+ # Platform-dependent flags
+-if (WIN32)
++if (MINGW)
++elseif (WIN32)
+ 	add_compile_definitions(XR_OS_WINDOWS XR_USE_PLATFORM_WIN32
+ 		XR_USE_GRAPHICS_API_D3D11 XR_USE_GRAPHICS_API_D3D12)
+ else()
+@@ -181,6 +197,10 @@ if (NOT OpenXR_FOUND OR NOT jsoncpp_FOUND)
+ 	)
+ 	endif()
+ 	target_include_directories(OpenXR PRIVATE ${XrDirCommon} ${XrDir}/src)
++	if (MINGW)
++		# The bundled OpenXR-SDK 1.0.12 loader relies on MSVC including <cstdint> transitively.
++		target_compile_options(OpenXR PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-include cstdint>)
++	endif ()
+ 	target_include_directories(OpenXR PUBLIC ${XrDir}/include)
+ 	# Platform-dependent flags
+ 	if (WIN32)
+@@ -518,7 +538,14 @@ if (NOT WIN32)
+ 	target_link_libraries(OCOVR PUBLIC -Wl,--start-group OCCore DrvOpenXR -Wl,--end-group)
+ else ()
+ 	# On Windows this isn't a problem since the linker knows how to figure this stuff out
++	if (MINGW)
++		# GNU ld is single-pass like on Linux, and GCC ignores the sources'
++		# #pragma comment(lib, ...) directives.
++		target_link_libraries(OCOVR -Wl,--start-group OCCore DrvOpenXR -Wl,--end-group
++			d3d11 dxgi d3dcompiler dbghelp shlwapi)
++	else ()
+ 	target_link_libraries(OCOVR OCCore DrvOpenXR)
++	endif ()
+ endif ()
+ 
+ # If we're on Linux, compile everything as position-independent
+diff --git a/DrvOpenXR/DrvOpenXR.cpp b/DrvOpenXR/DrvOpenXR.cpp
+index 8e3bd9c..f7352b2 100644
+--- a/DrvOpenXR/DrvOpenXR.cpp
++++ b/DrvOpenXR/DrvOpenXR.cpp
+@@ -24,6 +24,7 @@ static XrBackend* currentBackend;
+ static bool initialised = false;
+ 
+ #ifdef _WIN32
++#include <shlwapi.h> // PathStripPathA
+ std::string GetExeName()
+ {
+ 	char exePath[MAX_PATH + 1] = { 0 };
+diff --git a/DrvOpenXR/XrBackend.cpp b/DrvOpenXR/XrBackend.cpp
+index 3e246d9..d7177a9 100644
+--- a/DrvOpenXR/XrBackend.cpp
++++ b/DrvOpenXR/XrBackend.cpp
+@@ -154,6 +154,7 @@ void XrBackend::GetDeviceToAbsoluteTrackingPose(
+ 	}
+ }
+ 
++#ifdef SUPPORT_VK
+ static void find_queue_family_and_queue_idx(VkDevice dev, VkPhysicalDevice pdev, VkQueue desired_queue, uint32_t& out_queueFamilyIndex, uint32_t& out_queueIndex)
+ {
+ 	uint32_t queue_family_count;
+@@ -179,6 +180,7 @@ static void find_queue_family_and_queue_idx(VkDevice dev, VkPhysicalDevice pdev,
+ 	OOVR_ABORT("Couldn't find the queue family index/queue index of the queue that the OpenVR app gave us!"
+ 	           "This is really odd and really shouldn't ever happen");
+ }
++#endif
+ 
+ /* Submitting Frames */
+ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
+@@ -260,6 +262,9 @@ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
+ 			break;
+ 		}
+ 		case vr::TextureType_Vulkan: {
++#if !defined(SUPPORT_VK)
++			OOVR_ABORT("Application is trying to submit a Vulkan texture, which OpenComposite supports but is disabled in this build");
++#else
+ 			const vr::VRVulkanTextureData_t* vktex = (vr::VRVulkanTextureData_t*)tex->handle;
+ 
+ 			VkPhysicalDevice xr_desire;
+@@ -289,6 +294,7 @@ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
+ 
+ 			graphicsBinding = std::make_unique<BindingWrapper<XrGraphicsBindingVulkanKHR>>(binding);
+ 			DrvOpenXR::SetupSession();
++#endif
+ 			break;
+ 		}
+ 		case vr::TextureType_OpenGL: {
+diff --git a/OpenOVR/Compositor/compositor.h b/OpenOVR/Compositor/compositor.h
+index e83a16a..bf048e9 100644
+--- a/OpenOVR/Compositor/compositor.h
++++ b/OpenOVR/Compositor/compositor.h
+@@ -3,7 +3,9 @@
+ #include "generated/interfaces/vrtypes.h"
+ #ifdef WIN32
+ // Windows template libraries
++#ifndef __MINGW32__ // MinGW has no ATL; only the unused D3D10/D3D12 paths need it
+ #include <atlbase.h>
++#endif
+ #include <wrl/client.h>
+ #endif
+ 
+diff --git a/OpenOVR/Compositor/dx11compositor.cpp b/OpenOVR/Compositor/dx11compositor.cpp
+index 2ed44d2..82ac413 100644
+--- a/OpenOVR/Compositor/dx11compositor.cpp
++++ b/OpenOVR/Compositor/dx11compositor.cpp
+@@ -309,7 +309,7 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 	OOVR_FAILED_XR_ABORT(res = xrWaitSwapchainImage(chain, &waitInfo));
+ 
+ 	if (res == XR_TIMEOUT_EXPIRED)
+-		OOVR_ABORTF("xrWaitSwapchainImage timeout");
++		OOVR_ABORT("xrWaitSwapchainImage timeout");
+ 
+ 	// Copy the source to the destination image
+ 	D3D11_BOX sourceRegion;
+@@ -350,7 +350,26 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 		context->RSGetState(&pRSState);
+ 		context->RSSetState(nullptr);
+ 
++#ifdef __MINGW32__
++		// MinGW's d3d11.h lacks this CD3D11_VIEWPORT constructor; same computation.
++		D3D11_VIEWPORT viewport{};
++		{
++			D3D11_TEXTURE2D_DESC texDesc;
++			src->GetDesc(&texDesc);
++			D3D11_RENDER_TARGET_VIEW_DESC rtvDesc;
++			swapchain_rtvs[currentIndex]->GetDesc(&rtvDesc);
++			UINT mip = 0;
++			if (rtvDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D)
++				mip = rtvDesc.Texture2D.MipSlice;
++			else if (rtvDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY)
++				mip = rtvDesc.Texture2DArray.MipSlice;
++			viewport.Width = (float)std::max(texDesc.Width >> mip, 1u);
++			viewport.Height = (float)std::max(texDesc.Height >> mip, 1u);
++			viewport.MaxDepth = 1.0f;
++		}
++#else
+ 		D3D11_VIEWPORT viewport = CD3D11_VIEWPORT(src, swapchain_rtvs[currentIndex]);
++#endif
+ 		context->RSSetViewports(1, &viewport);
+ 		D3D11_RECT rects[1];
+ 		rects[0].top = 0;
+diff --git a/OpenOVR/Reimpl/BaseClientCore.cpp b/OpenOVR/Reimpl/BaseClientCore.cpp
+index 5f06605..15c69d8 100644
+--- a/OpenOVR/Reimpl/BaseClientCore.cpp
++++ b/OpenOVR/Reimpl/BaseClientCore.cpp
+@@ -4,6 +4,7 @@
+ #include "steamvr_abi.h"
+ 
+ #include <codecvt>
++#include <filesystem>
+ #include <fstream>
+ #include <locale>
+ 
+@@ -18,7 +19,8 @@ using namespace vr;
+ static std::wstring_convert<std::codecvt_utf8<wchar_t>> CHAR_CONV;
+ 
+ #ifdef _WIN32
+-#define APISTR(str) (str)
++// Opening a stream from a std::wstring is an MSVC extension; a path works everywhere.
++#define APISTR(str) (std::filesystem::path(str))
+ #else
+ #define APISTR(str) (CHAR_CONV.to_bytes(str))
+ #endif
+diff --git a/OpenOVR/Reimpl/BaseInput.cpp b/OpenOVR/Reimpl/BaseInput.cpp
+index c0ea5a8..03e04db 100644
+--- a/OpenOVR/Reimpl/BaseInput.cpp
++++ b/OpenOVR/Reimpl/BaseInput.cpp
+@@ -74,7 +74,8 @@ static bool ReadJson(const std::wstring& path, Json::Value& result)
+ 	std::wstring_convert<convert_type, wchar_t> converter;
+ 	const std::string real_path = converter.to_bytes(path);
+ #else
+-	const std::wstring& real_path = path;
++	// Opening a stream from a std::wstring is an MSVC extension; a path works everywhere.
++	const std::filesystem::path real_path = path;
+ #endif
+ 
+ #ifndef ANDROID
+diff --git a/OpenOVR/logging.cpp b/OpenOVR/logging.cpp
+index 11b88c5..bddb121 100644
+--- a/OpenOVR/logging.cpp
++++ b/OpenOVR/logging.cpp
+@@ -15,6 +15,7 @@
+ #include <sys/stat.h> // stat
+ #ifdef _WIN32
+ #include <direct.h> // _mkdir
++#include <io.h> // _commit
+ #endif
+ #ifdef __GLIBCXX__
+ #include <unistd.h>
+@@ -135,7 +136,13 @@ std::string GetEnv(const std::string& var)
+ #ifdef ANDROID
+ #include <android/log.h>
+ #else
++#ifdef __MINGW32__
++// The global Config (Config.cpp) logs from its constructor. MSVC happens to construct this
++// stream first; with MinGW it would still be unconstructed, so give it priority.
++static std::ofstream stream __attribute__((init_priority(101)));
++#else
+ static std::ofstream stream;
++#endif
+ 
+ #ifdef __GLIBCXX__
+ #include <ext/stdio_filebuf.h>
+@@ -240,7 +247,11 @@ void oovr_flush_safe()
+ 
+ 	int r;
+ 	do {
++#ifdef _WIN32
++		r = _commit(fd); // MinGW has no fsync
++#else
+ 		r = fsync(fd);
++#endif
+ 	} while (r < 0 && errno == EINTR);
+ #endif
+ }

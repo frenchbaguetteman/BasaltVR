@@ -192,7 +192,10 @@ final class AlvrControlTests: XCTestCase {
                                                  socket: sockets[0])
         let disconnected = expectation(description: "control disconnect dispatched")
         disconnected.expectedFulfillmentCount = 1
-        session.onDisconnect { disconnected.fulfill() }
+        session.onDisconnect { reason in
+            XCTAssertTrue(reason.contains("closed"), reason)
+            disconnected.fulfill()
+        }
 
         close(sockets[1])
         sockets[1] = -1
@@ -302,18 +305,5 @@ final class AlvrControlTests: XCTestCase {
         XCTAssertTrue(result.streamReady)
         XCTAssertEqual(result.negotiatedSettings?.refreshRate, 90)
         await fulfillment(of: [serverFinished], timeout: 5)
-    }
-
-    func testProbeGateSuppressesOverlapAndCompletedClients() {
-        let gate = AlvrControlProbeGate()
-        XCTAssertTrue(gate.begin(clientKey: "quest@127.0.0.1"))
-        XCTAssertFalse(gate.begin(clientKey: "quest@127.0.0.1"))
-
-        gate.finish(clientKey: "quest@127.0.0.1", succeeded: false)
-        XCTAssertTrue(gate.begin(clientKey: "quest@127.0.0.1"))
-
-        gate.finish(clientKey: "quest@127.0.0.1", succeeded: true)
-        XCTAssertFalse(gate.begin(clientKey: "quest@127.0.0.1"))
-        XCTAssertTrue(gate.begin(clientKey: "another@127.0.0.1"))
     }
 }

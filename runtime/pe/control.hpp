@@ -33,12 +33,21 @@ bool controlActive(XrSession session);
 // advertise the stream's actual target size to the application.
 bool controlConfiguredViewSize(uint32_t* width, uint32_t* height);
 
+// True when the BASALT_CONTROL handoff file is readable and its feature list
+// names BASALT_CONTROL_FEATURE_HAND_TRACKING (the streamer forwards Quest hand
+// skeletons). Read at xrEnumerateInstanceExtensionProperties time, before any
+// session exists, so it does not depend on the DXMT gate or a connection.
+bool controlHandTrackingAdvertised();
+
 // Blocks frame production while two submitted frames are still unconsumed by
 // the daemon (an app that calls xrWaitFrame(N+1) before xrEndFrame(N) can
 // have one more in flight). This is the end-to-end backpressure boundary: it
 // covers the GPU fence, control socket, compositor, and encoder admission
 // instead of allowing latency to accumulate in any of those queues.
 bool controlWaitForFrameBudget(XrSession session);
+// The headset refresh period the daemon sent in HELLO_ACK for this session;
+// 72 Hz while headless or for any other session.
+XrDuration controlDisplayPeriod(XrSession session);
 // Records a predictedDisplayTime returned by xrWaitFrame, so a later recenter
 // takes effect only after every frame the application may be rendering.
 void controlNotePredictedDisplayTime(XrSession session, XrTime predictedDisplayTime);
@@ -48,11 +57,25 @@ void controlNotePredictedDisplayTime(XrSession session, XrTime predictedDisplayT
 // changeTime. The Quest timestamp is preserved only for ordering because it is
 // not in the runtime's XrTime clock domain. False means disconnected, missing,
 // or stale tracking. A zero locateTime selects the current definition.
+// For a predictedDisplayTime from xrWaitFrame, the first fresh query pins its
+// sample: later queries for that time return the same pose and timestamp.
 bool controlHeadPose(
     XrSession session,
     XrTime locateTime,
     uint64_t* questTimestampNanoseconds,
     XrPosef* poseInLocal);
+
+// The Quest timestamp of the head sample pinned for displayTime, if a head
+// query for that predictedDisplayTime has pinned one.
+bool controlPinnedHeadTimestamp(
+    XrSession session,
+    XrTime displayTime,
+    uint64_t* questTimestampNanoseconds);
+
+// Cumulative diagnostics: frames that pinned a head sample, and frames where
+// a later head query for the same display time would have seen a newer
+// sample without pinning.
+void controlHeadSampleStats(uint64_t* pinnedFrames, uint64_t* divergedFrames);
 
 enum class ControlHand : uint32_t {
     kLeft = 0,
@@ -107,6 +130,27 @@ bool controlInputSnapshot(
     ControlInputSnapshot* snapshot,
     XrTime locateTime = 0);
 
+constexpr uint32_t kControlHandJointCount = 26;  // XR_HAND_JOINT_COUNT_EXT
+
+struct ControlHandSkeleton {
+    bool active;
+    uint64_t questTimestampNanoseconds;
+    // XR_EXT_hand_tracking joint order, expressed in LOCAL.
+    XrPosef jointPosesInLocal[kControlHandJointCount];
+    float jointRadii[kControlHandJointCount];
+};
+
+// Returns the latest fresh HAND_SKELETON for hand (0 left, 1 right),
+// converted to LOCAL with the definition in effect at locateTime (so a
+// recenter moves hands exactly like controllers). True only while connected
+// for that session, the hand is tracked, and the sample is as fresh as a
+// controller pose must be; otherwise out->active is false.
+bool controlHandSkeleton(
+    XrSession session,
+    uint32_t hand,
+    XrTime locateTime,
+    ControlHandSkeleton* out);
+
 // Sends one resolved OpenXR haptic command to the streamer. A zero duration
 // and amplitude is the stop representation.
 bool controlSendHaptic(
@@ -151,10 +195,19 @@ bool prepareSwapchainViewForExport(
 // number on the caller's thread (must be the xrEndFrame thread, which owns
 // the immediate context per XR_KHR_D3D11_enable), and a waiter thread sends
 // the message only after the fence completes (Phase 1 frame-done contract).
-void controlFrameReady(
+// exportViews runs prepareSwapchainViewForExport on application views; the
+// compositor passes false for its already-exported output images. Returns
+// the queued frame number, or 0 when nothing was queued.
+uint64_t controlFrameReady(
     int64_t displayTime,
     uint64_t questTrackingTimestampNanoseconds,
     const ControlFrameView* views,
-    uint32_t viewCount);
+    uint32_t viewCount,
+    bool exportViews);
+
+// Blocks until the daemon has consumed frameNumber (finished its Metal reads
+// of that frame's surfaces), so a runtime-owned image can be redrawn. False
+// on disconnect or timeout; frameNumber 0 returns true immediately.
+bool controlWaitForFrameConsumed(XrSession session, uint64_t frameNumber);
 
 }  // namespace basalt

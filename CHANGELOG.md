@@ -4,8 +4,49 @@ All notable changes to BasaltVR are documented here.
 
 ## Unreleased
 
+Upgrade note: control protocol v10 and then v11 are breaking changes. The OpenXR runtime DLL in
+each bottle and `basalt-streamer` must come from the same build; after updating, run
+`make runtime-build` and `basaltctl bottle prepare <bottle>` (the management app syncs the DLL
+before each session). The streamer reports a mismatched DLL instead of connecting.
+
 ### Added
 
+- Control protocol v10: `HelloAck` carries the negotiated Quest refresh period, and `xrWaitFrame`
+  paces to it instead of a fixed 72 Hz, so `--fps 90` or `--fps 120` with `--runtime` no longer
+  renders 72 Hz frames for a faster display.
+- Control protocol v11 and Quest optical hand tracking (off by default, opt-in). A
+  hand without a controller drives an emulated Touch controller through ALVR's gestures (pinch =
+  trigger, fist = grip, other pinches = face buttons), and games get the hand skeleton through
+  the new runtime extension `XR_EXT_hand_tracking`. See `docs/HAND-TRACKING.md`.
+- HEVC video (`--codec h264|hevc`, default `h264`): HEVC Main on the hardware encoder, sent with
+  VPS/SPS/PPS and a `DecoderConfig` packet as ALVR's own servers send it.
+  `basalt-streamer encoder-bench` measures encode time and drops for both codecs.
+- OpenVR games through a locally built OpenComposite: `runtime/scripts/build-opencomposite.zsh`
+  builds pinned upstream OpenComposite with Basalt's patches 0001–0005 (MinGW D3D11 build, MSVC
+  struct-return ABI, `GetPosesForFrame`, `GetD3D9AdapterIndex`, legacy frame timing), and
+  `runtime/openvr-proxy` provides an `openvr_api.dll` proxy for Valve-only exports.
+  `basaltctl opencomposite install` gains `--proxy`, `--preset default|alyx`, and `--ini`, and
+  writes only options OpenComposite can parse. See `docs/OPENCOMPOSITE.md`.
+- Runtime: `STAGE` reference space, `XR_KHR_visibility_mask`, action sets attached again to a
+  restarted session, quad layers, and a runtime compositor that converts non-BGRA, mipmapped,
+  or oversized swapchains and flipped rects into a BGRA output; up to 16 swapchains.
+- The streamer survives ALVR client disconnects over USB and Wi-Fi: it ends that session, sends
+  `INPUT_RESET` to the runtime, and accepts the next connection while the game keeps running.
+- Loss recovery: frames are not encoded while the transport is busy, and after a lost access
+  unit P-frames are held until a forced IDR, so the Quest never decodes against a missing
+  reference. The USB link rides out pauses of up to 5 s instead of dropping the headset.
+- A timer-driven `pipeline` line every 2 s: tracking rate and gaps, runtime frames with untracked
+  or repeated poses, encode time, per-stage drops, and pose age at send.
+- `--profile m3pro`, `--idr-interval <seconds>`, `--entropy cabac|cavlc`, and
+  `--controller-prediction full|alvr`; the startup log lists VideoToolbox properties that the
+  encoder refused. See `docs/PERFORMANCE.md`.
+- `basaltctl steam start PROFILE`.
+- Runtime diagnostics: `BASALT_RUNTIME_LOG` (a log file, for games started by other programs),
+  `BASALT_HAPTIC_LOG=1`, and `BASALT_COMPOSITOR_LOG=1` (the compositor's periodic debug readback,
+  which runs only with it).
+- Basalt DXMT fork patches 0005 (build with the Xcode 27 Metal toolchain) and 0006 (8x MSAA falls
+  back to the largest supported sample count instead of failing).
+- `docs/COMPATIBILITY.md`: The Lab verified on an M3 Pro with a Quest 3 over USB and Wi-Fi.
 - Control protocol v9 (breaking: the bottle's runtime DLL and the streamer must match). The daemon
   acknowledges each frame with `FrameConsumed` after Metal has read its source surfaces, and the
   runtime holds `xrWaitFrame` to a two-frame window so latency cannot accumulate.
@@ -43,8 +84,29 @@ All notable changes to BasaltVR are documented here.
 - `basalt-streamer --runtime` refuses a per-eye resolution above the runtime's 1680×1760 maximum
   instead of letting the game silently render at a different size than the stream.
 - `make app` runs the release build.
+- The stream configuration asks the ALVR client to predict controllers as far ahead as the head
+  (`steamvr_pipeline_frames = 0`); with ALVR's default they lagged the head by 2–3 frames because
+  Basalt does not extrapolate them as SteamVR does. `--controller-prediction alvr` restores it.
+- The runtime advertises only BGRA swapchain formats, so engines that choose from the list stay on
+  the zero-copy path; other formats are still accepted and converted by the compositor.
+- While the game submits no frames, the streamer no longer sends black filler frames. ALVR keeps
+  showing the last image; Basalt re-sends the last game image only when the headset does not have
+  it, and sends black only before the first game frame of a session.
 - The README is now a concise project overview; the streamer command-line guide (USB/Wi-Fi, audio,
   stream settings, measurements, and security model) moved to `docs/STREAMER.md`.
+- Projection frames in exported BGRA swapchains (`B8G8R8A8_UNORM`, `_UNORM_SRGB`, or
+  `B8G8R8A8_TYPELESS`) with one mip, at most twice the per-view size, and positive image rects go
+  zero-copy; the streamer crops each eye by its `imageRect`, so UE4's side-by-side image skips the
+  runtime compositor. Quad layers, flipped rects, other formats, mip chains, depth, and larger
+  images still go through it.
+- `runtime/scripts/build-opencomposite.zsh` clones upstream OpenComposite
+  (<https://gitlab.com/znixian/OpenOVR> at `cff07db`) and applies the six commits of the former
+  GitHub fork as patches, then Basalt's own, instead of cloning the fork.
+- Hand tracking (`XR_EXT_hand_tracking`) is off by default; `--hand-tracking on` turns it on. The
+  ALVR client's SteamVR grip offset is kept by default; `--grip-pose meta` removes it.
+- The Basalt DXMT fork is tagged `v0.80-basalt.2` (patches 0005 and 0006). Nothing checks the DXMT
+  version already in a bottle; run `basaltctl bottle install-dxmt <bottle>` after rebuilding, or 8x
+  MSAA games stay black.
 
 ### Fixed
 
@@ -58,6 +120,31 @@ All notable changes to BasaltVR are documented here.
   every Steam/game line rather than only the first line of each chunk.
 - Diagnostic reports no longer include audio device names (only BlackHole or another device) or
   `[U:1:…]` Steam IDs.
+- The OpenXR runtime now samples the head once per frame. For one `xrWaitFrame` display time,
+  the first `xrLocateViews` or `xrLocateSpace` pins the newest head sample, and every later head
+  query for that time returns the same pose. The frame goes to the streamer with that sample's
+  timestamp. Before, OpenComposite games (Half-Life: Alyx) located each frame several times, each
+  call got a newer sample (head poses arrive at about 216 Hz), and the last call set the frame's
+  timestamp. The game rendered with an older pose than the timestamp named, so ALVR reprojected
+  from the wrong pose and the world wobbled a little all the time. hello_xr locates once per
+  frame and was not affected. With `BASALT_RUNTIME_LOG` set, the runtime log prints a
+  `head pose pinning:` line every 5 s: the number of frames where a later head query saw a newer
+  sample (these frames had the wrong timestamp before this fix).
+- A slow game (The Lab's Secret Shop) or any hitch over 0.5 s no longer flickers between the game
+  image and black.
+- Touch controller poses can drop the ALVR client's SteamVR-only grip offset (-15° pitch, 5 mm),
+  which OpenComposite stacked with its own transform (opt-in; the offset is kept by default). A
+  hand-tracked hand no longer uses its raw palm pose as a controller grip.
+- Haptics: zero amplitude is a stop, durations of zero or less play a 5 ms pulse, and
+  out-of-range values from OpenVR translation layers are normalized instead of failing.
+- The runtime's control socket is no longer inherited by child processes, and a newer
+  authenticated runtime connection replaces a stale one. The Lab's Robot Repair, started by the
+  hub, previously ran headless with a black headset.
+- A forced recovery IDR that VideoToolbox rate control dropped is requested again instead of lost.
+- Game audio capture asks for Microphone access first and explains a denial, instead of
+  capturing silence from BlackHole.
+- `basaltctl opencomposite install` no longer writes `enableAudio`, which OpenComposite's `openxr`
+  branch rejects.
 - Open BSManager now launches with `start /wait`. A bare `start` exited immediately, and the
   utility exit handler then stopped every Wine process in the bottle, closing BSManager before its
   window appeared.
@@ -120,6 +207,8 @@ All notable changes to BasaltVR are documented here.
   pull request's base), not only uncommitted edits, and syntax-checks the app launcher script.
 - The release packager refuses an incomplete DXMT artifact set instead of shipping it as included,
   and the DXMT fork build rebuilds a patched checkout that sits on an outdated upstream commit.
+- `test-dxmt.zsh` adds the runtime compositor, 8x MSAA, OpenComposite frame-timing, and
+  hand-tracking checks; `runtime/scripts/test-openvr-proxy.zsh` tests the proxy.
 
 ## 0.1.0 - 2026-07-28
 

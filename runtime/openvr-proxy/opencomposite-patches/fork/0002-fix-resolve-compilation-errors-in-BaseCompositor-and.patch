@@ -1,0 +1,53 @@
+From 924de5db116c8b570368a2d8957e53a9d63de4a0 Mon Sep 17 00:00:00 2001
+From: Mac <charmillionaire@192.168.1.100>
+Date: Mon, 12 Oct 2026 19:13:26 +0800
+Subject: [PATCH 2/6] fix: resolve compilation errors in BaseCompositor and
+ XrHMD for OpenVR 2.x
+
+---
+ DrvOpenXR/XrHMD.cpp               | 1 +
+ OpenOVR/Reimpl/BaseCompositor.cpp | 4 ++--
+ OpenOVR/Reimpl/BaseCompositor.h   | 2 +-
+ 3 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/DrvOpenXR/XrHMD.cpp b/DrvOpenXR/XrHMD.cpp
+index ffeab7972cfb815bedf967aef48d4ed325e821aa..9568eaf828667de5cf3e624ff57863f825be95da 100644
+--- a/DrvOpenXR/XrHMD.cpp
++++ b/DrvOpenXR/XrHMD.cpp
+@@ -10,6 +10,7 @@
+ #include "../OpenOVR/convert.h"
+ #include "generated/static_bases.gen.h"
+ #include <thread>
++#include <chrono>
+ #include <mutex>
+ 
+ void XrHMD::GetRecommendedRenderTargetSize(uint32_t* width, uint32_t* height)
+diff --git a/OpenOVR/Reimpl/BaseCompositor.cpp b/OpenOVR/Reimpl/BaseCompositor.cpp
+index 045ae7664c4b2f3377d6b92abd14df82ebeeda98..5607c0fa739a177ede7c10c8f767f7cc13978cf4 100644
+--- a/OpenOVR/Reimpl/BaseCompositor.cpp
++++ b/OpenOVR/Reimpl/BaseCompositor.cpp
+@@ -602,8 +602,8 @@ ovr_enum_t BaseCompositor::GetPosesForFrame(uint32_t unPosePredictionID, Tracked
+ }
+ 
+ 
+-vr::EVRCompositorError BaseCompositor::GetSubmitTexture(vr::Texture_t *pOutTexture, bool *pNeedsFlush, vr::IVRCompositor_029::EVRCompositorTextureUsage eUsage, const vr::Texture_t *pTexture, const vr::VRTextureBounds_t *pBounds, vr::EVRSubmitFlags nSubmitFlags)
++BaseCompositor::ovr_enum_t BaseCompositor::GetSubmitTexture(vr::Texture_t *pOutTexture, bool *pNeedsFlush, vr::IVRCompositor_029::EVRCompositorTextureUsage eUsage, const vr::Texture_t *pTexture, const vr::VRTextureBounds_t *pBounds, vr::EVRSubmitFlags nSubmitFlags)
+ {
+ 	STUBBED();
+-	return vr::VRCompositorError_SharedTexturesNotSupported;
++	return 106; // VRCompositorError_SharedTexturesNotSupported
+ }
+diff --git a/OpenOVR/Reimpl/BaseCompositor.h b/OpenOVR/Reimpl/BaseCompositor.h
+index d5c2bf920e02d254fe86fdbd039c359467d57d88..356afc974d603b5f2e34dabefad21e10dafc8526 100644
+--- a/OpenOVR/Reimpl/BaseCompositor.h
++++ b/OpenOVR/Reimpl/BaseCompositor.h
+@@ -367,5 +367,5 @@ public:
+ 	ovr_enum_t GetPosesForFrame(uint32_t unPosePredictionID, vr::TrackedDevicePose_t* pPoseArray, uint32_t unPoseArrayCount);
+ 
+ 	// OpenVR 2.x additions
+-	vr::EVRCompositorError GetSubmitTexture(vr::Texture_t *pOutTexture, bool *pNeedsFlush, vr::IVRCompositor_029::EVRCompositorTextureUsage eUsage, const vr::Texture_t *pTexture, const vr::VRTextureBounds_t *pBounds = 0, vr::EVRSubmitFlags nSubmitFlags = vr::Submit_Default);
++	ovr_enum_t GetSubmitTexture(vr::Texture_t *pOutTexture, bool *pNeedsFlush, vr::IVRCompositor_029::EVRCompositorTextureUsage eUsage, const vr::Texture_t *pTexture, const vr::VRTextureBounds_t *pBounds = 0, vr::EVRSubmitFlags nSubmitFlags = vr::Submit_Default);
+ };
+-- 
+2.39.5
+

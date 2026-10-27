@@ -20,7 +20,7 @@ build_dir=${BUILD_DIR:-${runtime_dir}/build}
 readonly dxmt_repo=https://github.com/3Shain/dxmt.git
 readonly dxmt_tag=v0.80
 readonly dxmt_commit=589adb780354b461645b29999cefaf533594ee99
-readonly basalt_tag=v0.80-basalt.1
+readonly basalt_tag=v0.80-basalt.2
 
 readonly llvm_repo=https://github.com/llvm/llvm-project.git
 readonly llvm_tag=llvmorg-15.0.7
