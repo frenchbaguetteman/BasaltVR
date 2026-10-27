@@ -18,7 +18,7 @@ run_step "Environment" "$script_dir/doctor.zsh" --core
 
 print
 print "==> Repository hygiene"
-zsh -n packaging/*.zsh runtime/scripts/*.zsh scripts/*.zsh
+zsh -n packaging/*.zsh packaging/BasaltVRLauncher runtime/scripts/*.zsh scripts/*.zsh
 plutil -lint packaging/Info.plist
 swift package --package-path streamer dump-package >/dev/null
 (
@@ -28,7 +28,14 @@ swift package --package-path streamer dump-package >/dev/null
     '
 )
 "$script_dir/check-markdown-links.zsh"
-git diff --check
+# A plain `git diff --check` sees only uncommitted edits, which a CI checkout
+# never has. Diffing the working tree against the merge base with the target
+# branch also covers every commit on the branch or pull request.
+if merge_base=$(git merge-base HEAD "origin/${GITHUB_BASE_REF:-main}" 2>/dev/null); then
+    git diff --check "$merge_base"
+else
+    git diff --check
+fi
 
 # The native control daemon and readback tool otherwise compile only inside
 # the Metal-dependent DXMT suite, so a protocol-header change could break them

@@ -99,12 +99,15 @@ if [[ ! -d ${src_dir}/.git ]]; then
 fi
 
 # The checkout is only reusable if it was built from the exact patch files
-# on disk; the hash in the tagged commit's message detects edited patches.
+# on disk on top of the pinned upstream commit: the hash in the tagged
+# commit's message detects edited patches, and the tag's parent detects a
+# patch commit left over from an older dxmt_commit pin.
 patches_sha=$(cat "${patches_dir}"/*.patch | shasum -a 256 | awk '{print $1}')
 
 if [[ $(git -C "${src_dir}" rev-parse "${basalt_tag}^{commit}" 2>/dev/null) != '' ]] &&
    git -C "${src_dir}" diff --quiet "${basalt_tag}" 2>/dev/null &&
    [[ $(git -C "${src_dir}" rev-parse HEAD) == $(git -C "${src_dir}" rev-parse "${basalt_tag}^{commit}") ]] &&
+   [[ $(git -C "${src_dir}" rev-parse "${basalt_tag}^{commit}^" 2>/dev/null) == ${dxmt_commit} ]] &&
    git -C "${src_dir}" log -1 --format=%B "${basalt_tag}" | grep -q "patches-sha ${patches_sha}"; then
     print "Using existing ${basalt_tag} checkout (patches ${patches_sha[1,12]})"
 else
