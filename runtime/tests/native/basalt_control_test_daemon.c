@@ -10,6 +10,13 @@
  *
  * Usage: basalt_control_test_daemon --control-file <path> [--expect-frames N]
  *        [--frame-delay-ms N] [--view-width N --view-height N]
+ *        [--verify-clears | --compositor-scenarios]
+ *
+ * --compositor-scenarios pairs with d3d11_compositor_smoke.exe: every
+ * FrameReady is checked against basalt_compositor_scenarios.h by reading
+ * the referenced IOSurfaces (the application's own direct swapchain or the
+ * runtime compositor's output; exact or blended pixels at known places) and,
+ * for the side-by-side scenario, each eye's image rect.
  */
 
 #include <IOSurface/IOSurfaceRef.h>
@@ -29,9 +36,12 @@
 #include <unistd.h>
 
 #include "../../pe/basalt_control_protocol.h"
+#include "../basalt_compositor_scenarios.h"
 #include "../basalt_test_colors.h"
 
-#define MAX_SWAPCHAINS 8
+/* The runtime keeps up to 16 application swapchains plus one compositor
+ * output swapchain; only direct ones are registered, but allow them all. */
+#define MAX_SWAPCHAINS 24
 #define MAX_IMAGES 8
 #define ACCEPT_TIMEOUT_SECONDS 60
 #define READ_TIMEOUT_SECONDS 30
@@ -47,6 +57,9 @@ typedef struct {
 } Swapchain;
 
 #define DXGI_FORMAT_B8G8R8A8_UNORM_VALUE 87u
+#define DXGI_FORMAT_B8G8R8A8_UNORM_SRGB_VALUE 91u
+#define COMPOSITOR_OUTPUT_IMAGE_COUNT 6u
+#define APPLICATION_IMAGE_COUNT 3u
 
 /* The shared color formula packs r,g,b,a memory bytes (RGBA8); BGRA8
  * surfaces store b,g,r,a, so swap the red and blue bytes to compare. */
@@ -62,6 +75,7 @@ static Swapchain g_swapchains[MAX_SWAPCHAINS];
 static uint64_t g_frames_received = 0;
 static uint64_t g_last_frame_number = 0;
 static bool g_verify_clears = false;
+static bool g_compositor_scenarios = false;
 static uint64_t g_haptics_received = 0;
 static bool g_refresh_tracking = false;
 static bool g_head_turned = false;
@@ -166,9 +180,11 @@ static bool send_touch_profile(int fd, uint32_t hand) {
 
 static bool send_view_config(int fd) {
     const float values[9] = {
-        0.064f,
-        -0.85f, 0.75f, 0.80f, -0.78f,
-        -0.75f, 0.85f, 0.80f, -0.78f,
+        BASALT_TEST_IPD_METERS,
+        kBasaltTestEyeFov[0][0], kBasaltTestEyeFov[0][1],
+        kBasaltTestEyeFov[0][2], kBasaltTestEyeFov[0][3],
+        kBasaltTestEyeFov[1][0], kBasaltTestEyeFov[1][1],
+        kBasaltTestEyeFov[1][2], kBasaltTestEyeFov[1][3],
     };
     return send_message(
         fd, BASALT_MSG_VIEW_CONFIG,
@@ -375,6 +391,209 @@ static bool handle_destroy_swapchain(int fd, const uint8_t* payload, size_t leng
     return send_message(fd, BASALT_MSG_DESTROY_SWAPCHAIN_ACK, payload, 8);
 }
 
+/* Reads one pixel's b,g,r,a bytes (packed little-endian) from a BGRA
+ * surface. */
+static bool read_bgra_pixel(IOSurfaceRef surface, uint32_t x, uint32_t y, uint32_t* pixel) {
+    if (x >= IOSurfaceGetWidth(surface) || y >= IOSurfaceGetHeight(surface) ||
+        IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != KERN_SUCCESS) {
+        return false;
+    }
+    const uint8_t* base = IOSurfaceGetBaseAddress(surface);
+    memcpy(pixel, base + (size_t)y * IOSurfaceGetBytesPerRow(surface) + (size_t)x * 4,
+           sizeof(*pixel));
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    return true;
+}
+
+static uint32_t rgba_to_bgra(uint32_t rgba) {
+    return (rgba & 0xff00ff00u) | ((rgba & 0xffu) << 16) | ((rgba >> 16) & 0xffu);
+}
+
+/* Linear-light "over" of an unpremultiplied source, re-encoded to sRGB,
+ * which is what the runtime compositor's sRGB output view produces. */
+static uint32_t blend_over_rgba(uint32_t source, uint32_t destination) {
+    const double alpha = (double)(source >> 24) / 255.0;
+    uint32_t result = 0xff000000u;
+    for (int channel = 0; channel < 3; ++channel) {
+        const double s = basaltSrgbToLinear((double)((source >> (channel * 8)) & 0xffu) / 255.0);
+        const double d = basaltSrgbToLinear(
+            (double)((destination >> (channel * 8)) & 0xffu) / 255.0);
+        const double encoded = basaltLinearToSrgb(s * alpha + d * (1.0 - alpha));
+        result |= (uint32_t)lround(encoded * 255.0) << (channel * 8);
+    }
+    return result;
+}
+
+static bool expect_pixel(
+    uint64_t frame_number, uint32_t view, IOSurfaceRef surface,
+    float x, float y, uint32_t expected_rgba, int tolerance, const char* what) {
+    const uint32_t px = (uint32_t)x;
+    const uint32_t py = (uint32_t)y;
+    uint32_t pixel = 0;
+    if (!read_bgra_pixel(surface, px, py, &pixel)) {
+        fprintf(stderr, "FAIL: frame %" PRIu64 " view %u: cannot read pixel %u,%u (%s)\n",
+                frame_number, view, px, py, what);
+        return false;
+    }
+    const uint32_t expected = rgba_to_bgra(expected_rgba);
+    for (int channel = 0; channel < 4; ++channel) {
+        const int actual_byte = (int)((pixel >> (channel * 8)) & 0xffu);
+        const int expected_byte = (int)((expected >> (channel * 8)) & 0xffu);
+        if (abs(actual_byte - expected_byte) > tolerance) {
+            fprintf(stderr,
+                    "FAIL: frame %" PRIu64 " view %u pixel %u,%u (%s) is BGRA 0x%08x, "
+                    "expected 0x%08x (tolerance %d)\n",
+                    frame_number, view, px, py, what, pixel, expected, tolerance);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_compositor_output(const Swapchain* swapchain) {
+    return swapchain->dxgi_format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB_VALUE &&
+           swapchain->image_count == COMPOSITOR_OUTPUT_IMAGE_COUNT &&
+           swapchain->width == BASALT_COMPOSITOR_VIEW_WIDTH &&
+           swapchain->height == BASALT_COMPOSITOR_VIEW_HEIGHT;
+}
+
+static bool is_application_direct(const Swapchain* swapchain) {
+    return swapchain->dxgi_format == DXGI_FORMAT_B8G8R8A8_UNORM_VALUE &&
+           swapchain->image_count == APPLICATION_IMAGE_COUNT;
+}
+
+/* Checks one view of a compositor scenario frame; rect is the view's
+ * x, y, width, height. */
+static bool verify_scenario_view(
+    uint64_t frame_number, uint32_t view, const Swapchain* swapchain,
+    uint32_t image_index, const int32_t rect[4]) {
+    const float width = (float)BASALT_COMPOSITOR_VIEW_WIDTH;
+    const float height = (float)BASALT_COMPOSITOR_VIEW_HEIGHT;
+    IOSurfaceRef surface = swapchain->surfaces[image_index];
+    const bool direct_expected =
+        frame_number == BASALT_SCENARIO_DIRECT || frame_number == BASALT_SCENARIO_FIFO ||
+        frame_number == BASALT_SCENARIO_SIDE_BY_SIDE;
+    if (frame_number > BASALT_SCENARIO_COUNT) {
+        fprintf(stderr, "FAIL: unexpected extra FrameReady %" PRIu64 "\n", frame_number);
+        return false;
+    }
+    if (direct_expected ? !is_application_direct(swapchain)
+                        : !is_compositor_output(swapchain)) {
+        fprintf(stderr,
+                "FAIL: scenario %" PRIu64 " view %u referenced swapchain %" PRIu64
+                " (%ux%u, format %u, %u images); expected the %s\n",
+                frame_number, view, swapchain->id, swapchain->width, swapchain->height,
+                swapchain->dxgi_format, swapchain->image_count,
+                direct_expected ? "application's own BGRA swapchain"
+                                : "runtime compositor output");
+        return false;
+    }
+    switch (frame_number) {
+    case BASALT_SCENARIO_DIRECT:
+        return expect_pixel(frame_number, view, surface, 0, 0, kBasaltDirectColor, 0, "direct") &&
+               expect_pixel(frame_number, view, surface, 33, 47, kBasaltDirectColor, 0, "direct");
+    case BASALT_SCENARIO_SRGB_RGBA:
+        return expect_pixel(frame_number, view, surface, 0, 0, kBasaltSrgbColor, 0, "corner") &&
+               expect_pixel(frame_number, view, surface, width - 1, height - 1,
+                            kBasaltSrgbColor, 0, "corner") &&
+               expect_pixel(frame_number, view, surface, width * 0.5f, height * 0.5f,
+                            kBasaltSrgbColor, 0, "center") &&
+               expect_pixel(frame_number, view, surface, 17, height * 0.6f,
+                            kBasaltSrgbColor, 0, "edge");
+    case BASALT_SCENARIO_MIPMAPPED:
+    case BASALT_SCENARIO_OVERSIZED:
+        return expect_pixel(frame_number, view, surface, width * 0.25f, height * 0.25f,
+                            kBasaltQuadrantColors[0], 0, "top-left quadrant") &&
+               expect_pixel(frame_number, view, surface, width * 0.75f, height * 0.25f,
+                            kBasaltQuadrantColors[1], 0, "top-right quadrant") &&
+               expect_pixel(frame_number, view, surface, width * 0.25f, height * 0.75f,
+                            kBasaltQuadrantColors[2], 0, "bottom-left quadrant") &&
+               expect_pixel(frame_number, view, surface, width * 0.75f, height * 0.75f,
+                            kBasaltQuadrantColors[3], 0, "bottom-right quadrant");
+    case BASALT_SCENARIO_FLIPPED:
+        return expect_pixel(frame_number, view, surface, width * 0.5f, height * 0.25f,
+                            kBasaltFlipBottomColor, 0, "flipped top") &&
+               expect_pixel(frame_number, view, surface, width * 0.5f, height * 0.75f,
+                            kBasaltFlipTopColor, 0, "flipped bottom");
+    case BASALT_SCENARIO_QUAD: {
+        float center_x = 0.0f;
+        float center_y = 0.0f;
+        float inner_x = 0.0f;
+        float inner_y = 0.0f;
+        float outside_x = 0.0f;
+        float outside_y = 0.0f;
+        basaltQuadCenterPixel(view, &center_x, &center_y);
+        basaltQuadOffsetPixel(view, 0.15f, -0.15f, &inner_x, &inner_y);
+        basaltQuadOffsetPixel(view, BASALT_QUAD_SIZE_METERS, 0.0f, &outside_x, &outside_y);
+        const uint32_t blended = blend_over_rgba(kBasaltQuadColor, kBasaltProjectionColor);
+        return expect_pixel(frame_number, view, surface, center_x, center_y,
+                            blended, 2, "quad center") &&
+               expect_pixel(frame_number, view, surface, inner_x, inner_y,
+                            blended, 2, "inside quad") &&
+               expect_pixel(frame_number, view, surface, outside_x, outside_y,
+                            kBasaltProjectionColor, 0, "beside quad") &&
+               expect_pixel(frame_number, view, surface, 5, 5,
+                            kBasaltProjectionColor, 0, "projection corner");
+    }
+    case BASALT_SCENARIO_QUAD_ONLY: {
+        float upper_x = 0.0f;
+        float upper_y = 0.0f;
+        float lower_x = 0.0f;
+        float lower_y = 0.0f;
+        basaltQuadOffsetPixel(view, 0.0f, 0.12f, &upper_x, &upper_y);
+        basaltQuadOffsetPixel(view, 0.0f, -0.12f, &lower_x, &lower_y);
+        /* The negative-height rect shows the image upside down. */
+        return expect_pixel(frame_number, view, surface, upper_x, upper_y,
+                            kBasaltSkyBottomColor, 0, "upper quad half") &&
+               expect_pixel(frame_number, view, surface, lower_x, lower_y,
+                            kBasaltSkyTopColor, 0, "lower quad half") &&
+               expect_pixel(frame_number, view, surface, 5, 5,
+                            BASALT_RGBA(0, 0, 0, 255), 0, "cleared background");
+    }
+    case BASALT_SCENARIO_FIFO:
+        if (image_index != BASALT_FIFO_RELEASED_IMAGE) {
+            fprintf(stderr,
+                    "FAIL: FIFO scenario view %u delivered image %u, expected the oldest "
+                    "acquired image %u\n",
+                    view, image_index, BASALT_FIFO_RELEASED_IMAGE);
+            return false;
+        }
+        return expect_pixel(frame_number, view, surface, 0, 0,
+                            kBasaltFifoReleasedColor, 0, "released image");
+    case BASALT_SCENARIO_SIDE_BY_SIDE: {
+        /* The typeless image is registered as B8G8R8A8_UNORM (checked
+         * above), and each eye selects its half of it by rect. */
+        const int32_t half = (int32_t)(BASALT_SIDE_BY_SIDE_WIDTH / 2);
+        const float seam = (float)half;
+        if (swapchain->width != BASALT_SIDE_BY_SIDE_WIDTH ||
+            swapchain->height != BASALT_SIDE_BY_SIDE_HEIGHT ||
+            rect[0] != (view == 0 ? 0 : half) || rect[1] != 0 || rect[2] != half ||
+            rect[3] != (int32_t)BASALT_SIDE_BY_SIDE_HEIGHT) {
+            fprintf(stderr,
+                    "FAIL: side-by-side view %u is %ux%u rect %d,%d %dx%d; expected the "
+                    "%ux%u image's %s half\n",
+                    view, swapchain->width, swapchain->height, rect[0], rect[1], rect[2],
+                    rect[3], BASALT_SIDE_BY_SIDE_WIDTH, BASALT_SIDE_BY_SIDE_HEIGHT,
+                    view == 0 ? "left" : "right");
+            return false;
+        }
+        return expect_pixel(frame_number, view, surface, seam - 1.0f, 0,
+                            kBasaltSideBySideLeftColor, 0, "left of the seam") &&
+               expect_pixel(frame_number, view, surface, seam, 0,
+                            kBasaltSideBySideRightColor, 0, "right of the seam") &&
+               expect_pixel(frame_number, view, surface,
+                            (float)rect[0] + (float)half * 0.5f,
+                            (float)BASALT_SIDE_BY_SIDE_HEIGHT * 0.5f,
+                            view == 0 ? kBasaltSideBySideLeftColor
+                                      : kBasaltSideBySideRightColor,
+                            0, "eye rect center");
+    }
+    default:
+        fprintf(stderr, "FAIL: unexpected FrameReady %" PRIu64 "\n", frame_number);
+        return false;
+    }
+}
+
 static bool handle_frame_ready(int fd, const uint8_t* payload, size_t length) {
     if (length < 28) {
         fprintf(stderr, "FAIL: FrameReady payload too short (%zu)\n", length);
@@ -421,6 +640,22 @@ static bool handle_frame_ready(int fd, const uint8_t* payload, size_t length) {
             fprintf(stderr, "FAIL: FrameReady image index %u out of range\n", image_index);
             return false;
         }
+        if (g_compositor_scenarios) {
+            const int32_t rect[4] = {
+                (int32_t)read_u32(view + 16), (int32_t)read_u32(view + 20),
+                (int32_t)read_u32(view + 24), (int32_t)read_u32(view + 28)};
+            if (!verify_scenario_view(frame_number, i, swapchain, image_index, rect)) {
+                return false;
+            }
+            /* Both composited eyes come from one output ring slot. */
+            if (is_compositor_output(swapchain) && view_count == 2 && i == 1 &&
+                (read_u64(payload + 28) != swapchain_id ||
+                 read_u32(payload + 28 + 8) + 1 != image_index ||
+                 image_index % 2 != 1)) {
+                fprintf(stderr, "FAIL: composited eyes are not one output slot pair\n");
+                return false;
+            }
+        }
         const float expected_x = i == 0 ? -0.032f : 0.032f;
         const float expected_z = 0.0f;
         const float orientation_y = read_f32(view + 36);
@@ -460,6 +695,9 @@ static bool handle_frame_ready(int fd, const uint8_t* payload, size_t length) {
         }
     }
     ++g_frames_received;
+    if (g_compositor_scenarios) {
+        printf("daemon: compositor scenario %" PRIu64 " verified\n", frame_number);
+    }
     if (g_frames_received <= 3) {
         printf("daemon: frame %" PRIu64 " ready (display time %" PRId64 ", %u views)\n",
                frame_number, display_time, view_count);
@@ -489,6 +727,8 @@ int main(int argc, char** argv) {
             expect_frames = strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--verify-clears") == 0) {
             g_verify_clears = true;
+        } else if (strcmp(argv[i], "--compositor-scenarios") == 0) {
+            g_compositor_scenarios = true;
         } else if (strcmp(argv[i], "--frame-delay-ms") == 0 && i + 1 < argc) {
             g_frame_delay_ms = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--view-width") == 0 && i + 1 < argc) {
@@ -500,9 +740,14 @@ int main(int argc, char** argv) {
             break;
         }
     }
-    if (control_file == NULL || (g_view_width == 0) != (g_view_height == 0)) {
+    if (control_file == NULL || (g_view_width == 0) != (g_view_height == 0) ||
+        (g_verify_clears && g_compositor_scenarios) ||
+        (g_compositor_scenarios &&
+         (g_view_width != BASALT_COMPOSITOR_VIEW_WIDTH ||
+          g_view_height != BASALT_COMPOSITOR_VIEW_HEIGHT))) {
         fprintf(stderr, "usage: %s --control-file <path> [--expect-frames N] "
-                        "[--frame-delay-ms N] [--view-width N --view-height N]\n",
+                        "[--frame-delay-ms N] [--view-width N --view-height N] "
+                        "[--verify-clears | --compositor-scenarios]\n",
                 argv[0]);
         return 2;
     }
@@ -699,6 +944,18 @@ int main(int argc, char** argv) {
                 "FAIL: received %" PRIu64 " FrameReady messages, expected at least %" PRIu64 "\n",
                 g_frames_received, expect_frames);
         return 1;
+    }
+    if (g_compositor_scenarios) {
+        if (g_frames_received != BASALT_SCENARIO_COUNT) {
+            fprintf(stderr,
+                    "FAIL: received %" PRIu64 " compositor scenario frames, expected %d\n",
+                    g_frames_received, BASALT_SCENARIO_COUNT);
+            return 1;
+        }
+        printf("PASS: control daemon verified %" PRIu64
+               " compositor scenarios by IOSurface readback%s\n",
+               g_frames_received, got_teardown ? " (clean teardown)" : "");
+        return 0;
     }
     if (g_haptics_received != 6) {
         fprintf(stderr,

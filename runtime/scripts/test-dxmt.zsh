@@ -124,12 +124,14 @@ fi
 "${cmake_bin}" --build "${build_dir}" --parallel --target \
     basalt_openxr \
     d3d11_runtime_smoke \
+    d3d11_compositor_smoke \
     dxmt_shared_texture_probe \
     dxmt_fence_probe \
     dxmt_window_swapchain_probe \
     dxmt_iosurface_probe \
     dxmt_iosurface_pixel_source \
     frame_timer_probe \
+    opencomposite_frame_timing_smoke \
     steamwebhelper_compat
 
 # Keep the executable in a clean directory so an unrelated d3d11.dll beside the
@@ -140,6 +142,7 @@ cp "${build_dir}/bin/dxmt_window_swapchain_probe.exe" "${probe_dir}/dxmt_window_
 cp "${build_dir}/bin/dxmt_iosurface_probe.exe" "${probe_dir}/dxmt_iosurface_probe.exe"
 cp "${build_dir}/bin/dxmt_iosurface_pixel_source.exe" "${probe_dir}/dxmt_iosurface_pixel_source.exe"
 cp "${build_dir}/bin/d3d11_runtime_smoke.exe" "${probe_dir}/d3d11_runtime_smoke.exe"
+cp "${build_dir}/bin/d3d11_compositor_smoke.exe" "${probe_dir}/d3d11_compositor_smoke.exe"
 cp "${build_dir}/bin/frame_timer_probe.exe" "${probe_dir}/frame_timer_probe.exe"
 
 # An already-created disposable prefix may contain older generated built-ins.
@@ -169,11 +172,18 @@ trap 'exit 130' INT TERM
 
 # One control-socket gate: start a native peer that publishes a control file,
 # run the OpenXR smoke against it, and fail with the peer's log if either side
-# fails. Usage: run_control_gate <label> [SMOKE_ENV=value...] -- <peer command>
-# The peer receives --control-file <path> after its own arguments.
+# fails. Usage:
+#   run_control_gate <label> [--smoke <exe>] [SMOKE_ENV=value...] -- <peer command>
+# The smoke defaults to d3d11_runtime_smoke.exe. The peer receives
+# --control-file <path> after its own arguments.
 run_control_gate() {
     local label=$1
     shift
+    local smoke_exe=./d3d11_runtime_smoke.exe
+    if [[ $1 == --smoke ]]; then
+        smoke_exe=$2
+        shift 2
+    fi
     local -a smoke_env
     while [[ $1 != -- ]]; do
         smoke_env+=("$1")
@@ -195,7 +205,7 @@ run_control_gate() {
     env WINEPREFIX=${wine_prefix} WINEDEBUG=-all MVK_CONFIG_LOG_LEVEL=0 \
         DXMT_BASALT_IOSURFACE=1 BASALT_EXPECT_IOSURFACE=1 "${smoke_env[@]}" \
         BASALT_CONTROL="Z:${control_file//\//\\}" \
-        "${wine_root}/bin/wine" ./d3d11_runtime_smoke.exe || smoke_status=$?
+        "${wine_root}/bin/wine" "${smoke_exe}" || smoke_status=$?
     # Report the peer's side too: a smoke failure alone hides whether the
     # peer saw the handshake, frames, or teardown.
     wait ${control_peer_pid} || peer_status=$?
@@ -244,6 +254,34 @@ WINEPREFIX=${wine_prefix} \
 WINEDEBUG=-all \
 MVK_CONFIG_LOG_LEVEL=0 \
     "${wine_root}/bin/wine" ./d3d11_runtime_smoke.exe
+
+# Headless compositor API surface: formats, limits, layer validation, FIFO
+# swapchain order, repeated wait+begin, and session replacement events.
+WINEPREFIX=${wine_prefix} \
+WINEDEBUG=-all \
+MVK_CONFIG_LOG_LEVEL=0 \
+    "${wine_root}/bin/wine" ./d3d11_compositor_smoke.exe
+
+# OpenComposite on the headless runtime: GetFrameTiming must report one present per
+# frame for old SteamVR Unity plugins too (IVRCompositor_013, 168-byte struct). A zero
+# there sends The Lab's Secret Shop to about 1 fps (opencomposite-patches/0005).
+opencomposite_dll=${OPENCOMPOSITE_DLL:-${build_dir}/opencomposite/out/openvr_api.dll}
+if [[ -f ${opencomposite_dll} ]]; then
+    oc_probe_dir=${build_dir}/dxmt/opencomposite-probe
+    rm -rf "${oc_probe_dir}"
+    mkdir -p "${oc_probe_dir}"
+    cp "${build_dir}/bin/opencomposite_frame_timing_smoke.exe" "${oc_probe_dir}/"
+    cp "${opencomposite_dll}" "${oc_probe_dir}/openvr_api.dll"
+    print 'initUsingVulkan=false' > "${oc_probe_dir}/opencomposite.ini"
+    pushd "${oc_probe_dir}" >/dev/null
+    WINEPREFIX=${wine_prefix} \
+    WINEDEBUG=-all \
+    MVK_CONFIG_LOG_LEVEL=0 \
+        "${wine_root}/bin/wine" ./opencomposite_frame_timing_smoke.exe
+    popd >/dev/null
+else
+    print "SKIP: OpenComposite frame-timing smoke (run runtime/scripts/build-opencomposite.zsh first)"
+fi
 
 # --- Basalt DXMT fork phase (runs when build-dxmt-fork.zsh has produced it) --
 fork_install=${build_dir}/dxmt/fork-install
@@ -342,6 +380,18 @@ if [[ -f ${fork_install}/x86_64-windows/d3d11.dll && -f ${fork_install}/x86_64-u
         --expect-frames 21 --verify-clears --frame-delay-ms 25 \
         --view-width 1152 --view-height 1216
 
+    # Runtime compositor gate: OpenComposite-shaped swapchains and layers
+    # (sRGB RGBA, mipmapped, oversized, flipped, blended quads, quad-only)
+    # arrive as the compositor's BGRA output with the expected pixels, the
+    # direct BGRA path still exports the application's own surfaces (also
+    # for UE4's side-by-side typeless image with one rect per eye), and
+    # wait/release follow acquisition order.
+    run_control_gate "runtime compositor" \
+        --smoke ./d3d11_compositor_smoke.exe -- \
+        "${probe_dir}/basalt_control_test_daemon" \
+        --expect-frames 9 --compositor-scenarios \
+        --view-width 512 --view-height 512
+
     # The production streamer's RuntimeLink, not just the C test daemon, must
     # complete the same handshake, swapchain registration, ordered
     # FrameConsumed acknowledgements, and H.264 encode against this runtime.
@@ -351,7 +401,7 @@ if [[ -f ${fork_install}/x86_64-windows/d3d11.dll && -f ${fork_install}/x86_64-u
     # Leave the generated Wine tree and prefix on the pinned stock overlay.
     overlay_dxmt "${dxmt_root}/x86_64-windows" "${dxmt_root}/x86_64-unix"
     fork_overlay_active=false
-    print "PASS: Basalt DXMT fork gate (IOSurface IDs, native readback, control-socket FrameReady, streamer RuntimeLink)"
+    print "PASS: Basalt DXMT fork gate (IOSurface IDs, native readback, control-socket FrameReady, runtime compositor, streamer RuntimeLink)"
 else
     print "NOTE: fork phase skipped; run runtime/scripts/build-dxmt-fork.zsh to enable it"
 fi

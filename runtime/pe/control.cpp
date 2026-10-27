@@ -1501,31 +1501,32 @@ void controlUnregisterSwapchain(XrSwapchain swapchain) {
     }
 }
 
-void controlFrameReady(
+uint64_t controlFrameReady(
     int64_t displayTime,
     uint64_t questTrackingTimestampNanoseconds,
     const ControlFrameView* views,
-    uint32_t viewCount) {
+    uint32_t viewCount,
+    bool exportViews) {
     if (viewCount == 0 || viewCount > kMaxFrameViews) {
-        return;
+        return 0;
     }
 
     AcquireSRWLockExclusive(&gControlLock);
     if (gSocket == INVALID_SOCKET || gReceiverFailed ||
         gFence == nullptr || gContext4 == nullptr) {
         ReleaseSRWLockExclusive(&gControlLock);
-        return;
+        return 0;
     }
 
     ControlFrameView preparedViews[kMaxFrameViews]{};
     for (uint32_t index = 0; index < viewCount; ++index) {
         preparedViews[index] = views[index];
-        if (!prepareSwapchainViewForExport(
+        if (exportViews && !prepareSwapchainViewForExport(
                 gContext4, &preparedViews[index])) {
             DisconnectState state = beginDisconnectLocked();
             ReleaseSRWLockExclusive(&gControlLock);
             finishDisconnect(state, false);
-            return;
+            return 0;
         }
     }
 
@@ -1538,7 +1539,7 @@ void controlFrameReady(
         DisconnectState state = beginDisconnectLocked();
         ReleaseSRWLockExclusive(&gControlLock);
         finishDisconnect(state, false);
-        return;
+        return 0;
     }
     slot = &gPendingFrames[(gPendingHead + gPendingCount) % kPendingFrameCapacity];
     ++gPendingCount;
@@ -1583,12 +1584,44 @@ void controlFrameReady(
         DisconnectState state = beginDisconnectLocked();
         ReleaseSRWLockExclusive(&gControlLock);
         finishDisconnect(state, false);
-        return;
+        return 0;
     }
     if (wake != nullptr) {
         SetEvent(wake);
     }
     ReleaseSRWLockExclusive(&gControlLock);
+    return frameNumber;
+}
+
+bool controlWaitForFrameConsumed(XrSession session, uint64_t frameNumber) {
+    if (frameNumber == 0) {
+        return true;
+    }
+    AcquireSRWLockExclusive(&gControlLock);
+    bool timedOut = false;
+    while (gControlSession == session && gSocket != INVALID_SOCKET &&
+           !gReceiverFailed && gLastConsumedFrameNumber < frameNumber) {
+        if (!SleepConditionVariableSRW(
+                &gFrameDeliveryCondition, &gControlLock,
+                kFrameConsumeMilliseconds, 0)) {
+            timedOut = true;
+            break;
+        }
+    }
+    const bool consumed = gControlSession == session &&
+                          gSocket != INVALID_SOCKET && !gReceiverFailed &&
+                          gLastConsumedFrameNumber >= frameNumber;
+    DisconnectState state;
+    if (timedOut && gControlSession == session) {
+        // Same policy as the frame budget: a daemon that stops consuming is
+        // dropped instead of letting the compositor overwrite a read image.
+        state = beginDisconnectLocked();
+    }
+    ReleaseSRWLockExclusive(&gControlLock);
+    if (state.socket != INVALID_SOCKET) {
+        finishDisconnect(state, false);
+    }
+    return consumed;
 }
 
 }  // namespace basalt
