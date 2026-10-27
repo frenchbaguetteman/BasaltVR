@@ -48,6 +48,16 @@ All notable changes to BasaltVR are documented here.
 
 ### Fixed
 
+- Reinstalling the Steam UI compatibility launcher after a rebuild no longer overwrites Steam's
+  preserved web helper with an older launcher build, which made the helper relaunch itself.
+- A bottle whose creation or import fails is removed instead of being left half-made with its
+  name taken.
+- Quitting after closing the window now still stops the game, Steam, and the bottle's Wine
+  processes. Stop no longer freezes the window while Wine shuts down; the next launch waits for it.
+- The session log keeps each process's stdout and stderr lines whole and in order, and prefixes
+  every Steam/game line rather than only the first line of each chunk.
+- Diagnostic reports no longer include audio device names (only BlackHole or another device) or
+  `[U:1:…]` Steam IDs.
 - Open BSManager now launches with `start /wait`. A bare `start` exited immediately, and the
   utility exit handler then stopped every Wine process in the bottle, closing BSManager before its
   window appeared.

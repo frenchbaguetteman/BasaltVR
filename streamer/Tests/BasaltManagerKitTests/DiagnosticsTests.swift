@@ -42,6 +42,7 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(redactor.redact("Adas-MacBook-Pro.local:9943"), "<host>.local:9943")
         XCTAssertEqual(redactor.redact("mail ada@example.com now"), "mail <email> now")
         XCTAssertEqual(redactor.redact("owner 76561198012345678"), "owner <steamid>")
+        XCTAssertEqual(redactor.redact("SetSteamID( [U:1:12345678] )"), "SetSteamID( <steamid> )")
         XCTAssertEqual(
             redactor.redact("token 0123456789abcdef0123456789abcdef ok"), "token <token> ok")
         XCTAssertEqual(redactor.redact(#"AccountName="ada_plays" ok"#), #"AccountName="<redacted>" ok"#)
@@ -115,6 +116,21 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(sessions.count, 1)
     }
 
+    func testReportOnlyCategorizesAudioDevices() throws {
+        let report = makeReport(
+            log: "Game audio output routed to Ada's AirPods Pro for this session\n",
+            audioDevice: "Ada's AirPods Pro", defaultAudioDevice: "BlackHole 2ch")
+        let markdown = report.markdown(redactedWith: redactor)
+        let json = try report.json(redactedWith: redactor)
+        for text in [markdown, json] {
+            XCTAssertFalse(text.contains("AirPods"), text)
+            XCTAssertFalse(text.contains("BlackHole 2ch"), text)
+        }
+        XCTAssertTrue(markdown.contains("· audio BlackHole"))
+        XCTAssertTrue(markdown.contains("· audio <audio device>"))
+        XCTAssertTrue(markdown.contains("Game audio output routed to <audio device> for this session"))
+    }
+
     func testReportCanLeaveOutTheLog() {
         let markdown = makeReport(log: nil).markdown(redactedWith: redactor)
         XCTAssertTrue(markdown.contains("### Session log\n\nNot included."))
@@ -177,7 +193,8 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(SourceRevision.read(repository: checkout), String(sha.prefix(12)))
     }
 
-    private func makeReport(log: String?) -> DiagnosticReport {
+    private func makeReport(log: String?, audioDevice: String? = nil,
+                            defaultAudioDevice: String? = nil) -> DiagnosticReport {
         let engineRoot = URL(fileURLWithPath: "/Users/ada/BasaltVR/runtime/build/wine")
         let engine = BottleEngine(
             id: "pinned-wine", kind: .pinned,
@@ -200,6 +217,9 @@ final class DiagnosticsTests: XCTestCase {
         var custom = StreamLaunchSettings()
         custom.connection = .wifi
         custom.fps = 90
+        custom.audioDeviceName = audioDevice
+        var defaults = StreamLaunchSettings()
+        defaults.audioDeviceName = defaultAudioDevice
         var failed = SessionRecord(
             profileName: "beat-saber-vr", settings: custom,
             startedAt: Date(timeIntervalSince1970: 1_800_000_000))
@@ -225,7 +245,7 @@ final class DiagnosticsTests: XCTestCase {
             engines: [engine],
             bottles: [bottle],
             profiles: [profile],
-            defaultStreamSettings: StreamLaunchSettings(),
+            defaultStreamSettings: defaults,
             profileStreamSettings: ["beat-saber-vr": custom],
             currentSession: .init(state: "stopped"),
             recentSessions: [failed],
