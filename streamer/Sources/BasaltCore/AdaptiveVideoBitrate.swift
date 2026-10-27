@@ -9,6 +9,9 @@ public final class AdaptiveVideoBitrateController: @unchecked Sendable {
     private static let unhealthyDurationNanoseconds: UInt64 = 1_000_000_000
     private static let healthyRecoveryNanoseconds: UInt64 = 12_000_000_000
     private static let congestionWindowNanoseconds: UInt64 = 2_000_000_000
+    /// Statistics come from the headset. A pipeline latency this large is a
+    /// corrupt or hostile sample, and would also overflow the latency math.
+    static let maximumPlausibleLatencyNanoseconds: UInt64 = 10_000_000_000
 
     public let configuredBitrate: Int
     public let minimumBitrate: Int
@@ -69,7 +72,9 @@ public final class AdaptiveVideoBitrateController: @unchecked Sendable {
         nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) -> Int? {
         guard statistics.frameIntervalNanoseconds > 0,
-              statistics.totalPipelineLatencyNanoseconds > 0 else { return nil }
+              statistics.totalPipelineLatencyNanoseconds > 0,
+              statistics.totalPipelineLatencyNanoseconds
+                <= Self.maximumPlausibleLatencyNanoseconds else { return nil }
 
         lock.lock()
         defer { lock.unlock() }

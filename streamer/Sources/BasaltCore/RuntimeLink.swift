@@ -66,6 +66,11 @@ public final class RuntimeLink: @unchecked Sendable {
     public static let maximumViewWidth = 1680
     public static let maximumViewHeight = 1760
     static let maximumRetainedButtonPaths = 64
+    /// The runtime's view-config bounds (parseViewConfig in
+    /// runtime/pe/control.cpp). It treats a value outside them as a corrupt
+    /// connection, so out-of-range calibration must never be sent.
+    static let viewConfigIPDRange: ClosedRange<Float> = 0.04...0.09
+    static let maximumViewConfigFovAngle: Float = 1.57079633
 
     public struct FrameView {
         public let swapchainId: UInt64
@@ -306,7 +311,8 @@ public final class RuntimeLink: @unchecked Sendable {
     }
 
     public func publishInteractionProfile(deviceID: UInt64, profileID: UInt64) {
-        guard let hand = AlvrHand(alvrDeviceID: deviceID) else { return }
+        // The runtime rejects profile 0 as a protocol error.
+        guard let hand = AlvrHand(alvrDeviceID: deviceID), profileID != 0 else { return }
         queue.async {
             self.latestInteractionProfiles[hand] = profileID
             if self.helloDone {
@@ -437,6 +443,8 @@ public final class RuntimeLink: @unchecked Sendable {
     }
 
     static func buttonStatePayload(_ entry: AlvrButtonEntry) -> Data? {
+        // The runtime rejects path 0 as a protocol error.
+        guard entry.pathID != 0 else { return nil }
         var payload = Data()
         payload.appendU64(entry.pathID)
         switch entry.value {
@@ -459,10 +467,15 @@ public final class RuntimeLink: @unchecked Sendable {
     }
 
     static func viewConfigPayload(_ config: AlvrViewsConfig) -> Data? {
-        guard config.fov.count == 2, config.ipdMeters.isFinite,
-              config.ipdMeters > 0 else { return nil }
+        guard config.fov.count == 2,
+              viewConfigIPDRange.contains(config.ipdMeters) else { return nil }
+        let limit = maximumViewConfigFovAngle
+        guard config.fov.allSatisfy({ fov in
+            fov.left < fov.right && fov.down < fov.up
+                && fov.left >= -limit && fov.right <= limit
+                && fov.down >= -limit && fov.up <= limit
+        }) else { return nil }
         let values = config.fov.flatMap { [$0.left, $0.right, $0.up, $0.down] }
-        guard values.allSatisfy(\.isFinite) else { return nil }
 
         var payload = Data()
         payload.appendF32(config.ipdMeters)

@@ -21,6 +21,9 @@ public struct AlvrVideoCapabilities: Equatable, Sendable {
     public let prefersFullRange: Bool
     public let preferredEncodingGamma: Float
     public let prefersHDR: Bool
+
+    /// Headset-advertised gammas outside this range fall back to linear (1).
+    static let encodingGammaRange: ClosedRange<Float> = 0.1...10
 }
 
 public struct AlvrFov: Equatable, Sendable {
@@ -753,7 +756,12 @@ private struct LittleEndianReader {
         func bool(_ key: String, default fallback: Bool) -> Bool {
             extras[key] as? Bool ?? fallback
         }
-        let gamma = (extras["preferred_encoding_gamma"] as? NSNumber)?.floatValue ?? 1
+        // The gamma is echoed into the StreamConfig JSON, where a non-finite
+        // value (e.g. 1e39 narrowed to Float) raises an Objective-C exception.
+        let advertisedGamma = (extras["preferred_encoding_gamma"] as? NSNumber)?.floatValue
+        let gamma = advertisedGamma.flatMap {
+            AlvrVideoCapabilities.encodingGammaRange.contains($0) ? $0 : nil
+        } ?? 1
 
         return AlvrVideoCapabilities(
             width: width, height: height, refreshRates: refreshRates,

@@ -78,6 +78,34 @@ final class AlvrControlTests: XCTestCase {
         XCTAssertTrue(capabilities.supportsHighProfile)
     }
 
+    func testUnusableEncodingGammaFallsBackBeforeReachingStreamConfigJSON() throws {
+        func capabilities(gammaJSON: String) throws -> AlvrVideoCapabilities {
+            var packet = Self.acceptedPrefix(protocolId: 20, name: "Quest 3")
+            packet.append(1) // Some
+            packet.append(Self.littleEndian(UInt32(2064)))
+            packet.append(Self.littleEndian(UInt32(2208)))
+            let json = Data("{\"preferred_encoding_gamma\":\(gammaJSON)}".utf8)
+            packet.append(Self.littleEndian(UInt64(1 + json.count)))
+            packet.append(Self.littleEndian(Float(90).bitPattern))
+            for byte in json { packet.append(Self.littleEndian((-Float(byte)).bitPattern)) }
+            packet.append(Self.littleEndian(UInt32(48_000)))
+            guard case .accepted(_, _, _, let capabilities?) =
+                    try AlvrClientConnectionDecoder.decode(packet) else {
+                throw BasaltError("Expected accepted capabilities")
+            }
+            return capabilities
+        }
+
+        XCTAssertEqual(try capabilities(gammaJSON: "2.2").preferredEncodingGamma, 2.2)
+        // 1e39 overflows Float to +inf, which JSONSerialization cannot encode.
+        for unusable in ["1e39", "-1", "0", "1000"] {
+            let decoded = try capabilities(gammaJSON: unusable)
+            XCTAssertEqual(decoded.preferredEncodingGamma, 1, unusable)
+            let settings = try AlvrNegotiatedSettings.beatSaberDefaults(for: decoded)
+            XCTAssertNoThrow(try AlvrStreamConfigEncoder.payload(settings: settings))
+        }
+    }
+
     func testDecodesStandby() throws {
         XCTAssertEqual(try AlvrClientConnectionDecoder.decode(Self.littleEndian(UInt32(1))), .standby)
     }

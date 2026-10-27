@@ -56,6 +56,31 @@ final class AdaptiveVideoBitrateTests: XCTestCase {
         XCTAssertLessThanOrEqual(recovered!, 35_000_000)
     }
 
+    func testImplausibleHeadsetLatencyIsIgnoredWithoutOverflow() {
+        let controller = AdaptiveVideoBitrateController(
+            configuredBitrate: 35_000_000, targetFramesPerSecond: 72)
+        // UInt64.max previously trapped on `baseline + 25_000_000`.
+        XCTAssertNil(controller.recordClientStatistics(
+            statistics(frameInterval: 27_777_778, latency: .max),
+            nowNanoseconds: 0))
+        XCTAssertNil(controller.recordClientStatistics(
+            statistics(frameInterval: 27_777_778,
+                       latency: AdaptiveVideoBitrateController
+                           .maximumPlausibleLatencyNanoseconds + 1),
+            nowNanoseconds: 1_000_000_000))
+
+        // The rejected samples did not poison the latency baseline.
+        XCTAssertNil(controller.recordClientStatistics(
+            statistics(frameInterval: 13_888_889, latency: 100_000_000),
+            nowNanoseconds: 2_000_000_000))
+        XCTAssertNil(controller.recordClientStatistics(
+            statistics(frameInterval: 27_777_778, latency: 150_000_000),
+            nowNanoseconds: 3_000_000_000))
+        XCTAssertEqual(controller.recordClientStatistics(
+            statistics(frameInterval: 27_777_778, latency: 155_000_000),
+            nowNanoseconds: 4_100_000_000), 28_000_000)
+    }
+
     private func statistics(
         frameInterval: UInt64, latency: UInt64,
         decoderQueue: UInt64 = 5_000_000

@@ -189,6 +189,9 @@ final class RuntimeLinkTests: XCTestCase {
         XCTAssertEqual(button.readTestU64(at: 0), 0x1234)
         XCTAssertEqual(button.readTestU32(at: 8), 1)
         XCTAssertEqual(button.readTestF32(at: 12), 0.75)
+        // The runtime treats path 0 as a corrupt connection.
+        XCTAssertNil(RuntimeLink.buttonStatePayload(
+            AlvrButtonEntry(pathID: 0, value: .binary(true))))
 
         let profile = RuntimeLink.interactionProfilePayload(
             hand: .right, profileID: 0x0812_fd85_c843_84a6)
@@ -232,6 +235,34 @@ final class RuntimeLinkTests: XCTestCase {
             ipdMeters: 0.063, fov: [
                 AlvrFov(left: -1, right: 1, up: 1, down: -1),
             ])))
+    }
+
+    /// parseViewConfig in runtime/pe/control.cpp drops the whole control
+    /// connection for a view config outside these bounds, and RuntimeLink
+    /// resends the retained config on every Hello, so one bad sample would
+    /// keep the runtime disconnected. Pin the mirrored bounds.
+    func testViewConfigPayloadEnforcesRuntimeBounds() {
+        XCTAssertEqual(RuntimeLink.viewConfigIPDRange, 0.04...0.09)
+        XCTAssertEqual(RuntimeLink.maximumViewConfigFovAngle, 1.57079633)
+
+        func payload(ipd: Float = 0.063, left: AlvrFov) -> Data? {
+            RuntimeLink.viewConfigPayload(AlvrViewsConfig(
+                ipdMeters: ipd,
+                fov: [left, AlvrFov(left: -1, right: 1, up: 1, down: -1)]))
+        }
+        let valid = AlvrFov(left: -1, right: 1, up: 1, down: -1)
+        XCTAssertNotNil(payload(ipd: 0.04, left: valid))
+        XCTAssertNotNil(payload(ipd: 0.09, left: valid))
+        XCTAssertNil(payload(ipd: 0.039, left: valid))
+        XCTAssertNil(payload(ipd: 0.091, left: valid))
+        XCTAssertNil(payload(ipd: .nan, left: valid))
+        XCTAssertNil(payload(left: AlvrFov(left: 1, right: -1, up: 1, down: -1)))
+        XCTAssertNil(payload(left: AlvrFov(left: -1, right: 1, up: -1, down: 1)))
+        XCTAssertNil(payload(left: AlvrFov(left: 0.5, right: 0.5, up: 1, down: -1)))
+        XCTAssertNil(payload(left: AlvrFov(left: -1.6, right: 1, up: 1, down: -1)))
+        XCTAssertNil(payload(left: AlvrFov(left: -1, right: 1.6, up: 1, down: -1)))
+        XCTAssertNil(payload(left: AlvrFov(left: -1, right: 1, up: 1.6, down: -1)))
+        XCTAssertNil(payload(left: AlvrFov(left: -1, right: 1, up: 1, down: -1.6)))
     }
 
     func testControllerSendSelectionAlternatesWhenBothHandsStayPending() throws {

@@ -68,6 +68,9 @@ All notable changes to BasaltVR are documented here.
 - Stopping the streamer during the USB headset handshake, or a failed start, now restores the Mac
   audio output and removes the adb forwards instead of leaving them behind.
 - A closed USB video stream no longer spins the streamer at 100% CPU.
+- Out-of-range headset values (encoding gamma, latency statistics, IPD/FOV calibration, button
+  path or controller profile 0) are ignored instead of crashing the streamer or making the runtime
+  drop its control connection.
 
 ### Project maintenance
 
