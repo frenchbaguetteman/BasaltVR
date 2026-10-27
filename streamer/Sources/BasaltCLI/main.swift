@@ -3,8 +3,20 @@ import BasaltBottleKit
 
 private struct ArgumentCursor {
     private(set) var values: [String]
+    /// Arguments after `--`, held apart so option lookups never consume
+    /// game arguments such as `-- --root x`.
+    private var trailing: [String]?
 
-    init(_ values: [String]) { self.values = values }
+    init(_ arguments: [String]) {
+        guard let separator = arguments.firstIndex(of: "--") else {
+            values = arguments
+            return
+        }
+        values = Array(arguments[..<separator])
+        trailing = Array(arguments[(separator + 1)...])
+    }
+
+    var remainder: [String] { values + (trailing.map { ["--"] + $0 } ?? []) }
 
     mutating func pop() -> String? {
         guard !values.isEmpty else { return nil }
@@ -34,11 +46,9 @@ private struct ArgumentCursor {
         return found
     }
 
-    mutating func takeValues(afterSeparator separator: String) -> [String] {
-        guard let index = values.firstIndex(of: separator) else { return [] }
-        let trailing = Array(values.dropFirst(index + 1))
-        values.removeSubrange(index...)
-        return trailing
+    mutating func takeTrailingValues() -> [String] {
+        defer { trailing = nil }
+        return trailing ?? []
     }
 }
 
@@ -74,7 +84,7 @@ private struct BasaltCLI {
         do {
             var cursor = ArgumentCursor(Array(CommandLine.arguments.dropFirst()))
             if cursor.values == ["--help"] || cursor.values == ["help"] ||
-                cursor.values.isEmpty {
+                cursor.remainder.isEmpty {
                 print(usage)
                 return
             }
@@ -273,7 +283,7 @@ private struct BasaltCLI {
         guard let control = try cursor.value(after: "--control-file") else {
             throw BottleToolError("run requires --control-file PATH")
         }
-        let additional = cursor.takeValues(afterSeparator: "--")
+        let additional = cursor.takeTrailingValues()
         try rejectRemainder(cursor)
         let result = try manager.runProfile(
             profile, controlFile: URL(fileURLWithPath: control),
@@ -285,8 +295,8 @@ private struct BasaltCLI {
     }
 
     private static func rejectRemainder(_ cursor: ArgumentCursor) throws {
-        guard cursor.values.isEmpty else {
-            throw BottleToolError("Unexpected arguments: \(cursor.values.joined(separator: " "))")
+        guard cursor.remainder.isEmpty else {
+            throw BottleToolError("Unexpected arguments: \(cursor.remainder.joined(separator: " "))")
         }
     }
 

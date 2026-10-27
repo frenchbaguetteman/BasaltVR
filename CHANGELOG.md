@@ -73,6 +73,7 @@ All notable changes to BasaltVR are documented here.
   drop its control connection.
 - A restarted OpenXR session can replace the runtime connection before the old one closes, and a
   connection that never sends its Hello is dropped after 5 seconds.
+- `basaltctl run` no longer reads its own options from game arguments after `--`.
 
 ### Project maintenance
 
