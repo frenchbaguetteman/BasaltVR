@@ -65,6 +65,7 @@ public struct DiagnosticRedactor: Sendable {
     private static let fixedRules: [(NSRegularExpression, String)] = [
         (regex(#"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"#), "<email>"),
         (regex(#"\b7656119\d{10}\b"#), "<steamid>"),
+        (regex(#"\[U:\d:\d+\]"#), "<steamid>"),
         (regex(#"(?i)\b[A-Z0-9-]+(?:\.[A-Z0-9-]+)*\.client\.alvr\b"#), "<headset>.client.alvr"),
         (regex(#"(?i)\b[A-Z0-9][A-Z0-9-]*\.local\b"#), "<host>.local"),
         (regex(#"(?i)(?<![0-9A-F:-])(?:[0-9A-F]{2}[:-]){5}[0-9A-F]{2}(?![0-9A-F:-])"#), "<mac>"),
@@ -302,11 +303,34 @@ public struct DiagnosticReport: Codable, Equatable, Sendable {
                     environmentKeys: $0.environment.keys.sorted(),
                     hasCustomStreamSettings: profileStreamSettings[$0.name] != nil)
         }
-        self.defaultStreamSettings = defaultStreamSettings
-        self.profileStreamSettings = profileStreamSettings
+        let recentSessions = Array(recentSessions.prefix(Self.maximumRecentSessions))
+        // Output device names can carry a person's name ("Ada's AirPods");
+        // the report only says whether game audio goes through BlackHole.
+        let audioDevices = Set(([defaultStreamSettings] + profileStreamSettings.values
+                                + recentSessions.map(\.settings)).compactMap(\.audioDeviceName))
+        self.defaultStreamSettings = Self.withAudioCategory(defaultStreamSettings)
+        self.profileStreamSettings = profileStreamSettings.mapValues(Self.withAudioCategory)
         self.currentSession = currentSession
-        self.recentSessions = Array(recentSessions.prefix(Self.maximumRecentSessions))
-        logTail = log.map(Self.tail(of:))
+        self.recentSessions = recentSessions.map {
+            var record = $0
+            record.settings = Self.withAudioCategory(record.settings)
+            return record
+        }
+        logTail = log.map { log in
+            Self.tail(of: audioDevices.sorted { $0.count > $1.count }.reduce(log) {
+                $1.isEmpty ? $0 : $0.replacingOccurrences(of: $1, with: Self.audioCategory($1))
+            })
+        }
+    }
+
+    static func audioCategory(_ deviceName: String) -> String {
+        deviceName.localizedCaseInsensitiveContains("BlackHole") ? "BlackHole" : "<audio device>"
+    }
+
+    private static func withAudioCategory(_ settings: StreamLaunchSettings) -> StreamLaunchSettings {
+        var settings = settings
+        settings.audioDeviceName = settings.audioDeviceName.map(audioCategory)
+        return settings
     }
 
     /// Pretty-printed JSON with every string passed through `redactor`.
