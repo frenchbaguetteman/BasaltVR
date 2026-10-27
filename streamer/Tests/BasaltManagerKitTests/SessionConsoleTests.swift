@@ -12,6 +12,32 @@ final class SessionConsoleTests: XCTestCase {
         XCTAssertEqual(console.latestLine, "encoder ready")
     }
 
+    func testKeepsOnePartialLinePerSource() {
+        let console = SessionConsole()
+        let streamer = NSObject(), game = NSObject()
+        XCTAssertEqual(console.append("Quest 7", from: ObjectIdentifier(streamer)), [])
+        XCTAssertEqual(console.append("loading\r\nfra", from: ObjectIdentifier(game),
+                                      prefix: "game: "), ["game: loading"])
+        XCTAssertEqual(console.append("2.0 fps\n", from: ObjectIdentifier(streamer)),
+                       ["Quest 72.0 fps"])
+        XCTAssertEqual(console.append("me\nnext\n", from: ObjectIdentifier(game),
+                                      prefix: "game: "), ["game: frame", "game: next"])
+        XCTAssertEqual(console.log, "game: loading\nQuest 72.0 fps\ngame: frame\ngame: next\n")
+    }
+
+    func testFlushesAClosedSourceAndCapsAPendingLine() {
+        let console = SessionConsole()
+        let pipe = ObjectIdentifier(NSObject())
+        XCTAssertEqual(console.append("fatal: no headset", from: pipe), [])
+        XCTAssertEqual(console.finish(pipe), ["fatal: no headset"])
+        XCTAssertEqual(console.finish(pipe), [])
+        XCTAssertEqual(console.log, "fatal: no headset\n")
+
+        let flood = String(repeating: "x", count: SessionConsole.maximumPartialLineBytes + 1)
+        XCTAssertEqual(console.append(flood, from: pipe), [flood])
+        XCTAssertEqual(console.append("tail\n", from: pipe), ["tail"])
+    }
+
     func testTrimsWholeLinesFromTheFront() {
         let console = SessionConsole()
         let line = String(repeating: "x", count: 99) + "\n"

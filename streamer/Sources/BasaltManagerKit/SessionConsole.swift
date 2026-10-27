@@ -14,11 +14,17 @@ public final class SessionConsole: ObservableObject {
     /// Samples kept for CSV export; the charts show the last `chartWindow`.
     public static let maximumSamples = 50_000
     public static let chartWindow = 360
+    /// A partial line longer than this is logged as it stands, so a process
+    /// that never writes a newline cannot grow its buffer without bound.
+    public static let maximumPartialLineBytes = 16_384
 
     @Published public private(set) var log = ""
     /// Every metric sample since the session started.
     @Published public private(set) var samples = [StreamMetricSample]()
-    private var partialLine = ""
+    /// One pending partial line per output source (each process pipe, or
+    /// nil for the app's own messages), so concurrent outputs never splice
+    /// into each other mid-line.
+    private var partialLines = [ObjectIdentifier?: String]()
 
     public init() {}
 
@@ -40,18 +46,40 @@ public final class SessionConsole: ObservableObject {
     /// utility keeps the last stream's charts.
     public func restart(with firstLine: String = "", clearingSamples: Bool = true) {
         log = firstLine
-        partialLine = ""
+        partialLines.removeAll()
         if clearingSamples { samples.removeAll() }
     }
 
-    /// Appends raw output and returns the lines it completed.
-    public func append(_ output: String) -> [String] {
-        log += output
+    /// Appends raw output from `source`, logs the lines it completed with
+    /// `prefix`, and returns them. An unfinished line waits for its source's
+    /// next chunk or `finish`.
+    public func append(_ output: String, from source: ObjectIdentifier? = nil,
+                       prefix: String = "") -> [String] {
+        // Wine writes CRLF; split on LF and drop the CR so it adds no blank line.
+        var lines = (partialLines[source, default: ""] + output)
+            .components(separatedBy: "\n")
+        var partial = lines.removeLast()
+        lines = lines.map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
+        if partial.utf8.count > Self.maximumPartialLineBytes {
+            lines.append(partial)
+            partial = ""
+        }
+        partialLines[source] = partial.isEmpty ? nil : partial
+        return commit(lines, prefix: prefix)
+    }
+
+    /// Logs and returns the unfinished line `source` left when it closed.
+    public func finish(_ source: ObjectIdentifier?, prefix: String = "") -> [String] {
+        guard let partial = partialLines.removeValue(forKey: source) else { return [] }
+        return commit([partial], prefix: prefix)
+    }
+
+    private func commit(_ lines: [String], prefix: String) -> [String] {
+        guard !lines.isEmpty else { return [] }
+        let prefixed = lines.map { prefix + $0 }
+        log += prefixed.map { $0 + "\n" }.joined()
         if log.utf8.count > Self.maximumLogBytes { trimLog() }
-        partialLine += output
-        var lines = partialLine.components(separatedBy: .newlines)
-        partialLine = lines.removeLast()
-        return lines
+        return prefixed
     }
 
     public func record(_ sample: StreamMetricSample) {

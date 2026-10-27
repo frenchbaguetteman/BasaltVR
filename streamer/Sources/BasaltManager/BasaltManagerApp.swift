@@ -11,6 +11,9 @@ struct BasaltManagerApp: App {
         WindowGroup("BasaltVR") {
             RootView(model: model)
                 .frame(minWidth: 940, minHeight: 640)
+                // Every session starts from this window, so the delegate has
+                // the model before there is anything to stop at quit.
+                .onAppear { appDelegate.model = model }
         }
         .defaultSize(width: 1180, height: 780)
         .commands {
@@ -42,9 +45,17 @@ struct BasaltManagerApp: App {
 }
 
 private final class BasaltApplicationDelegate: NSObject, NSApplicationDelegate {
+    var model: BasaltAppModel?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.regular)
         NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    /// The window (and any view-level observer) may already be gone when the
+    /// app quits; the game, Steam, and wineserver must not outlive it.
+    func applicationWillTerminate(_ notification: Notification) {
+        model?.stop(waitingForWine: true)
     }
 }
 
@@ -91,10 +102,6 @@ private struct RootView: View {
             Button("OK") { model.alertMessage = nil }
         } message: {
             Text(model.alertMessage ?? "")
-        }
-        .onReceive(NotificationCenter.default.publisher(
-            for: NSApplication.willTerminateNotification)) { _ in
-            model.stop()
         }
     }
 }

@@ -115,6 +115,10 @@ final class BasaltAppModel: ObservableObject {
     /// is still awaiting cleanup, Steam, or the streamer abandons quietly
     /// instead of starting more processes or reporting a spurious failure.
     private var activeLaunchID: UUID?
+    /// The prefix shutdown `stop()` runs off the main actor, and the commands
+    /// it is shutting down. `launch` waits for it before touching the bottle,
+    /// and quitting repeats the kill synchronously so it is issued before exit.
+    private var wineShutdown: (task: Task<Void, Never>, commands: [BottleLaunchCommand])?
     /// The session `launch` started; `finishSession` records it to history.
     private var openSession: SessionRecord?
     private var hasChosenInitialSection = false
@@ -563,6 +567,11 @@ final class BasaltAppModel: ObservableObject {
             console.restart(with: "Preparing \(profileName)…\n")
             openSession = SessionRecord(profileName: profileName, settings: launchSettings)
 
+            if let wineShutdown {
+                appendLog("Waiting for the previous session's Wine processes to stop…\n")
+                await wineShutdown.task.value
+                try ensureCurrent()
+            }
             appendLog("Stopping stale Wine processes in this bottle…\n")
             let manager = manager
             // A failure thrown after Stop is swallowed by the catch below.
@@ -715,7 +724,10 @@ final class BasaltAppModel: ObservableObject {
         }
     }
 
-    func stop() {
+    /// Ends the session at once and shuts its prefix down in the background,
+    /// since `wineserver --kill --wait` can take seconds. When the app is
+    /// quitting, `waitingForWine` runs the shutdown before returning instead.
+    func stop(waitingForWine: Bool = false) {
         activeLaunchID = nil
         finishSession(.stopped)
         let game = gameProcess
@@ -726,21 +738,53 @@ final class BasaltAppModel: ObservableObject {
         steamProcess = nil
         streamerProcess = nil
         activeWineCommand = nil
-
-        if let game, game.isRunning { game.terminate() }
-        if let steam, steam.isRunning { steam.terminate() }
-        if let wineCommand {
-            do {
-                try manager.terminateBottleProcesses(launchedWith: wineCommand)
-                appendLog("Stopped Wine processes for this session\n")
-            } catch {
-                appendLog("Wine cleanup failed: \(error.localizedDescription)\n")
-            }
-        }
-        if let streamer, streamer.isRunning { streamer.terminate() }
         if let controlFile { try? FileManager.default.removeItem(at: controlFile) }
         controlFile = nil
         if sessionState.isActive { sessionState = .stopped }
+
+        if let game, game.isRunning { game.terminate() }
+        if let steam, steam.isRunning { steam.terminate() }
+        let manager = manager
+        // The streamer outlives the Wine shutdown, as the game's runtime may
+        // still be connected to it.
+        let shutDown = { (commands: [BottleLaunchCommand]) -> String? in
+            var message: String?
+            for command in commands {
+                do {
+                    try manager.terminateBottleProcesses(launchedWith: command)
+                    message = "Stopped Wine processes for this session\n"
+                } catch {
+                    message = "Wine cleanup failed: \(error.localizedDescription)\n"
+                }
+            }
+            if let streamer, streamer.isRunning { streamer.terminate() }
+            return message
+        }
+        if waitingForWine {
+            // An earlier background shutdown may not finish before exit.
+            let commands = (wineShutdown?.commands ?? []) + [wineCommand].compactMap { $0 }
+            _ = shutDown(commands)
+            return
+        }
+        guard let wineCommand else {
+            _ = shutDown([])
+            return
+        }
+        let previous = wineShutdown
+        let task = Task.detached { [weak self] in
+            await previous?.task.value
+            let message = shutDown([wineCommand])
+            await self?.finishWineShutdown(message: message)
+        }
+        wineShutdown = (task, (previous?.commands ?? []) + [wineCommand])
+    }
+
+    private func finishWineShutdown(message: String?) {
+        if let message { appendLog(message) }
+        // Shutdowns run in order, so the one finishing is the oldest listed.
+        guard var pending = wineShutdown else { return }
+        pending.commands.removeFirst()
+        wineShutdown = pending.commands.isEmpty ? nil : pending
     }
 
     private func waitForSteam(
@@ -850,14 +894,25 @@ final class BasaltAppModel: ObservableObject {
         process.standardError = errorPipe
 
         for pipe in [outputPipe, errorPipe] {
-            pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            // One stream per pipe delivers its chunks to the main actor in
+            // order; a Task per chunk could run them out of order.
+            let source = ObjectIdentifier(pipe)
+            let (chunks, continuation) = AsyncStream.makeStream(of: Data.self)
+            pipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 guard !data.isEmpty else {
                     handle.readabilityHandler = nil
+                    continuation.finish()
                     return
                 }
-                let value = String(decoding: data, as: UTF8.self)
-                Task { @MainActor in self?.appendLog(prefix + value) }
+                continuation.yield(data)
+            }
+            Task { @MainActor [weak self] in
+                for await data in chunks {
+                    self?.appendLog(String(decoding: data, as: UTF8.self),
+                                    from: source, prefix: prefix)
+                }
+                self?.finishLog(from: source, prefix: prefix)
             }
         }
     }
@@ -865,6 +920,9 @@ final class BasaltAppModel: ObservableObject {
     private func launchUtility(_ command: BottleLaunchCommand, label: String) throws {
         guard !sessionState.isActive else {
             throw BottleToolError("Stop the current Wine or VR session first")
+        }
+        guard wineShutdown == nil else {
+            throw BottleToolError("Wine is still stopping the last session; try again in a moment")
         }
         let process = Process()
         process.executableURL = command.executable
@@ -955,8 +1013,17 @@ final class BasaltAppModel: ObservableObject {
         }
     }
 
-    private func appendLog(_ value: String) {
-        for line in console.append(value) {
+    private func appendLog(_ value: String, from source: ObjectIdentifier? = nil,
+                           prefix: String = "") {
+        recordLines(console.append(value, from: source, prefix: prefix))
+    }
+
+    private func finishLog(from source: ObjectIdentifier, prefix: String) {
+        recordLines(console.finish(source, prefix: prefix))
+    }
+
+    private func recordLines(_ lines: [String]) {
+        for line in lines {
             if let metric = StreamLogMetricsParser.parse(line: line) {
                 console.record(metric)
                 if let target = openSession?.settings.fps {
