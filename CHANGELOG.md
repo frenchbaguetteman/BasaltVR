@@ -75,6 +75,15 @@ All notable changes to BasaltVR are documented here.
 - Pressing Stop while a session is still starting now cancels the launch. Previously it could
   go on to start Steam, the streamer, and the game, report a spurious failure, or, after a
   delayed Steam sign-in timeout, tear down a session started afterwards.
+- The runtime advertises and accepts `LOCAL_FLOOR` and `STAGE` reference spaces, and only `VIEW`
+  follows the head. Previously a VIEW-relative query against a floor space returned a constant
+  pose, so OpenVR titles using a standing space rendered a frozen camera.
+- An action set can be attached to a new session after its previous session is destroyed
+  (OpenComposite rebuilds its session and re-attaches); it stays immutable.
+- Swapchains may be up to twice the per-eye maximum width and height, so a side-by-side image with
+  both eyes (UE4) is accepted, and `DXGI_FORMAT_B8G8R8A8_TYPELESS` is accepted as BGRA.
+- Runtime stereo composition honours each eye's `imageRect`; side-by-side submissions no longer
+  show the whole image squeezed into each eye.
 
 ### Project maintenance
 
@@ -88,6 +97,10 @@ All notable changes to BasaltVR are documented here.
 - Added one-command environment, test, build, documentation-link, and repository-hygiene checks.
 - Added maintainer, support, triage, compatibility-report, and contributor workflows.
 - Hardened GitHub Actions configuration and release preflight validation.
+- `make check` checks whitespace in every commit since the merge base with `origin/main` (or the
+  pull request's base), not only uncommitted edits, and syntax-checks the app launcher script.
+- The release packager refuses an incomplete DXMT artifact set instead of shipping it as included,
+  and the DXMT fork build rebuilds a patched checkout that sits on an outdated upstream commit.
 
 ## 0.1.0 - 2026-07-28
 

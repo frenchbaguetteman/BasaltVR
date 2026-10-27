@@ -121,19 +121,19 @@ for artifact in loader_smoke.exe steamwebhelper_compat.exe; do
 done
 
 dxmt_included=false
-if [[ -f "${dxmt_source_dir}/x86_64-unix/winemetal.so" ]]; then
-    mkdir -p "${support_dir}/runtime/build/dxmt/fork-install/x86_64-unix"
+# DXMT is optional, but a partial set (say, winemetal.so without its DLLs)
+# would be advertised as included and fail only at game launch.
+if [[ -d "${dxmt_source_dir}" ]]; then
+    BASALT_DXMT_BUILD_DIR="${dxmt_source_dir}" \
+        "${repo_dir}/runtime/scripts/verify-dxmt-artifacts.zsh"
+    mkdir -p "${support_dir}/runtime/build/dxmt/fork-install/x86_64-unix" \
+        "${support_dir}/runtime/build/dxmt/fork-install/x86_64-windows"
     cp "${dxmt_source_dir}/x86_64-unix/winemetal.so" \
         "${support_dir}/runtime/build/dxmt/fork-install/x86_64-unix/winemetal.so"
-    if [[ -d "${dxmt_source_dir}/x86_64-windows" ]]; then
-        mkdir -p "${support_dir}/runtime/build/dxmt/fork-install/x86_64-windows"
-        for dll in d3d10core.dll d3d11.dll dxgi.dll winemetal.dll; do
-            if [[ -f "${dxmt_source_dir}/x86_64-windows/${dll}" ]]; then
-                cp "${dxmt_source_dir}/x86_64-windows/${dll}" \
-                    "${support_dir}/runtime/build/dxmt/fork-install/x86_64-windows/${dll}"
-            fi
-        done
-    fi
+    for dll in d3d10core.dll d3d11.dll dxgi.dll winemetal.dll; do
+        cp "${dxmt_source_dir}/x86_64-windows/${dll}" \
+            "${support_dir}/runtime/build/dxmt/fork-install/x86_64-windows/${dll}"
+    done
     dxmt_included=true
 fi
 

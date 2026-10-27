@@ -20,8 +20,8 @@ WhiskyWine 7.7 with Apple D3DMetal fails the gate and therefore sees zero runtim
 extensions; pinned DXMT v0.80 under Wine 11.10 passes it.
 
 The runtime now also provides FIFO session events, the required session control calls, an
-absolute-deadline 72 Hz `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame` contract, and bounded `VIEW`/`LOCAL`
-reference-space handles. Headless sessions stop at `SYNCHRONIZED` with `shouldRender` false.
+absolute-deadline 72 Hz `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame` contract, and bounded `VIEW`,
+`LOCAL`, `LOCAL_FLOOR`, and `STAGE` reference-space handles. Headless sessions stop at `SYNCHRONIZED` with `shouldRender` false.
 Sessions authenticated to the native `RuntimeLink` progress through `VISIBLE`/`FOCUSED` with
 `shouldRender` true and unwind those states during clean exit.
 
@@ -130,8 +130,9 @@ then uses the official Khronos loader to exercise reference spaces, session and 
 events, frame call ordering, exact profile bindings/localized names, action-set priority, action
 spaces, velocity, controller loss/recovery, haptics, static `xrLocateSpace`/`xrLocateViews`,
 projection-layer submission (accept, quad/limit/rect/never-released rejection), and two independent
-three-image D3D11 swapchains. It also verifies that a two-slice texture-array swapchain is rejected
-so engines can take a per-eye multipass fallback. It does not modify `/Applications`,
+three-image D3D11 swapchains. It also creates and submits a two-slice texture-array swapchain
+(Unity's Single Pass Instanced shape), whose slices the runtime copies into per-eye IOSurface
+exports. It does not modify `/Applications`,
 Whisky, CrossOver, or a game bottle. Rosetta 2 is required on Apple Silicon. Override the
 generated prefix only with
 `BASALT_DXMT_WINEPREFIX`; never point that variable at a game bottle.
