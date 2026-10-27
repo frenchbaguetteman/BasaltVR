@@ -31,12 +31,14 @@ jobs:
 
       - name: Resolve version
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         shell: zsh {0}
         run: |
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
           else
-            version="${{ inputs.version }}"
+            version="$INPUT_VERSION"
           fi
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
             print -u2 "Invalid release version: $version"
@@ -64,7 +66,9 @@ jobs:
         run: make check
 
       - name: Build release archive
-        run: packaging/build-release.zsh "${{ steps.version.outputs.version }}"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: packaging/build-release.zsh "$VERSION"
 
       - name: Publish prerelease and assets
         env:

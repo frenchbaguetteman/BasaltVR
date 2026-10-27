@@ -14,6 +14,7 @@ notarized, and accepted from a clean macOS user account with a live headset.
    make check
    make runtime-test
    make dxmt-test
+   make dxmt-verify
    make release VERSION=X.Y.Z
    ```
 
@@ -26,7 +27,9 @@ notarized, and accepted from a clean macOS user account with a live headset.
    ```
 
 4. Confirm the app and all bundled native executables are arm64, the app's internal signature
-   verifies, and the support manifest records `wineIncluded` as `false`.
+   verifies, and the support manifest records `dxmtIncluded` as `true` and `wineIncluded` as
+   `false`. The packager runs the same inspection as `make dxmt-verify` and refuses an incomplete
+   DXMT set, but omits DXMT entirely when `runtime/build/dxmt/fork-install` does not exist.
 5. Extract the ZIP into a clean temporary directory and run the bundled CLI outside the source
    checkout:
 
@@ -52,7 +55,8 @@ The workflow uses the repository-scoped `GITHUB_TOKEN` with only `contents: writ
 signing credentials are required for the current ad-hoc-signed preview. It refuses to overwrite
 an existing GitHub release; publish a new version for any corrected artifact.
 
-Release builds run on a pinned Apple Silicon runner image while the native build and DXMT fork
+Release builds run on GitHub's `macos-15` Apple Silicon runner label, whose image GitHub updates
+in place, while the native build and DXMT fork
 explicitly preserve the macOS 14 deployment target. Workflow actions are pinned to immutable
 commits and updated through Dependabot.
 

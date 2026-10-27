@@ -227,8 +227,8 @@ e.g. `v0.80-basalt.1` — so the runtime can detect and pin it.
    localized Touch actions, rendered for roughly 14 seconds, and cleanly traversed
    `STOPPING→IDLE→EXITING`. The companion live Quest scene is physically verified with fused,
    level/world-fixed stereo, tracked controller response, analog squeeze, and haptics at 72 fps.
-   The runtime rejects two-slice texture-array swapchains so engines select the supported per-eye
-   `arraySize=1` multipass path.
+   The runtime accepts two-slice texture-array swapchains and copies each slice into a per-eye
+   IOSurface export; patch 0004 still steers Unity to its per-eye `arraySize=1` multipass path.
 
 ## Open decisions
 

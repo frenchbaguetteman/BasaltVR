@@ -168,7 +168,7 @@ swapchains (up to four total), each with three
 `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` textures and independent acquire/wait/release state. It
 also implements session events/control, CTS-shaped 72 Hz frame call ordering with an
 absolute-deadline waitable-timer scheduler, and bounded
-`VIEW`/`LOCAL` reference spaces. The official Khronos loader smoke exercises these lifecycles and
+`VIEW`, `LOCAL`, `LOCAL_FLOOR`, and `STAGE` reference spaces. The official Khronos loader smoke exercises these lifecycles and
 independently opens every texture's NT handle.
 
 The `hello_xr` initialization surface is now implemented and covered by both Wine smokes:
@@ -250,9 +250,10 @@ constellation and a physically scaled controller marker to expose stereo/head-tr
 Each submitted frame also carries the exact Quest tracking timestamp consumed by its successful
 `xrLocateViews` call through the control daemon and VideoToolbox to ALVR, preventing the client
 from applying a newer or older pose to that rendered image.
-The swapchain API deliberately rejects `arraySize=2` texture arrays because the native handoff
-currently consumes one IOSurface per eye; Unity-style engines can then take their multipass
-`arraySize=1` fallback rather than receiving a falsely supported multiview path. Khronos' real
+The swapchain API accepts `arraySize=2` texture arrays. Because the native handoff consumes one
+IOSurface per eye, the array stays private to the game's device and each submitted slice is copied
+into its own IOSurface-backed 2D texture. The DXMT fork still reports render-target-array indexing
+from any shader stage as unavailable, so Unity selects its multipass `arraySize=1` path. Khronos' real
 `hello_xr` D3D11 application is built from pinned official 1.1.61 source as an external gate. It
 now completes a live Quest run through `FOCUSED`, two eye swapchains, localized Touch actions,
 roughly 14 seconds of rendering, and clean `STOPPING→IDLE→EXITING` teardown. User confirmation of

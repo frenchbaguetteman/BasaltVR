@@ -35,14 +35,17 @@ decision in `docs/DXMT-INTEROP.md`). These patches are MIT like the rest of Basa
     The unix call also rejects incompatible descriptors defensively (nil texture, not a
     Metal assertion). Without the gate, behavior is bit-for-bit stock.
 - `patches/0002-fix-missing-iomanip-include.patch` — build fix for current mingw-w64 GCC
+  (`std::setfill`/`std::setw` used without `<iomanip>`).
 - `patches/0003-exportless-winemac-metal-view.patch` — creates a normal AppKit/Metal
   child view for single-window games when an otherwise-compatible Wine build hides DXMT's
   optional private mac-driver exports.
-  (`std::setfill`/`std::setw` used without `<iomanip>`).
 - `patches/0004-force-unity-openxr-multipass.patch` — reports
   `VPAndRTArrayIndexFromAnyShaderFeedingRasterizer` as unavailable. Unity OpenXR then uses
   its multipass fallback, matching Basalt's independent 2D IOSurface eye swapchains and
-  preventing single-pass fullscreen lighting from reaching only one eye.
+  preventing single-pass fullscreen lighting from reaching only one eye. The patch's own
+  comment predates texture-array support and says Basalt rejects array swapchains; the
+  runtime now accepts them (each slice is copied into a per-eye IOSurface export), but
+  multipass remains the path Unity takes.
 
 ## Building
 
