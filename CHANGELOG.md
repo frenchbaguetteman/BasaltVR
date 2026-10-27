@@ -65,6 +65,16 @@ All notable changes to BasaltVR are documented here.
 - Pressing Stop while a session is still starting now cancels the launch. Previously it could
   go on to start Steam, the streamer, and the game, report a spurious failure, or, after a
   delayed Steam sign-in timeout, tear down a session started afterwards.
+- `xrGetReferenceSpaceBoundsRect` reports unavailable bounds for STAGE and LOCAL_FLOOR instead
+  of rejecting them, which made OpenComposite abort at startup.
+- Controller velocity is reported against LOCAL_FLOOR and STAGE, not only LOCAL.
+- `xrEndFrame` accepts (validated) quad layers instead of failing the whole frame; quads are not
+  yet composed, and the frame's projection layer is still streamed.
+- After the headset reconnects with a restarted clock, head tracking resumes instead of
+  dropping every pose whose timestamp is lower than the previous session's.
+- Recentering also queues reference-space-change events for existing STAGE and LOCAL_FLOOR
+  spaces; a full event queue never drops session-state changes and reports
+  `XrEventDataEventsLost`; swapchain wait/release follow acquire order.
 
 ### Project maintenance
 

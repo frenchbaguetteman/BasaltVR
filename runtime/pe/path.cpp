@@ -188,31 +188,4 @@ bool isTopLevelUserPath(XrPath path) {
     return false;
 }
 
-bool isBindingSourcePath(XrPath path) {
-    static constexpr const char* kBindingPrefixes[] = {
-        "/user/head/input/",
-        "/user/hand/left/input/",
-        "/user/hand/left/output/",
-        "/user/hand/right/input/",
-        "/user/hand/right/output/",
-        "/user/gamepad/input/",
-        "/user/gamepad/output/",
-    };
-    AcquireSRWLockShared(&gPathLock);
-    const PathRecord* record = findAtomLocked(path);
-    bool matches = false;
-    if (record != nullptr) {
-        for (const char* prefix : kBindingPrefixes) {
-            const size_t prefixLength = std::strlen(prefix);
-            if (std::strncmp(record->string, prefix, prefixLength) == 0 &&
-                record->string[prefixLength] != '\0') {
-                matches = true;
-                break;
-            }
-        }
-    }
-    ReleaseSRWLockShared(&gPathLock);
-    return matches;
-}
-
 }  // namespace basalt

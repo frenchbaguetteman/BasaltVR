@@ -1494,6 +1494,39 @@ int main(int argc, char** argv) {
     }
 
     if (injectedController) {
+        // LOCAL_FLOOR and STAGE share LOCAL's frame, so the controller's raw
+        // velocity must be reported against them too.
+        for (XrReferenceSpaceType floorSpaceType : {XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR,
+                                                    XR_REFERENCE_SPACE_TYPE_STAGE}) {
+            referenceSpaceInfo.referenceSpaceType = floorSpaceType;
+            XrSpace floorSpace = XR_NULL_HANDLE;
+            result = xrCreateReferenceSpace(session, &referenceSpaceInfo, &floorSpace);
+            controllerVelocity = {};
+            controllerVelocity.type = XR_TYPE_SPACE_VELOCITY;
+            location = {};
+            location.type = XR_TYPE_SPACE_LOCATION;
+            location.next = &controllerVelocity;
+            if (XR_SUCCEEDED(result)) {
+                result = xrLocateSpace(handSpace, floorSpace, locateTime, &location);
+            }
+            xrDestroySpace(floorSpace);
+            if (XR_FAILED(result) || location.locationFlags != kControllerTrackedFlags ||
+                controllerVelocity.velocityFlags !=
+                    (XR_SPACE_VELOCITY_LINEAR_VALID_BIT |
+                     XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) ||
+                !nearlyEqual(controllerVelocity.linearVelocity.x, -0.3f) ||
+                !nearlyEqual(controllerVelocity.linearVelocity.y, 0.2f) ||
+                !nearlyEqual(controllerVelocity.linearVelocity.z, 0.1f) ||
+                !nearlyEqual(controllerVelocity.angularVelocity.y, 0.5f)) {
+                xrDestroySession(session);
+                release(context);
+                release(device);
+                xrDestroyInstance(instance);
+                return fail("xrLocateSpace(action space in floor space)", result);
+            }
+        }
+        std::puts("PASS: controller velocity reported in LOCAL_FLOOR and STAGE");
+
         // Ask the native daemon to publish mask(timestamp=3, absent), followed
         // by stale motion(timestamp=2). The pose and chained velocity must
         // clear together and remain cleared after the stale packet.
@@ -1713,11 +1746,18 @@ int main(int argc, char** argv) {
         // Ask the native daemon to turn the injected head another 90 degrees
         // and hold the Quest right-system button. Basalt must recenter LOCAL,
         // notify the application, and expose the current leveled head as the
-        // new forward origin without losing floor height.
+        // new forward origin without losing floor height. STAGE shares the
+        // LOCAL origin, so an existing STAGE space gets its own event; no
+        // LOCAL_FLOOR space exists, so none is reported for it.
+        referenceSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+        XrSpace recenterStageSpace = XR_NULL_HANDLE;
+        result = xrCreateReferenceSpace(session, &referenceSpaceInfo, &recenterStageSpace);
         vibration.amplitude = 0.375f;
-        result = xrApplyHapticFeedback(
-            session, &hapticInfo,
-            reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+        if (XR_SUCCEEDED(result)) {
+            result = xrApplyHapticFeedback(
+                session, &hapticInfo,
+                reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+        }
         XrEventDataReferenceSpaceChangePending recenterEvent{};
         bool receivedRecenter = false;
         for (int attempt = 0; XR_SUCCEEDED(result) && attempt < 100; ++attempt) {
@@ -1752,6 +1792,27 @@ int main(int argc, char** argv) {
             release(device);
             xrDestroyInstance(instance);
             return fail("Quest reset-view reference-space event", result);
+        }
+        {
+            XrEventDataBuffer eventData{};
+            eventData.type = XR_TYPE_EVENT_DATA_BUFFER;
+            result = xrPollEvent(instance, &eventData);
+            const auto* stageEvent =
+                reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&eventData);
+            if (result != XR_SUCCESS ||
+                eventData.type != XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING ||
+                stageEvent->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_STAGE ||
+                stageEvent->changeTime != recenterEvent.changeTime ||
+                !nearlyEqual(stageEvent->poseInPreviousSpace.position.x, -0.25f) ||
+                !nearlyEqual(stageEvent->poseInPreviousSpace.position.z, 0.25f) ||
+                !expectNoEvent(instance)) {
+                xrDestroySession(session);
+                release(context);
+                release(device);
+                xrDestroyInstance(instance);
+                return fail("Quest reset-view STAGE reference-space event", result);
+            }
+            result = xrDestroySpace(recenterStageSpace);
         }
 
         // The change is time-bounded: an in-flight locate from just before
@@ -1846,6 +1907,33 @@ int main(int argc, char** argv) {
             xrDestroyInstance(instance);
             return fail("xrLocateViews(stale head pose)", result);
         }
+
+        // A replacement ALVR session restarts the Quest clock. Ask the
+        // daemon for InputReset followed by a head pose whose timestamp (1)
+        // is below the previous session's (2); it must still be tracked.
+        vibration.amplitude = 0.625f;
+        result = xrApplyHapticFeedback(
+            session, &hapticInfo,
+            reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+        bool headPoseRestored = false;
+        for (int attempt = 0; XR_SUCCEEDED(result) && attempt < 100; ++attempt) {
+            viewState.viewStateFlags = 0;
+            result = xrLocateViews(
+                session, &viewLocateInfo, &viewState, 0, &viewCount, nullptr);
+            if (XR_SUCCEEDED(result) && viewState.viewStateFlags == kTrackedViewFlags) {
+                headPoseRestored = true;
+                break;
+            }
+            Sleep(10);
+        }
+        if (XR_FAILED(result) || !headPoseRestored) {
+            xrDestroySession(session);
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            return fail("head pose after Quest clock reset", result);
+        }
+        std::puts("PASS: InputReset accepts head poses from a restarted Quest clock");
     } else if (requireHeadPose()) {
         const float headX =
             (locatedViews[0].pose.position.x + locatedViews[1].pose.position.x) * 0.5f;
@@ -1866,15 +1954,31 @@ int main(int argc, char** argv) {
         return fail("xrLocateViews(missing tracking)", XR_ERROR_VALIDATION_FAILURE);
     }
 
-    XrExtent2Df bounds{1.0f, 1.0f};
-    result = xrGetReferenceSpaceBoundsRect(session, XR_REFERENCE_SPACE_TYPE_LOCAL, &bounds);
-    if (result != XR_SPACE_BOUNDS_UNAVAILABLE || bounds.width != 0.0f ||
-        bounds.height != 0.0f) {
-        xrDestroySession(session);
-        release(context);
-        release(device);
-        xrDestroyInstance(instance);
-        return fail("xrGetReferenceSpaceBoundsRect", result);
+    // Every enumerated space reports unavailable bounds. OpenComposite asks
+    // for STAGE bounds while starting and aborts on an unsupported result.
+    for (XrReferenceSpaceType boundsSpaceType : referenceSpaces) {
+        XrExtent2Df bounds{1.0f, 1.0f};
+        result = xrGetReferenceSpaceBoundsRect(session, boundsSpaceType, &bounds);
+        if (result != XR_SPACE_BOUNDS_UNAVAILABLE || bounds.width != 0.0f ||
+            bounds.height != 0.0f) {
+            xrDestroySession(session);
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            return fail("xrGetReferenceSpaceBoundsRect", result);
+        }
+    }
+    {
+        XrExtent2Df bounds{};
+        result = xrGetReferenceSpaceBoundsRect(
+            session, XR_REFERENCE_SPACE_TYPE_UNBOUNDED_MSFT, &bounds);
+        if (result != XR_ERROR_REFERENCE_SPACE_UNSUPPORTED) {
+            xrDestroySession(session);
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            return fail("xrGetReferenceSpaceBoundsRect(unsupported)", result);
+        }
     }
 
     uint32_t formatCount = 0;
@@ -2324,6 +2428,19 @@ int main(int argc, char** argv) {
     uint32_t imageIndex = UINT32_MAX;
     uint32_t secondImageIndex = UINT32_MAX;
 
+    // Quad layers are validated and accepted but not yet composed. The first
+    // loop frame places one ahead of the projection layer, which must still
+    // reach the daemon with that frame's pixels.
+    XrCompositionLayerQuad quadLayer{};
+    quadLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+    quadLayer.space = localSpace;
+    quadLayer.subImage = projectionViews[0].subImage;
+    quadLayer.pose.orientation.w = 1.0f;
+    quadLayer.size = {1.0f, 1.0f};
+    const XrCompositionLayerBaseHeader* quadAndProjectionLayers[] = {
+        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadLayer),
+        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projectionLayer)};
+
     // Freeze a small constellation in LOCAL from the first tracked view. It
     // remains stationary while the live eye poses move, making head rotation,
     // translation, stereo disparity, and depth visually unambiguous.
@@ -2509,8 +2626,9 @@ int main(int argc, char** argv) {
         }
         if (XR_SUCCEEDED(result)) {
             frameEndInfo.displayTime = loopFrameState.predictedDisplayTime;
-            frameEndInfo.layerCount = 1;
-            frameEndInfo.layers = submittedLayers;
+            frameEndInfo.layerCount = loopFrame == 0 ? 2 : 1;
+            frameEndInfo.layers =
+                loopFrame == 0 ? quadAndProjectionLayers : submittedLayers;
             result = xrEndFrame(session, &frameEndInfo);
         }
         if (XR_FAILED(result)) {
@@ -2536,41 +2654,117 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(options.renderFrames),
                 expectConnected() ? " and delivered to the control daemon" : "");
 
-    XrCompositionLayerQuad quadLayer{};
-    quadLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
-    quadLayer.space = localSpace;
-    quadLayer.subImage = projectionViews[0].subImage;
-    quadLayer.pose.orientation.w = 1.0f;
-    quadLayer.size = {1.0f, 1.0f};
-    result = xrWaitFrame(session, nullptr, &layerFrameState);
-    if (XR_SUCCEEDED(result)) {
-        result = xrBeginFrame(session, nullptr);
-    }
-    frameEndInfo.displayTime = layerFrameState.predictedDisplayTime;
+    // A frame with only quad layers behaves like a frame with no layers: it
+    // succeeds and submits nothing. Malformed quads still fail the frame.
+    struct QuadCase {
+        const char* name;
+        XrRect2Di rect;
+        uint32_t arrayIndex;
+        XrResult expected;
+    };
+    const XrRect2Di fullRect = quadLayer.subImage.imageRect;
+    const QuadCase quadCases[] = {
+        {"quad-only frame", fullRect, 0, XR_SUCCESS},
+        {"out-of-bounds quad rect",
+         {{static_cast<int32_t>(swapchainInfo.width) / 2, 0}, fullRect.extent},
+         0, XR_ERROR_SWAPCHAIN_RECT_INVALID},
+        {"out-of-range quad array index", fullRect, 1, XR_ERROR_VALIDATION_FAILURE},
+    };
     submittedLayers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quadLayer);
-    if (XR_SUCCEEDED(result)) {
-        result = xrEndFrame(session, &frameEndInfo);
-        if (result != XR_ERROR_LAYER_INVALID) {
+    for (const QuadCase& quadCase : quadCases) {
+        quadLayer.subImage.imageRect = quadCase.rect;
+        quadLayer.subImage.imageArrayIndex = quadCase.arrayIndex;
+        result = xrWaitFrame(session, nullptr, &layerFrameState);
+        if (XR_SUCCEEDED(result)) {
+            result = xrBeginFrame(session, nullptr);
+        }
+        frameEndInfo.displayTime = layerFrameState.predictedDisplayTime;
+        frameEndInfo.layerCount = 1;
+        frameEndInfo.layers = submittedLayers;
+        if (XR_SUCCEEDED(result)) {
+            result = xrEndFrame(session, &frameEndInfo);
+            if (result != quadCase.expected) {
+                xrDestroySwapchain(secondSwapchain);
+                xrDestroySwapchain(swapchain);
+                xrDestroySession(session);
+                release(context);
+                release(device);
+                xrDestroyInstance(instance);
+                return fail(quadCase.name, result);
+            }
+            if (XR_FAILED(result)) {
+                frameEndInfo.layerCount = 0;
+                frameEndInfo.layers = nullptr;
+                result = xrEndFrame(session, &frameEndInfo);
+            }
+        }
+        if (XR_FAILED(result)) {
             xrDestroySwapchain(secondSwapchain);
             xrDestroySwapchain(swapchain);
             xrDestroySession(session);
             release(context);
             release(device);
             xrDestroyInstance(instance);
-            return fail("quad layer rejection", result);
+            return fail("quad layer recovery", result);
         }
-        frameEndInfo.layerCount = 0;
-        frameEndInfo.layers = nullptr;
-        result = xrEndFrame(session, &frameEndInfo);
     }
-    if (XR_FAILED(result)) {
-        xrDestroySwapchain(secondSwapchain);
-        xrDestroySwapchain(swapchain);
-        xrDestroySession(session);
-        release(context);
-        release(device);
-        xrDestroyInstance(instance);
-        return fail("quad rejection recovery", result);
+    std::puts("PASS: quad layers are validated and accepted alongside projection");
+
+    // Wait and release apply to the oldest acquired image, not the lowest
+    // index. Two full cycles move the round-robin cursor to image 2, so the
+    // next acquires return 2 then 0; releasing must free 2, which the fourth
+    // acquire then returns.
+    {
+        XrSwapchain fifoSwapchain = XR_NULL_HANDLE;
+        result = xrCreateSwapchain(session, &swapchainInfo, &fifoSwapchain);
+        uint32_t acquired[4]{};
+        for (int cycle = 0; XR_SUCCEEDED(result) && cycle < 2; ++cycle) {
+            result = xrAcquireSwapchainImage(fifoSwapchain, &acquireInfo, &acquired[0]);
+            if (XR_SUCCEEDED(result)) {
+                result = xrWaitSwapchainImage(fifoSwapchain, &waitInfo);
+            }
+            if (XR_SUCCEEDED(result)) {
+                result = xrReleaseSwapchainImage(fifoSwapchain, &releaseInfo);
+            }
+        }
+        if (XR_SUCCEEDED(result)) {
+            result = xrAcquireSwapchainImage(fifoSwapchain, &acquireInfo, &acquired[0]);
+        }
+        if (XR_SUCCEEDED(result)) {
+            result = xrAcquireSwapchainImage(fifoSwapchain, &acquireInfo, &acquired[1]);
+        }
+        if (XR_SUCCEEDED(result)) {
+            result = xrWaitSwapchainImage(fifoSwapchain, &waitInfo);
+        }
+        if (XR_SUCCEEDED(result)) {
+            result = xrReleaseSwapchainImage(fifoSwapchain, &releaseInfo);
+        }
+        if (XR_SUCCEEDED(result)) {
+            result = xrAcquireSwapchainImage(fifoSwapchain, &acquireInfo, &acquired[2]);
+        }
+        if (XR_SUCCEEDED(result)) {
+            result = xrAcquireSwapchainImage(fifoSwapchain, &acquireInfo, &acquired[3]);
+        }
+        for (int pending = 0; XR_SUCCEEDED(result) && pending < 3; ++pending) {
+            result = xrWaitSwapchainImage(fifoSwapchain, &waitInfo);
+            if (XR_SUCCEEDED(result)) {
+                result = xrReleaseSwapchainImage(fifoSwapchain, &releaseInfo);
+            }
+        }
+        if (fifoSwapchain != XR_NULL_HANDLE) {
+            xrDestroySwapchain(fifoSwapchain);
+        }
+        if (XR_FAILED(result) || acquired[0] != 2 || acquired[1] != 0 ||
+            acquired[2] != 1 || acquired[3] != 2) {
+            xrDestroySwapchain(secondSwapchain);
+            xrDestroySwapchain(swapchain);
+            xrDestroySession(session);
+            release(context);
+            release(device);
+            xrDestroyInstance(instance);
+            return fail("swapchain FIFO wait/release order", result);
+        }
+        std::puts("PASS: swapchain wait/release follow acquire order");
     }
 
     submittedLayers[0] =

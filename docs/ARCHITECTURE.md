@@ -187,7 +187,8 @@ forwards haptics as described in M4 below.
 
 `xrEndFrame` now validates and accepts stereo projection layers — layer flags, space and
 swapchain session ownership, per-view poses/FOV, in-bounds image rects, the 16-layer limit,
-and a released image in every referenced swapchain — while still rejecting quad layers.
+and a released image in every referenced swapchain. Quad layers are validated the same way and
+accepted but not yet composed; extension layers are still rejected.
 As of 2026-07-18 accepted layers ARE consumed: with the Basalt DXMT fork
 (`runtime/dxmt-fork`, IOSurface-backed swapchain textures) and the control socket
 (`runtime/pe/control.cpp`, protocol in `docs/DXMT-INTEROP.md` §4), every layered

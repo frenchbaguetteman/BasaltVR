@@ -12,7 +12,10 @@
 namespace {
 
 constexpr XrDuration kDisplayPeriod = 13'888'889;
-constexpr size_t kEventCapacity = 8;
+// A session emits at most ten state changes (IDLE through EXITING), and state
+// changes are never dropped, so the queue always has room to shed the oldest
+// other event when an application stops polling.
+constexpr size_t kEventCapacity = 16;
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
@@ -31,6 +34,7 @@ XrTime gLastEventTime = 0;
 XrEventDataBuffer gEvents[kEventCapacity]{};
 size_t gEventHead = 0;
 size_t gEventCount = 0;
+uint32_t gLostEventCount = 0;
 
 struct TimerApi {
     HANDLE timer = nullptr;
@@ -140,6 +144,7 @@ void waitUntil(XrTime deadline) {
 void clearEventsLocked() {
     gEventHead = 0;
     gEventCount = 0;
+    gLostEventCount = 0;
     std::memset(gEvents, 0, sizeof(gEvents));
 }
 
@@ -148,8 +153,20 @@ void queueEventLocked(const void* event, size_t eventSize) {
         return;
     }
     if (gEventCount == kEventCapacity) {
-        gEventHead = (gEventHead + 1) % kEventCapacity;
+        // Drop the oldest event that is not a session state change; the
+        // application learns of the loss through XrEventDataEventsLost.
+        size_t dropped = 0;
+        while (dropped + 1 < gEventCount &&
+               gEvents[(gEventHead + dropped) % kEventCapacity].type ==
+                   XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+            ++dropped;
+        }
+        for (size_t offset = dropped; offset + 1 < gEventCount; ++offset) {
+            gEvents[(gEventHead + offset) % kEventCapacity] =
+                gEvents[(gEventHead + offset + 1) % kEventCapacity];
+        }
         --gEventCount;
+        ++gLostEventCount;
     }
     const size_t tail = (gEventHead + gEventCount) % kEventCapacity;
     gEvents[tail] = {};
@@ -206,6 +223,13 @@ void queueReferenceSpaceChange(
     XrSession session,
     XrTime changeTime,
     const XrPosef& poseInPreviousSpace) {
+    // LOCAL_FLOOR and STAGE share LOCAL's origin, so a recenter moves them
+    // by the same pose. Report LOCAL always and the floor spaces once the
+    // application has created one.
+    const bool includeLocalFloor =
+        sessionHasReferenceSpace(session, XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR);
+    const bool includeStage =
+        sessionHasReferenceSpace(session, XR_REFERENCE_SPACE_TYPE_STAGE);
     AcquireSRWLockExclusive(&gLifecycleLock);
     if (lifecycleMatchesLocked(session) && gSessionRunning && changeTime > 0) {
         XrEventDataReferenceSpaceChangePending event{};
@@ -217,6 +241,14 @@ void queueReferenceSpaceChange(
         event.poseValid = XR_TRUE;
         event.poseInPreviousSpace = poseInPreviousSpace;
         queueEventLocked(&event, sizeof(event));
+        if (includeLocalFloor) {
+            event.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR;
+            queueEventLocked(&event, sizeof(event));
+        }
+        if (includeStage) {
+            event.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+            queueEventLocked(&event, sizeof(event));
+        }
     }
     ReleaseSRWLockExclusive(&gLifecycleLock);
 }
@@ -225,6 +257,53 @@ void queueReferenceSpaceChange(
 
 namespace {
 
+constexpr XrCompositionLayerFlags kSupportedLayerFlags =
+    XR_COMPOSITION_LAYER_CORRECT_CHROMATIC_ABERRATION_BIT |
+    XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+    XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+
+// Validates a layer's swapchain sub-image: the swapchain must belong to the
+// session, the array slice and rectangle must lie inside it, and the app must
+// have released an image the compositor can read.
+XrResult validateSubImage(
+    XrSession session,
+    const XrSwapchainSubImage& subImage,
+    uint32_t* lastReleasedIndex) {
+    XrSession swapchainSession = XR_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t arraySize = 0;
+    bool hasReleasedImage = false;
+    if (!basalt::getSwapchainSubmitState(
+            subImage.swapchain,
+            &swapchainSession,
+            &width,
+            &height,
+            &arraySize,
+            &hasReleasedImage,
+            lastReleasedIndex) ||
+        swapchainSession != session) {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    if (subImage.imageArrayIndex >= arraySize) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    const XrRect2Di& rect = subImage.imageRect;
+    if (rect.offset.x < 0 || rect.offset.y < 0 ||
+        rect.extent.width <= 0 || rect.extent.height <= 0 ||
+        static_cast<int64_t>(rect.offset.x) + rect.extent.width >
+            static_cast<int64_t>(width) ||
+        static_cast<int64_t>(rect.offset.y) + rect.extent.height >
+            static_cast<int64_t>(height)) {
+        return XR_ERROR_SWAPCHAIN_RECT_INVALID;
+    }
+    if (!hasReleasedImage) {
+        // The compositor can only consume an image the app has released.
+        return XR_ERROR_LAYER_INVALID;
+    }
+    return XR_SUCCESS;
+}
+
 // Validates one submitted projection layer against the session's spaces and
 // swapchains. When outViews is non-null, the validated per-view submission
 // data is captured for the control-socket FrameReady handoff.
@@ -232,10 +311,6 @@ XrResult validateProjectionLayer(
     XrSession session,
     const XrCompositionLayerProjection* layer,
     basalt::ControlFrameView* outViews) {
-    constexpr XrCompositionLayerFlags kSupportedLayerFlags =
-        XR_COMPOSITION_LAYER_CORRECT_CHROMATIC_ABERRATION_BIT |
-        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
-        XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
     constexpr float kMaxFovHalfAngleRadians = 1.57079633f;
     constexpr uint32_t kStereoViewCount = 2;
 
@@ -268,38 +343,11 @@ XrResult validateProjectionLayer(
             return XR_ERROR_VALIDATION_FAILURE;
         }
 
-        XrSession swapchainSession = XR_NULL_HANDLE;
-        uint32_t width = 0;
-        uint32_t height = 0;
-        uint32_t arraySize = 0;
-        bool hasReleasedImage = false;
         uint32_t lastReleasedIndex = 0;
-        if (!basalt::getSwapchainSubmitState(
-                view.subImage.swapchain,
-                &swapchainSession,
-                &width,
-                &height,
-                &arraySize,
-                &hasReleasedImage,
-                &lastReleasedIndex) ||
-            swapchainSession != session) {
-            return XR_ERROR_HANDLE_INVALID;
-        }
-        if (view.subImage.imageArrayIndex >= arraySize) {
-            return XR_ERROR_VALIDATION_FAILURE;
-        }
-        const XrRect2Di& rect = view.subImage.imageRect;
-        if (rect.offset.x < 0 || rect.offset.y < 0 ||
-            rect.extent.width <= 0 || rect.extent.height <= 0 ||
-            static_cast<int64_t>(rect.offset.x) + rect.extent.width >
-                static_cast<int64_t>(width) ||
-            static_cast<int64_t>(rect.offset.y) + rect.extent.height >
-                static_cast<int64_t>(height)) {
-            return XR_ERROR_SWAPCHAIN_RECT_INVALID;
-        }
-        if (!hasReleasedImage) {
-            // The compositor can only consume an image the app has released.
-            return XR_ERROR_LAYER_INVALID;
+        const XrResult subImageResult =
+            validateSubImage(session, view.subImage, &lastReleasedIndex);
+        if (XR_FAILED(subImageResult)) {
+            return subImageResult;
         }
 
         if (outViews != nullptr) {
@@ -313,6 +361,29 @@ XrResult validateProjectionLayer(
         }
     }
     return XR_SUCCESS;
+}
+
+// Quad layers are validated like any submitted layer but not yet composed:
+// only the first projection layer reaches the streamer.
+XrResult validateQuadLayer(
+    XrSession session,
+    const XrCompositionLayerQuad* layer) {
+    if ((layer->layerFlags & ~kSupportedLayerFlags) != 0) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (!basalt::isSpaceForSession(layer->space, session)) {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    if (layer->eyeVisibility != XR_EYE_VISIBILITY_BOTH &&
+        layer->eyeVisibility != XR_EYE_VISIBILITY_LEFT &&
+        layer->eyeVisibility != XR_EYE_VISIBILITY_RIGHT) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (!basalt::isPoseWellFormed(layer->pose)) {
+        return XR_ERROR_POSE_INVALID;
+    }
+    uint32_t lastReleasedIndex = 0;
+    return validateSubImage(session, layer->subImage, &lastReleasedIndex);
 }
 
 }  // namespace
@@ -357,14 +428,24 @@ XrResult XRAPI_CALL pollEvent(
     }
 
     AcquireSRWLockExclusive(&gLifecycleLock);
-    if (instance != gLifecycleInstance || gEventCount == 0) {
+    if (instance != gLifecycleInstance ||
+        (gEventCount == 0 && gLostEventCount == 0)) {
         ReleaseSRWLockExclusive(&gLifecycleLock);
         return XR_EVENT_UNAVAILABLE;
     }
 
-    const XrEventDataBuffer event = gEvents[gEventHead];
-    gEventHead = (gEventHead + 1) % kEventCapacity;
-    --gEventCount;
+    XrEventDataBuffer event{};
+    if (gLostEventCount > 0) {
+        auto* lost = reinterpret_cast<XrEventDataEventsLost*>(&event);
+        lost->type = XR_TYPE_EVENT_DATA_EVENTS_LOST;
+        lost->next = nullptr;
+        lost->lostEventCount = gLostEventCount;
+        gLostEventCount = 0;
+    } else {
+        event = gEvents[gEventHead];
+        gEventHead = (gEventHead + 1) % kEventCapacity;
+        --gEventCount;
+    }
     ReleaseSRWLockExclusive(&gLifecycleLock);
 
     std::memset(eventData, 0, sizeof(*eventData));
@@ -652,8 +733,14 @@ XrResult XRAPI_CALL endFrame(
                 reinterpret_cast<const XrCompositionLayerProjection*>(layer),
                 haveFrameViews ? nullptr : frameViews);
             haveFrameViews = true;
+        } else if (layer->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+            // Validated, then left out until the native compositor composes
+            // quads. A frame with only quads therefore submits no frame,
+            // exactly like a frame with no layers.
+            layerResult = validateQuadLayer(
+                session, reinterpret_cast<const XrCompositionLayerQuad*>(layer));
         } else {
-            // Quad and extension layers wait for the native compositor.
+            // Extension layers wait for the native compositor.
             layerResult = XR_ERROR_LAYER_INVALID;
         }
         if (XR_FAILED(layerResult)) {

@@ -1007,10 +1007,24 @@ XrResult XRAPI_CALL suggestInteractionProfileBindings(
         }
     }
     ReleaseSRWLockShared(&gInputLock);
-    if (XR_FAILED(result) ||
-        !pathStringEquals(
+    if (XR_FAILED(result)) {
+        return result;
+    }
+    if (!pathStringEquals(
             suggestedBindings->interactionProfile,
             "/interaction_profiles/oculus/touch_controller")) {
+        // Only Quest Touch bindings drive input. The other profiles are
+        // validated but never bound, so say so once per profile.
+        static LONG loggedDiscardedProfiles[std::size(kInteractionProfiles)]{};
+        const size_t profileIndex =
+            static_cast<size_t>(profile - kInteractionProfiles);
+        if (InterlockedExchange(&loggedDiscardedProfiles[profileIndex], 1) == 0) {
+            std::fprintf(
+                stderr,
+                "Basalt OpenXR: ignoring suggested bindings for %s; only "
+                "/interaction_profiles/oculus/touch_controller is bound\n",
+                profile->path);
+        }
         return result;
     }
     if (suggestedBindings->countSuggestedBindings > kMaxTouchBindings) {
