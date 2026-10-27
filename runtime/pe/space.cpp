@@ -27,6 +27,21 @@ constexpr std::array<XrReferenceSpaceType, 4> kSupportedReferenceSpaces = {
     XR_REFERENCE_SPACE_TYPE_STAGE,
 };
 
+// STAGE and LOCAL_FLOOR share LOCAL's origin. ALVR delivers poses in the
+// Quest's floor-level guardian frame, and control.cpp's leveledHeadOrigin()
+// keeps Y = 0 of that frame when it defines LOCAL (only X/Z and yaw are
+// centered; see docs/DXMT-INTEROP.md, and the control-daemon smoke sees an
+// injected standing head at LOCAL y = 1.5). LOCAL's origin is therefore
+// already on the floor, which is the STAGE and LOCAL_FLOOR definition, so
+// STAGE-from-LOCAL and LOCAL_FLOOR-from-LOCAL are identity. The recenter
+// gesture moves this shared origin, so all three move together, and
+// queueReferenceSpaceChange (frame.cpp) queues an event for each of them.
+bool isWorldReferenceSpace(XrReferenceSpaceType referenceSpaceType) {
+    return referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL ||
+           referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR ||
+           referenceSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE;
+}
+
 // The headset supplies LOCAL-from-HEAD. These eye values are conservative
 // fallbacks until the control protocol delivers the Quest's calibrated IPD/FOV.
 constexpr float kEyeOffsetMeters = 0.063f / 2.0f;
@@ -154,6 +169,57 @@ XrVector3f vectorCross(const XrVector3f& a, const XrVector3f& b) {
 
 XrVector3f vectorAdd(const XrVector3f& a, const XrVector3f& b) {
     return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+// One consistent head and controller sample for a locate call; every space
+// in that call is resolved against it.
+struct TrackingSample {
+    bool headTracked = false;
+    XrPosef headInLocal{};
+    basalt::ControlInputSnapshot input{};
+};
+
+void sampleTracking(XrSession session, XrTime time, TrackingSample* sample) {
+    sample->headTracked = basalt::controlHeadPose(
+        session, time, nullptr, &sample->headInLocal);
+    basalt::controlInputSnapshot(session, &sample->input, time);
+}
+
+// Resolves an action space to its controller (hand 0/1, grip or aim); false
+// for reference spaces and for actions without a current pose binding.
+bool resolveActionSpace(const SpaceRecord& record, uint32_t* hand, bool* aim) {
+    *hand = UINT32_MAX;
+    *aim = false;
+    return record.kind == SpaceKind::kAction &&
+           basalt::getActionPoseSource(
+               record.session, record.action, record.subactionPath, hand, aim);
+}
+
+// LOCAL-from-space: LOCAL, LOCAL_FLOOR, and STAGE are their creation offset,
+// VIEW follows the fresh head pose, and an action space follows its active
+// controller.
+bool localFromSpace(
+    const SpaceRecord& record,
+    bool actionResolved,
+    uint32_t hand,
+    const TrackingSample& sample,
+    XrPosef* pose) {
+    if (record.kind == SpaceKind::kAction) {
+        if (!actionResolved || hand >= 2 || !sample.input.controllers[hand].poseActive) {
+            return false;
+        }
+        *pose = poseCompose(sample.input.controllers[hand].poseInLocal, record.pose);
+        return true;
+    }
+    if (isWorldReferenceSpace(record.referenceSpaceType)) {
+        *pose = record.pose;
+        return true;
+    }
+    if (!sample.headTracked) {
+        return false;
+    }
+    *pose = poseCompose(sample.headInLocal, record.pose);
+    return true;
 }
 
 }  // namespace
@@ -334,12 +400,10 @@ XrResult XRAPI_CALL locateSpace(
     uint32_t baseHand = UINT32_MAX;
     bool targetAim = false;
     bool baseAim = false;
-    const bool targetActionResolved = target.kind == SpaceKind::kAction &&
-        getActionPoseSource(target.session, target.action, target.subactionPath,
-                            &targetHand, &targetAim);
-    const bool baseActionResolved = base.kind == SpaceKind::kAction &&
-        getActionPoseSource(base.session, base.action, base.subactionPath,
-                            &baseHand, &baseAim);
+    const bool targetActionResolved =
+        resolveActionSpace(target, &targetHand, &targetAim);
+    const bool baseActionResolved =
+        resolveActionSpace(base, &baseHand, &baseAim);
     XrSpaceVelocityFlags velocityFlags = 0;
     XrVector3f linearVelocity{};
     XrVector3f angularVelocity{};
@@ -358,9 +422,12 @@ XrResult XRAPI_CALL locateSpace(
                         XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
     } else if (target.kind == SpaceKind::kReference &&
                base.kind == SpaceKind::kReference &&
-               target.referenceSpaceType == base.referenceSpaceType) {
-        // The natural transform cancels for LOCAL↔LOCAL and VIEW↔VIEW, so
-        // creation offsets remain valid even before the first head sample.
+               (target.referenceSpaceType == base.referenceSpaceType ||
+                (isWorldReferenceSpace(target.referenceSpaceType) &&
+                 isWorldReferenceSpace(base.referenceSpaceType)))) {
+        // The natural transform cancels for VIEW↔VIEW and between LOCAL,
+        // LOCAL_FLOOR, and STAGE, which share one origin, so creation offsets
+        // remain valid even before the first head sample.
         location->locationFlags =
             XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
             XR_SPACE_LOCATION_POSITION_VALID_BIT;
@@ -368,40 +435,16 @@ XrResult XRAPI_CALL locateSpace(
         velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT |
                         XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
     } else {
-        XrPosef headInLocal{};
-        const bool headTracked = controlHeadPose(
-            target.session, time, nullptr, &headInLocal);
-        ControlInputSnapshot input{};
-        controlInputSnapshot(target.session, &input, time);
-
-        auto localFromSpace = [&](const SpaceRecord& record, bool actionResolved,
-                                  uint32_t hand, XrPosef* pose) -> bool {
-            if (record.kind == SpaceKind::kAction) {
-                if (!actionResolved || hand >= 2 || !input.controllers[hand].poseActive) {
-                    return false;
-                }
-                *pose = poseCompose(input.controllers[hand].poseInLocal, record.pose);
-                return true;
-            }
-            // Only VIEW follows the head. LOCAL, LOCAL_FLOOR and STAGE are
-            // fixed world spaces; composing them with the head pose made a
-            // VIEW-vs-floor query cancel the head transform and return a
-            // constant pose, so titles rendered a frozen camera.
-            if (record.referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW) {
-                *pose = record.pose;
-                return true;
-            }
-            if (!headTracked) {
-                return false;
-            }
-            *pose = poseCompose(headInLocal, record.pose);
-            return true;
-        };
+        TrackingSample sample;
+        sampleTracking(target.session, time, &sample);
+        const ControlInputSnapshot& input = sample.input;
 
         XrPosef targetInLocal{};
         XrPosef baseInLocal{};
-        if (!localFromSpace(target, targetActionResolved, targetHand, &targetInLocal) ||
-            !localFromSpace(base, baseActionResolved, baseHand, &baseInLocal)) {
+        if (!localFromSpace(target, targetActionResolved, targetHand, sample,
+                            &targetInLocal) ||
+            !localFromSpace(base, baseActionResolved, baseHand, sample,
+                            &baseInLocal)) {
             location->locationFlags = 0;
             location->pose = identityPose();
             setChainedSpaceVelocity(
@@ -581,6 +624,8 @@ XrResult XRAPI_CALL getReferenceSpaceBoundsRect(
         return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
     }
 
+    // ALVR does not forward the Quest guardian, so no space has known bounds.
+    // OpenComposite accepts this result for STAGE.
     bounds->width = 0.0f;
     bounds->height = 0.0f;
     return XR_SPACE_BOUNDS_UNAVAILABLE;
@@ -643,6 +688,38 @@ bool isSpaceForSession(XrSpace space, XrSession session) {
     const bool matches = record != nullptr && record->session == session;
     ReleaseSRWLockShared(&gSpaceLock);
     return matches;
+}
+
+bool locateSpaceInLocal(
+    XrSpace space,
+    XrSession expectedSession,
+    XrTime time,
+    XrPosef* poseInLocal) {
+    if (space == XR_NULL_HANDLE || poseInLocal == nullptr) {
+        return false;
+    }
+    AcquireSRWLockShared(&gSpaceLock);
+    const SpaceRecord* found = findSpaceLocked(space);
+    const bool matches = found != nullptr && found->session == expectedSession;
+    SpaceRecord record{};
+    if (matches) {
+        record = *found;
+    }
+    ReleaseSRWLockShared(&gSpaceLock);
+    if (!matches) {
+        return false;
+    }
+    if (record.kind == SpaceKind::kReference &&
+        isWorldReferenceSpace(record.referenceSpaceType)) {
+        *poseInLocal = record.pose;
+        return true;
+    }
+    uint32_t hand = UINT32_MAX;
+    bool aim = false;
+    const bool actionResolved = resolveActionSpace(record, &hand, &aim);
+    TrackingSample sample;
+    sampleTracking(record.session, time, &sample);
+    return localFromSpace(record, actionResolved, hand, sample, poseInLocal);
 }
 
 bool isPoseWellFormed(const XrPosef& pose) {

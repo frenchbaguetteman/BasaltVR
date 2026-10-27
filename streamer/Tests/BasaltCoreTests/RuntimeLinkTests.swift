@@ -59,6 +59,17 @@ final class RuntimeLinkTests: XCTestCase {
         XCTAssertEqual(defines["MIN_VIEW_DIMENSION"], PerEyeResolution.dimensionRange.lowerBound)
         XCTAssertEqual(defines["MAX_VIEW_WIDTH"], RuntimeLink.maximumViewWidth)
         XCTAssertEqual(defines["MAX_VIEW_HEIGHT"], RuntimeLink.maximumViewHeight)
+        XCTAssertEqual(defines["MIN_DISPLAY_PERIOD_NS"],
+                       Int(RuntimeLink.minimumDisplayPeriodNanoseconds))
+        XCTAssertEqual(defines["MAX_DISPLAY_PERIOD_NS"],
+                       Int(RuntimeLink.maximumDisplayPeriodNanoseconds))
+        XCTAssertEqual(defines["DEFAULT_DISPLAY_PERIOD_NS"],
+                       Int(RuntimeLink.defaultDisplayPeriodNanoseconds))
+        XCTAssertEqual(defines["HAND_JOINT_COUNT"], RuntimeLink.handJointCount)
+        XCTAssertEqual(defines["HAND_SKELETON_PAYLOAD_LENGTH"],
+                       RuntimeLink.handSkeletonPayloadLength)
+        XCTAssertTrue(header.contains(
+            "#define BASALT_CONTROL_FEATURE_HAND_TRACKING \"\(RuntimeLink.handTrackingFeature)\""))
 
         // BASALT_MSG_HELLO_ACK = 2 must mirror `case helloAck = 2`.
         let headerMessages = try values(#"BASALT_MSG_([A-Z_]+) = ([0-9]+),"#)
@@ -91,6 +102,23 @@ final class RuntimeLinkTests: XCTestCase {
             dxgiFormat: 28, iosurfacePixelFormat: bgraFourCC))
         XCTAssertFalse(RuntimeLink.isStreamableSwapchainFormat(
             dxgiFormat: 87, iosurfacePixelFormat: rgbaFourCC))
+    }
+
+    func testHelloAckCarriesTheHeadsetDisplayPeriod() {
+        XCTAssertEqual(RuntimeLink.displayPeriodNanoseconds(refreshRate: 72),
+                       RuntimeLink.defaultDisplayPeriodNanoseconds)
+        XCTAssertEqual(RuntimeLink.displayPeriodNanoseconds(refreshRate: 90), 11_111_111)
+        XCTAssertEqual(RuntimeLink.displayPeriodNanoseconds(refreshRate: 120), 8_333_333)
+        XCTAssertEqual(RuntimeLink.displayPeriodNanoseconds(refreshRate: 240), 4_166_667)
+        for invalid: Float in [0, -72, 20, 241, .nan, .infinity] {
+            XCTAssertNil(RuntimeLink.displayPeriodNanoseconds(refreshRate: invalid), "\(invalid)")
+        }
+
+        let ack = RuntimeLink.helloAckPayload(displayPeriodNanoseconds: 11_111_111)
+        var expected = Data()
+        expected.appendTestU16(RuntimeLink.protocolVersion)
+        expected.appendTestU64(11_111_111)
+        XCTAssertEqual(ack, expected)
     }
 
     func testFrameReadyHeaderPreservesExactQuestTrackingTimestamp() throws {
