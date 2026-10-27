@@ -335,7 +335,10 @@ final class BottleManagerTests: XCTestCase {
         try Data([0x4d, 0x5a]).write(to: beatSaber)
         try Data([0x4d, 0x5a]).write(to: steam)
         let originalHelper = Data([0x4d, 0x5a, 0x10])
-        let compatibilityShim = Data([0x4d, 0x5a, 0x20])
+        let shimMarker = Data("steamwebhelper.basalt-original.exe".utf16.flatMap {
+            [UInt8($0 & 0xff), UInt8($0 >> 8)]
+        })
+        let compatibilityShim = Data([0x4d, 0x5a, 0x20]) + shimMarker
         try originalHelper.write(to: webHelper)
         try compatibilityShim.write(to: compatibilityArtifact)
         try FileManager.default.setAttributes(
@@ -388,6 +391,23 @@ final class BottleManagerTests: XCTestCase {
         _ = try manager.installSteamWebHelperCompatibility(forProfile: "beat-saber")
         XCTAssertEqual(try Data(contentsOf: webHelper), compatibilityShim)
         XCTAssertEqual(try Data(contentsOf: preservedHelper), updatedHelper)
+
+        // A rebuilt shim differs byte-for-byte from the installed older build.
+        // The older shim must be replaced, never preserved as Steam's helper.
+        let rebuiltShim = Data([0x4d, 0x5a, 0x21]) + shimMarker
+        try rebuiltShim.write(to: compatibilityArtifact)
+        _ = try manager.installSteamWebHelperCompatibility(forProfile: "beat-saber")
+        XCTAssertEqual(try Data(contentsOf: webHelper), rebuiltShim)
+        XCTAssertEqual(try Data(contentsOf: preservedHelper), updatedHelper)
+        XCTAssertTrue(BottleManager.isSteamWebHelperShim(rebuiltShim))
+        XCTAssertFalse(BottleManager.isSteamWebHelperShim(updatedHelper))
+
+        // A backup already overwritten by an older Basalt build is refused
+        // rather than installed as a self-launching loop.
+        try compatibilityShim.write(to: preservedHelper)
+        XCTAssertThrowsError(
+            try manager.installSteamWebHelperCompatibility(forProfile: "beat-saber"))
+        try updatedHelper.write(to: preservedHelper)
 
         let bootstrap = try XCTUnwrap(
             manager.steamBootstrapCommand(forProfile: "beat-saber"))
@@ -496,6 +516,69 @@ final class BottleManagerTests: XCTestCase {
                       "The external source must remain untouched")
         XCTAssertFalse(imported.dxmtInstalled)
         XCTAssertFalse(imported.runtimeInstalled)
+    }
+
+    func testFailedCreateAndImportRemoveTheHalfMadeBottle() throws {
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "BasaltFailedCreate-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            _ = try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o644],
+                ofItemAtPath: temporary.appendingPathComponent("Source/locked").path)
+            try? FileManager.default.removeItem(at: temporary)
+        }
+        let pinned = temporary.appendingPathComponent(
+            "runtime/build/dxmt/toolchain/wine-11.10/Wine Devel.app/Contents/Resources/wine")
+        let bin = pinned.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        for name in ["wine", "wineserver"] {
+            // wineboot runs through this stub and fails.
+            let executable = bin.appendingPathComponent(name)
+            try Data("#!/bin/sh\nexit 71\n".utf8).write(to: executable)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        }
+        let macDriver = pinned.appendingPathComponent("lib/wine/x86_64-unix/winemac.so")
+        try FileManager.default.createDirectory(
+            at: macDriver.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data([1]).write(to: macDriver)
+        let fork = temporary.appendingPathComponent(
+            "runtime/build/dxmt/fork-install/x86_64-unix/winemetal.so")
+        try FileManager.default.createDirectory(
+            at: fork.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data([1]).write(to: fork)
+
+        let manager = BottleManager(
+            root: temporary.appendingPathComponent("data"), repoRoot: temporary)
+        let directory = try manager.paths.bottleDirectory("Broken")
+
+        XCTAssertThrowsError(try manager.createBottle(
+            name: "Broken", engineID: BottleEngineDiscovery.pinnedDXMTEngineID))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        XCTAssertEqual(try manager.listBottles().count, 0)
+
+        // An unreadable source file makes the prefix copy fail after the
+        // bottle directory exists.
+        let source = temporary.appendingPathComponent("Source", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: source.appendingPathComponent("drive_c"), withIntermediateDirectories: true)
+        try Data("WINE REGISTRY".utf8).write(to: source.appendingPathComponent("system.reg"))
+        let locked = source.appendingPathComponent("locked")
+        try Data([1]).write(to: locked)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000], ofItemAtPath: locked.path)
+
+        XCTAssertThrowsError(try manager.importPrefix(
+            name: "Broken", engineID: BottleEngineDiscovery.pinnedDXMTEngineID,
+            sourcePrefix: source))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        XCTAssertEqual(try manager.listBottles().count, 0)
+
+        // The name is free again once the source is fixed.
+        try FileManager.default.removeItem(at: locked)
+        XCTAssertNoThrow(try manager.importPrefix(
+            name: "Broken", engineID: BottleEngineDiscovery.pinnedDXMTEngineID,
+            sourcePrefix: source))
     }
 
     func testInstallDXMTMigratesLegacyPinnedEngineBeforeOverlay() throws {
