@@ -115,10 +115,11 @@ final class BasaltAppModel: ObservableObject {
     /// is still awaiting cleanup, Steam, or the streamer abandons quietly
     /// instead of starting more processes or reporting a spurious failure.
     private var activeLaunchID: UUID?
-    /// The prefix shutdown `stop()` runs off the main actor, and the commands
-    /// it is shutting down. `launch` waits for it before touching the bottle,
-    /// and quitting repeats the kill synchronously so it is issued before exit.
-    private var wineShutdown: (task: Task<Void, Never>, commands: [BottleLaunchCommand])?
+    /// The prefix shutdown `stop()` runs off the main actor, with the commands
+    /// and streamers it is shutting down. `launch` waits for it before touching
+    /// the bottle, and quitting repeats it synchronously so it is issued before exit.
+    private var wineShutdown: (
+        task: Task<Void, Never>, commands: [BottleLaunchCommand], streamers: [Process])?
     /// The session `launch` started; `finishSession` records it to history.
     private var openSession: SessionRecord?
     private var hasChosenInitialSection = false
@@ -764,6 +765,9 @@ final class BasaltAppModel: ObservableObject {
             // An earlier background shutdown may not finish before exit.
             let commands = (wineShutdown?.commands ?? []) + [wineCommand].compactMap { $0 }
             _ = shutDown(commands)
+            for pending in wineShutdown?.streamers ?? [] where pending.isRunning {
+                pending.terminate()
+            }
             return
         }
         guard let wineCommand else {
@@ -776,7 +780,8 @@ final class BasaltAppModel: ObservableObject {
             let message = shutDown([wineCommand])
             await self?.finishWineShutdown(message: message)
         }
-        wineShutdown = (task, (previous?.commands ?? []) + [wineCommand])
+        wineShutdown = (task, (previous?.commands ?? []) + [wineCommand],
+                        (previous?.streamers ?? []) + [streamer].compactMap { $0 })
     }
 
     private func finishWineShutdown(message: String?) {
@@ -784,6 +789,7 @@ final class BasaltAppModel: ObservableObject {
         // Shutdowns run in order, so the one finishing is the oldest listed.
         guard var pending = wineShutdown else { return }
         pending.commands.removeFirst()
+        pending.streamers.removeAll { !$0.isRunning }
         wineShutdown = pending.commands.isEmpty ? nil : pending
     }
 
