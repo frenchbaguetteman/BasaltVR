@@ -242,6 +242,7 @@ final class AlvrVideoStreamTests: XCTestCase {
             XCTAssertGreaterThan(report.durationNanoseconds, 0)
             reportReceived.fulfill()
         }
+        sender.start()
         sender.send(annexB: Data([0, 0, 0, 1, 0x65]),
                     timestampNanoseconds: 1, isIDR: true)
         let prefix = try readExactly(4, from: peer)
@@ -339,6 +340,120 @@ final class AlvrVideoStreamTests: XCTestCase {
         XCTAssertFalse(sender.send(
             annexB: Data([0, 0, 0, 1, 0x41]),
             timestampNanoseconds: 2, isIDR: false))
+    }
+
+    func testWiredUplinkEOFFailsTransportInsteadOfSpinning() throws {
+        let listener = socket(AF_INET, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(listener, 0)
+        defer { close(listener) }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bindResult = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(listener, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        XCTAssertEqual(bindResult, 0)
+        XCTAssertEqual(listen(listener, 1), 0)
+        var bound = sockaddr_in()
+        var boundSize = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &bound) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                _ = getsockname(listener, $0, &boundSize)
+            }
+        }
+
+        let sender = try AlvrVideoStreamSender(
+            host: "127.0.0.1", remotePort: UInt16(bigEndian: bound.sin_port),
+            localPort: 0, transport: .tcp)
+        let peer = accept(listener, nil, nil)
+        XCTAssertGreaterThanOrEqual(peer, 0)
+
+        let failed = expectation(description: "headset EOF reported once")
+        failed.assertForOverFulfill = true
+        sender.onError = { error in
+            XCTAssertTrue(error.localizedDescription.contains("closed"))
+            failed.fulfill()
+        }
+        sender.start()
+        close(peer)
+        wait(for: [failed], timeout: 2)
+
+        // The EOF permanently fails the connection; the read source was
+        // cancelled rather than left firing on a readable, closed socket.
+        XCTAssertFalse(sender.send(
+            annexB: Data([0, 0, 0, 1, 0x41]),
+            timestampNanoseconds: 1, isIDR: false))
+    }
+
+    func testUplinkIsNotReadUntilStarted() throws {
+        let receiver = socket(AF_INET, SOCK_DGRAM, 0)
+        XCTAssertGreaterThanOrEqual(receiver, 0)
+        defer { close(receiver) }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bindResult = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(receiver, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        XCTAssertEqual(bindResult, 0)
+        var bound = sockaddr_in()
+        var boundSize = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &bound) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                _ = getsockname(receiver, $0, &boundSize)
+            }
+        }
+
+        let sender = try AlvrVideoStreamSender(
+            host: "127.0.0.1", remotePort: UInt16(bigEndian: bound.sin_port), localPort: 0)
+        var senderAddress = sockaddr_in()
+        var senderAddressSize = socklen_t(MemoryLayout<sockaddr_in>.size)
+        sender.send(annexB: Data([0, 0, 0, 1, 0x65]), timestampNanoseconds: 1, isIDR: true)
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(receiver, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                   socklen_t(MemoryLayout<timeval>.size))
+        var buffer = [UInt8](repeating: 0, count: 2_048)
+        let received = withUnsafeMutablePointer(to: &senderAddress) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                recvfrom(receiver, &buffer, buffer.count, 0, $0, &senderAddressSize)
+            }
+        }
+        XCTAssertGreaterThan(received, 0)
+
+        let tracking = Self.uplinkDatagram(
+            streamID: 0, payload: Self.duration(seconds: 3, nanoseconds: 0))
+        func sendTracking() {
+            _ = tracking.withUnsafeBytes { bytes in
+                withUnsafePointer(to: &senderAddress) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        sendto(receiver, bytes.baseAddress, tracking.count, 0,
+                               $0, senderAddressSize)
+                    }
+                }
+            }
+        }
+        sendTracking()
+        usleep(100_000)
+        XCTAssertNil(sender.timestampForVideoFrame())
+
+        // Handlers are installed; the queued datagram is read on start.
+        sender.start()
+        let deadline = Date().addingTimeInterval(1)
+        var videoTimestamp: UInt64?
+        while videoTimestamp == nil, Date() < deadline {
+            videoTimestamp = sender.timestampForVideoFrame()
+            usleep(1_000)
+        }
+        XCTAssertEqual(videoTimestamp, 3_000_000_000)
     }
 
     private func readExactly(_ count: Int, from socket: Int32) throws -> Data {

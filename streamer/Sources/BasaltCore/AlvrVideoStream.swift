@@ -333,6 +333,7 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
     private var trackingReadyCallback: (() -> Void)?
     private var tcpReceiveBuffer = Data()
     private var transportFailed = false
+    private var uplinkStarted = false
 
     public init(host: String, remotePort: UInt16 = defaultPort,
                 localPort: UInt16 = defaultPort,
@@ -414,9 +415,9 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
             }
             socket = fd
             queue.setSpecific(key: queueKey, value: ())
+            // Resumed by `start()`, once the owner has installed its handlers.
             let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
             source.setEventHandler { [weak self] in self?.drainUplink() }
-            source.resume()
             readSource = source
         } catch {
             close(fd)
@@ -426,11 +427,25 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
 
     deinit {
         readSource?.cancel()
+        // Releasing a suspended dispatch source crashes.
+        if !uplinkStarted { readSource?.resume() }
         if DispatchQueue.getSpecific(key: queueKey) != nil {
             close(socket)
         } else {
             _ = queue.sync { close(socket) }
         }
+    }
+
+    /// Starts reading the tracking/statistics uplink. Call once, after the
+    /// `on…` handlers are set: uplink callbacks run on the sender's queue and
+    /// must not race their own installation.
+    public func start() {
+        stateLock.lock()
+        let alreadyStarted = uplinkStarted
+        uplinkStarted = true
+        stateLock.unlock()
+        guard !alreadyStarted else { return }
+        readSource?.resume()
     }
 
     @discardableResult
@@ -589,7 +604,23 @@ public final class AlvrVideoStreamSender: @unchecked Sendable {
                 continue
             } else if count < 0, errno == EAGAIN || errno == EWOULDBLOCK {
                 return
+            } else if transport == .udp, count == 0 {
+                continue  // an empty datagram
+            } else if transport == .udp, errno == ECONNREFUSED {
+                // A briefly unreachable headset; recv consumed the ICMP error.
+                return
             } else {
+                // EOF or a hard error leaves the descriptor readable forever;
+                // returning would spin the read source at full CPU.
+                let error = count == 0
+                    ? BasaltError("ALVR USB stream closed by the headset")
+                    : Self.socketError("ALVR stream uplink failed")
+                if transport == .tcp {
+                    failTCPTransport()
+                } else {
+                    readSource?.cancel()
+                }
+                onError?(error)
                 return
             }
         }

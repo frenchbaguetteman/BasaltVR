@@ -65,6 +65,7 @@ All notable changes to BasaltVR are documented here.
 - Pressing Stop while a session is still starting now cancels the launch. Previously it could
   go on to start Steam, the streamer, and the game, report a spurious failure, or, after a
   delayed Steam sign-in timeout, tear down a session started afterwards.
+- A closed USB video stream no longer spins the streamer at 100% CPU.
 
 ### Project maintenance
 

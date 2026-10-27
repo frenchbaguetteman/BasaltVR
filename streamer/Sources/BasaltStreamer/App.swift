@@ -557,6 +557,7 @@ struct BasaltStreamerApp {
                 hand: hand, durationNanoseconds: duration,
                 frequency: frequency, amplitude: amplitude)
         }
+        videoSender.start()
 
         // StreamReady means the client's control state advanced, but an ALVR
         // client left stale by a prior wired session can accept both TCP
