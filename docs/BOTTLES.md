@@ -72,20 +72,26 @@ Wine process's host working directory.
 
 ## OpenComposite
 
-Basalt does not download, link, or redistribute OpenComposite. Supply the matching-bitness
-`openvr_api.dll` from the [official OpenComposite project](https://gitlab.com/znixian/OpenOVR/-/tree/openxr),
-then name the exact game DLL target inside the managed prefix:
+OpenVR games (such as The Lab) need OpenComposite as their `openvr_api.dll`. Basalt does not
+download, link, or redistribute OpenComposite (GPL-3.0); build it locally from pinned source with
+`runtime/scripts/build-opencomposite.zsh`, or supply your own matching-bitness build. The build,
+Basalt's patches, the OpenVR proxy, presets, and a per-game checklist are in
+[the OpenComposite guide](OPENCOMPOSITE.md).
+
+Install it into one game by naming the exact game DLL target inside the managed prefix:
 
 ```sh
 swift run --package-path streamer basaltctl opencomposite install beat-saber-steam \
-  --artifact /path/to/openvr_api.dll \
+  --artifact runtime/build/opencomposite/out/openvr_api.dll \
   --target "$HOME/Library/Application Support/BasaltVR/Bottles/beat-saber/prefix/drive_c/Program Files (x86)/Steam/steamapps/common/Beat Saber/Beat Saber_Data/Plugins/x86_64/openvr_api.dll"
 ```
 
 The installer requires an `MZ` PE artifact and an `openvr_api.dll` destination below that
 bottle's prefix. If the game DLL exists, its first version is retained as
 `openvr_api.dll.basalt-original`. The generated `opencomposite.ini` uses the D3D11 path
-(`initUsingVulkan=false`).
+(`initUsingVulkan=false`). `--preset alyx`, `--proxy`, and `--ini KEY=VALUE` are described in the
+OpenComposite guide. A Steam update or "Verify integrity of game files" can restore Valve's DLL;
+run the install command again if that happens.
 
 ## Launch
 
@@ -109,10 +115,46 @@ The run command refuses incomplete bottles or a missing control file. It maps th
 Wine `Z:` drive, enables the private DXMT IOSurface gate, applies the profile environment, and
 starts the explicit executable. Extra arguments after `--` are appended for that invocation only.
 
-The generated OpenComposite configuration keeps `enableAudio=false`: OpenComposite's audio option
-tries to redirect games to an Oculus/Rift output that does not exist in this Wine setup. Instead,
-set BlackHole to 48 kHz in Audio MIDI Setup and let `--route-audio` temporarily direct application
-output into the loopback; the streamer restores the prior Mac output on shutdown. The management
+OpenComposite's `openxr` branch has no `enableAudio` option and aborts on unknown options, so
+Basalt no longer writes it. For game audio, set BlackHole to 48 kHz in Audio MIDI Setup and let
+`--route-audio` temporarily direct application output into the loopback; the streamer restores
+the prior Mac output on shutdown. The management
 app adds this flag automatically. Direct CLI users with an existing Multi-Output route can omit
 it. Validate the host side with `basalt-streamer --list-audio-devices` and
 `basalt-streamer audio-loopback-selftest --device 'BlackHole 2ch'`.
+
+macOS returns silence from BlackHole unless the app that runs `basalt-streamer` has Microphone
+access. The streamer asks for access before it captures and, if access is denied, stops with the
+System Settings action to take. A terminal that cannot ask (for example one embedded in an app
+without the audio-input entitlement) gets no prompt; run the command from Terminal.app instead.
+
+## Steam
+
+Install Steam into the bottle by running Valve's `SteamSetup.exe /S` with the bottle's Wine and
+`WINEPREFIX`. With the pinned engine the silent installer has been seen to crash after it copied
+its files; the client still works because `steam.exe` updates itself on first start (stop the
+crashed installer with the bottle's `wineserver -k`). Then create a Steam profile for the client.
+The examples below use one named `steam` in a bottle named `pcvr`:
+
+```sh
+EXE='C:\Program Files (x86)\Steam\steam.exe'
+CWD="$HOME/Library/Application Support/BasaltVR/Bottles/pcvr/prefix/drive_c/Program Files (x86)/Steam"
+swift run --package-path streamer basaltctl profile add steam --bottle pcvr --source steam \
+  --exe "$EXE" --cwd "$CWD"
+```
+
+`basaltctl steam start PROFILE [--log PATH]` takes the bottle from a Steam (or BSManager)
+profile, installs Basalt's Steam web helper compatibility shim (it fixes a black Steam window),
+and starts that bottle's `steam.exe` with `-inhibitbootstrap -noverifyfiles -no-cef-sandbox`. It
+returns while Steam keeps running. The installer recognizes any Basalt shim build and never
+preserves a shim as Steam's original helper, which would make the shim launch itself in a loop.
+
+To sign in and download games without the streamer, run
+`swift run --package-path streamer basaltctl steam start steam` and quit Steam from its own menu
+when done.
+
+`basaltctl profile` has `list`, `show`, and `add`; `add` with an existing name replaces that
+profile. For Beat Saber (app 620980), `basaltctl run` turns `steam.exe -applaunch 620980` into a
+direct launch of `Beat Saber.exe`, so Steam must already be running. A profile can also name a
+game executable directly and pass `--env SteamAppId=<id> --env SteamGameId=<id>` so the game finds
+the running Steam without a `steam_appid.txt`.

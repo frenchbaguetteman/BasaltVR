@@ -70,6 +70,8 @@ final class BasaltAppModel: ObservableObject {
     @Published private(set) var setupChecks = [SetupCheck]()
     @Published private(set) var bottles = [ManagedBottle]()
     @Published private(set) var profiles = [LaunchProfile]()
+    /// VR file checks per profile, recomputed on every refresh.
+    @Published private(set) var vrStatuses = [String: VRSetupStatus]()
     @Published private(set) var games = [DetectedGame]()
     @Published private(set) var discoveredBottles = [DiscoveredBottle]()
     @Published private(set) var steamGames = [SteamGame]()
@@ -186,7 +188,7 @@ final class BasaltAppModel: ObservableObject {
             [ManagedBottle], [LaunchProfile], [DetectedGame],
             [BottleEngine], [SetupCheck], [GameAudioDevice],
             [DiscoveredBottle], [SteamGame], [BSManagerInstance],
-            [BSManagerInstallation]
+            [BSManagerInstallation], [String: VRSetupStatus]
         ), Error>
         let bsManagerLocation = bsManagerLocation
         let result: RefreshResult = await Task.detached {
@@ -204,9 +206,12 @@ final class BasaltAppModel: ObservableObject {
                     bottles: bottles)
                 let bsManagerApps = BSManagerInstallationDiscovery().discover(
                     in: bottles)
+                let vr = Dictionary(uniqueKeysWithValues: profiles.map {
+                    ($0.name, manager.vrSetupStatus(profileName: $0.name))
+                })
                 return RefreshResult.success(
                     (bottles, profiles, games, manager.engines(), checks, audio,
-                     discovered, steam, bsManager, bsManagerApps))
+                     discovered, steam, bsManager, bsManagerApps, vr))
             } catch {
                 return RefreshResult.failure(error)
             }
@@ -215,7 +220,7 @@ final class BasaltAppModel: ObservableObject {
         case .success(let values):
             (bottles, profiles, games, engines, setupChecks, audioDevices,
              discoveredBottles, steamGames, bsManagerInstances,
-             bsManagerInstallations) = values
+             bsManagerInstallations, vrStatuses) = values
             print("BasaltVR library: \(discoveredBottles.count) bottle(s), "
                   + "\(steamGames.filter { !$0.isTool }.count) Steam game(s), "
                   + "\(bsManagerInstances.count) BSManager instance(s), "
@@ -351,6 +356,93 @@ final class BasaltAppModel: ObservableObject {
         }
     }
 
+    /// A launch profile for a Windows game chosen by hand (GOG, itch.io, or
+    /// any installer). Its folder becomes the profile's game folder
+    /// (`gameRoot`).
+    /// Returns the new profile's name, or nil after showing why it failed.
+    @discardableResult
+    func createGameProfile(
+        named title: String, executable: URL, source: LaunchSource,
+        arguments: [String], in bottle: ManagedBottle
+    ) async -> String? {
+        let prefix = URL(fileURLWithPath: bottle.prefixPath, isDirectory: true)
+        let folder = executable.deletingLastPathComponent()
+        guard ManualGame.isInstalled(executable, inPrefix: prefix),
+              let windowsExecutable = ManualGame.windowsPath(for: executable, prefix: prefix),
+              let windowsFolder = ManualGame.windowsPath(for: folder, prefix: prefix) else {
+            alertMessage = "Install \(executable.lastPathComponent) in the \(bottle.name) bottle first."
+            return nil
+        }
+        let name = uniqueProfileName(for: title)
+        do {
+            try manager.saveProfile(LaunchProfile(
+                name: name, bottleName: bottle.name, source: source,
+                executable: windowsExecutable,
+                arguments: arguments,
+                workingDirectory: folder.path,
+                gameRoot: windowsFolder))
+            await refresh()
+            return name
+        } catch {
+            alertMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    // MARK: VR setup
+
+    var vrArtifacts: VRArtifacts { VRArtifacts.local(repoRoot: repoRoot) }
+
+    /// The game folder of `profile`; a `steam.exe -applaunch` profile uses the Steam
+    /// game's install folder from the library.
+    func vrLocation(for profile: LaunchProfile) throws -> VRGameLocation {
+        var appID = profile.environment["SteamAppId"]
+        if let index = profile.arguments.firstIndex(of: "-applaunch"),
+           profile.arguments.indices.contains(index + 1) {
+            appID = profile.arguments[index + 1]
+        }
+        let install = appID.flatMap { id in
+            steamGames.first {
+                $0.appID == id && $0.bottleOrigin == .managed && $0.bottleName == profile.bottleName
+            }?.installDirectory
+        }
+        return try manager.vrGameLocation(for: profile, steamInstallDirectory: install)
+    }
+
+    func inspectVR(_ location: VRGameLocation, bottleName: String) async
+        -> Result<VRGameDetection, Error> {
+        let manager = manager
+        return await Task.detached {
+            Result { try manager.inspectVRGame(location, bottleName: bottleName) }
+        }.value
+    }
+
+    func prepareVR(profileName: String, location: VRGameLocation, mode: VRMode,
+                   replaceCustomFiles: Bool = false) async -> Result<VRPrepareResult, Error> {
+        let manager = manager
+        let artifacts = vrArtifacts
+        isBusy = true
+        let result = await Task.detached {
+            Result {
+                try manager.prepareVR(
+                    profileName: profileName, location: location, mode: mode,
+                    artifacts: artifacts, replaceCustomFiles: replaceCustomFiles)
+            }
+        }.value
+        await refresh()
+        return result
+    }
+
+    func restoreVR(profileName: String) async -> Result<VRRestoreReport, Error> {
+        let manager = manager
+        isBusy = true
+        let result = await Task.detached {
+            Result { try manager.restoreVR(profileName: profileName) }
+        }.value
+        await refresh()
+        return result
+    }
+
     func profile(for instance: BSManagerInstance) -> LaunchProfile? {
         profiles.first { profile in
             guard profile.source == .bsmanager,
@@ -405,15 +497,23 @@ final class BasaltAppModel: ObservableObject {
         isBusy = false
     }
 
-    func deleteProfile(_ name: String) async {
-        do {
-            try manager.deleteProfile(name)
+    /// Deletes the profile and its VR setup record. With `restoringVR`, Basalt first puts the
+    /// game's own VR files back and keeps the profile if that restore is not complete.
+    func deleteProfile(_ name: String, restoringVR: Bool = false) async {
+        let manager = manager
+        isBusy = true
+        let result = await Task.detached {
+            Result { try manager.deleteProfile(name, restoringVR: restoringVR) }
+        }.value
+        switch result {
+        case .success:
             profileSettings[name] = nil
             persistProfileSettings()
-            await refresh()
-        } catch {
+        case .failure(let error):
             alertMessage = error.localizedDescription
         }
+        // Refresh either way: a restore that did not finish can still have changed files.
+        await refresh()
     }
 
     func streamSettings(for profile: String) -> StreamLaunchSettings {
@@ -706,7 +806,8 @@ final class BasaltAppModel: ObservableObject {
                     self.stop()
                 }
             }
-            try game.run()
+            // Replaces attachOutput's /dev/null stdin: hello_xr quits at its EOF.
+            try HeldOpenStandardInput.run(game)
             gameProcess = game
             activeWineCommand = command
             activeLaunchID = nil
@@ -833,26 +934,11 @@ final class BasaltAppModel: ObservableObject {
     }
 
     private func sanitizedProfileName(_ value: String) -> String {
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
-        let mapped = value.lowercased().unicodeScalars.map {
-            allowed.contains($0) ? Character(String($0)) : "-"
-        }
-        let collapsed = String(mapped).replacingOccurrences(
-            of: "-+", with: "-", options: .regularExpression)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-._"))
-        return String((collapsed.isEmpty ? "game" : collapsed).prefix(56))
+        ProfileNaming.slug(value)
     }
 
     private func uniqueProfileName(for value: String) -> String {
-        let existingNames = Set(profiles.map { $0.name.lowercased() })
-        let base = sanitizedProfileName(value)
-        var name = base
-        var suffix = 2
-        while existingNames.contains(name.lowercased()) {
-            name = "\(base)-\(suffix)"
-            suffix += 1
-        }
-        return name
+        ProfileNaming.unique(value, existing: profiles.map(\.name))
     }
 
     private func persistSettings() {

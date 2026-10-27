@@ -62,7 +62,7 @@ final class DiagnosticsTests: XCTestCase {
             "listening on 127.0.0.1:9944 and 0.0.0.0",
             "loopback ::1 only",
             "12:34:56.789 frame 42",
-            "Wine 11.10 with DXMT v0.80-basalt.1 at /usr/local/bin and /opt/homebrew/bin",
+            "Wine 11.10 with DXMT v0.80-basalt.2 at /usr/local/bin and /opt/homebrew/bin",
             "1344 × 1408 BGRA swapchain, DXGI_FORMAT_B8G8R8A8_UNORM, H264",
             "std::vector and BasaltCore::RuntimeLink",
             "/var/folders/xy/T/basalt-manager-3F2504E0-4F89-11D3-9A0C-0305E82C3301.control",

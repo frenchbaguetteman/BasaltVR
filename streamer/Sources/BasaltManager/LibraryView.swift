@@ -27,16 +27,20 @@ enum LibrarySheet: Identifiable {
     case importBottle(DiscoveredBottle)
     case chooseBottle(BSManagerInstance)
     case installBSManager(URL)
+    case addGame
     case edit(LaunchProfile)
     case settings(String)
+    case prepareVR(LaunchProfile)
 
     var id: String {
         switch self {
         case .importBottle(let bottle): "import-\(bottle.id)"
         case .chooseBottle(let instance): "choose-bottle-\(instance.id)"
         case .installBSManager(let url): "install-\(url.path)"
+        case .addGame: "add-game"
         case .edit(let profile): "edit-\(profile.name)"
         case .settings(let profileName): "settings-\(profileName)"
+        case .prepareVR(let profile): "prepare-vr-\(profile.name)"
         }
     }
 }
@@ -166,6 +170,12 @@ struct LibraryView: View {
         .searchable(text: $search, placement: .toolbar, prompt: "Search games or bottles")
         .toolbar {
             ToolbarItem {
+                Button { sheet = .addGame } label: {
+                    Label("Add Game…", systemImage: "plus")
+                }
+                .help("Add a Windows game from any folder in a Basalt bottle")
+            }
+            ToolbarItem {
                 Menu {
                     Toggle("VR Games Only", isOn: $vrOnly)
                     Toggle("Show Steam Tools", isOn: $showTools)
@@ -187,10 +197,14 @@ struct LibraryView: View {
                 BSManagerBottleSheet(instance: instance, model: model)
             case .installBSManager(let installer):
                 BSManagerInstallerSheet(installer: installer, model: model)
+            case .addGame:
+                AddGameSheet(model: model)
             case .edit(let profile):
                 ProfileEditorSheet(profile: profile, model: model)
             case .settings(let profileName):
                 PerGameSettingsSheet(profileName: profileName, model: model)
+            case .prepareVR(let profile):
+                PrepareVRSheet(profile: profile, model: model)
             }
         }
     }
@@ -344,7 +358,8 @@ private struct SteamGameTile: View {
                               colors: [.basaltSlate, .black], caption: nil),
             chips: chips,
             profileName: profile?.name,
-            model: model
+            model: model,
+            prepareVR: profile.map { profile in { present(.prepareVR(profile)) } }
         ) {
             if game.bottleOrigin == .managed {
                 Button("Create Profile") {
@@ -411,7 +426,8 @@ private struct BSManagerInstanceTile: View {
             chips: [ArtworkChip(text: "BSMANAGER")]
                 + (instance.isModded ? [ArtworkChip(text: "MODDED", systemImage: "wand.and.stars")] : []),
             profileName: profile?.name,
-            model: model
+            model: model,
+            prepareVR: profile.map { profile in { present(.prepareVR(profile)) } }
         ) {
             if profile == nil {
                 Button("Create Profile") { createProfile() }
@@ -459,7 +475,8 @@ private struct DetectedGameTile: View {
                 caption: nil),
             chips: [ArtworkChip(text: game.source.rawValue.uppercased())],
             profileName: game.profileName,
-            model: model
+            model: model,
+            prepareVR: profile.map { profile in { present(.prepareVR(profile)) } }
         ) {
             if game.profileName == nil {
                 Button("Create Profile") {
@@ -485,6 +502,7 @@ private struct ProfileMenuItems: View {
     let present: (LibrarySheet) -> Void
 
     var body: some View {
+        Button("Prepare VR…") { present(.prepareVR(profile)) }
         Button("Edit Launch Profile…") { present(.edit(profile)) }
         Button("Stream Settings…") { present(.settings(profile.name)) }
     }
@@ -501,9 +519,16 @@ private struct GameTile<SetupAction: View, MenuItems: View>: View {
     /// The launch profile backing this tile, when it is ready to play.
     let profileName: String?
     @ObservedObject var model: BasaltAppModel
+    /// Opens Prepare VR; shown beside Play when the VR files changed after setup.
+    var prepareVR: (() -> Void)? = nil
     @ViewBuilder var setupAction: SetupAction
     @ViewBuilder var menu: MenuItems
     @State private var hovering = false
+
+    private var vrNeedsAttention: Bool {
+        guard let profileName else { return false }
+        return model.vrStatuses[profileName]?.needsAttention == true
+    }
 
     private var isLive: Bool {
         guard let profileName else { return false }
@@ -528,6 +553,9 @@ private struct GameTile<SetupAction: View, MenuItems: View>: View {
                 .overlay(alignment: .topTrailing) {
                     if isLive {
                         ArtworkChip(text: "LIVE", systemImage: "dot.radiowaves.left.and.right", tint: .green)
+                            .padding(9)
+                    } else if vrNeedsAttention {
+                        ArtworkChip(text: "VR FILES CHANGED", systemImage: "exclamationmark.triangle", tint: .orange)
                             .padding(9)
                     } else if profileName != nil {
                         ArtworkChip(text: "READY", systemImage: "checkmark", tint: .green)
@@ -571,6 +599,10 @@ private struct GameTile<SetupAction: View, MenuItems: View>: View {
 
                 HStack(spacing: 8) {
                     primaryAction
+                    if vrNeedsAttention, let prepareVR, !isLive, !isStarting {
+                        Button("Prepare VR…", action: prepareVR)
+                            .help("A Steam update or file check changed the VR files Basalt installed")
+                    }
                     Spacer(minLength: 0)
                     Menu { menu } label: {
                         Image(systemName: "ellipsis.circle")

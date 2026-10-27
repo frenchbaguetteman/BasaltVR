@@ -83,11 +83,17 @@ public struct LaunchProfile: Codable, Equatable, Sendable {
     public var arguments: [String]
     public var workingDirectory: String?
     public var environment: [String: String]
+    /// Install folder of the game (a Windows path), for games whose executable
+    /// is not at the top of it (a launcher, or `bin/win64`). Prepare VR looks
+    /// for the game's OpenVR DLLs here. When nil, the `steamapps/common/<Game>`
+    /// folder of `executable` is used, or the executable's own folder.
+    public var gameRoot: String?
 
     public init(name: String, bottleName: String, source: LaunchSource,
                 executable: String, arguments: [String] = [],
                 workingDirectory: String? = nil,
-                environment: [String: String] = [:]) {
+                environment: [String: String] = [:],
+                gameRoot: String? = nil) {
         formatVersion = Self.currentFormatVersion
         self.name = name
         self.bottleName = bottleName
@@ -96,6 +102,7 @@ public struct LaunchProfile: Codable, Equatable, Sendable {
         self.arguments = arguments
         self.workingDirectory = workingDirectory
         self.environment = environment
+        self.gameRoot = gameRoot
     }
 }
 
@@ -135,6 +142,20 @@ public struct BottleLaunchCommand: Equatable, Sendable {
 public protocol BottleCommandRunning: Sendable {
     func run(executable: URL, arguments: [String], environment: [String: String],
              currentDirectory: URL?) throws -> CommandOutput
+    /// Like `run`, for a game: the child gets an empty stdin that stays open until it
+    /// exits (see `HeldOpenStandardInput`), not the caller's stdin.
+    func runKeepingInputOpen(executable: URL, arguments: [String],
+                             environment: [String: String],
+                             currentDirectory: URL?) throws -> CommandOutput
+}
+
+extension BottleCommandRunning {
+    public func runKeepingInputOpen(executable: URL, arguments: [String],
+                                    environment: [String: String],
+                                    currentDirectory: URL?) throws -> CommandOutput {
+        try run(executable: executable, arguments: arguments,
+                environment: environment, currentDirectory: currentDirectory)
+    }
 }
 
 public struct ProcessBottleCommandRunner: BottleCommandRunning {
@@ -143,6 +164,20 @@ public struct ProcessBottleCommandRunner: BottleCommandRunning {
     public func run(executable: URL, arguments: [String],
                     environment: [String: String], currentDirectory: URL?) throws
         -> CommandOutput {
+        try execute(executable: executable, arguments: arguments, environment: environment,
+                    currentDirectory: currentDirectory, keepsInputOpen: false)
+    }
+
+    public func runKeepingInputOpen(executable: URL, arguments: [String],
+                                    environment: [String: String],
+                                    currentDirectory: URL?) throws -> CommandOutput {
+        try execute(executable: executable, arguments: arguments, environment: environment,
+                    currentDirectory: currentDirectory, keepsInputOpen: true)
+    }
+
+    private func execute(executable: URL, arguments: [String],
+                         environment: [String: String], currentDirectory: URL?,
+                         keepsInputOpen: Bool) throws -> CommandOutput {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
@@ -172,12 +207,18 @@ public struct ProcessBottleCommandRunner: BottleCommandRunning {
         defer { try? outputHandle.close() }
         process.standardOutput = outputHandle
         process.standardError = outputHandle
+        var input: HeldOpenStandardInput?
         do {
-            try process.run()
+            if keepsInputOpen {
+                input = try HeldOpenStandardInput.run(process)
+            } else {
+                try process.run()
+            }
         } catch {
             throw BottleToolError("Could not run \(executable.path): \(error.localizedDescription)")
         }
         process.waitUntilExit()
+        input?.close()
         try? outputHandle.synchronize()
         let data = (try? Data(contentsOf: outputURL)) ?? Data()
         return CommandOutput(
@@ -215,6 +256,14 @@ public struct BasaltManagedPaths: Sendable {
 
     public func bottleMetadata(_ name: String) throws -> URL {
         try bottleDirectory(name).appendingPathComponent("bottle.json")
+    }
+
+    /// Records of the VR files Basalt installed for each launch profile.
+    public var vrSetups: URL { root.appendingPathComponent("VRSetup", isDirectory: true) }
+
+    public func vrSetupFile(_ name: String) throws -> URL {
+        let safeName = try BottleName.validate(name, kind: "profile name")
+        return vrSetups.appendingPathComponent(safeName).appendingPathExtension("json")
     }
 
     public func profileFile(_ name: String) throws -> URL {
@@ -297,10 +346,10 @@ public enum BottleEngineDiscovery {
 public final class BottleManager: @unchecked Sendable {
     public let paths: BasaltManagedPaths
     public let repoRoot: URL
-    private let fileManager: FileManager
+    let fileManager: FileManager
     private let runner: any BottleCommandRunning
-    private let encoder: JSONEncoder
-    private let decoder: JSONDecoder
+    let encoder: JSONEncoder
+    let decoder: JSONDecoder
 
     public init(root: URL, repoRoot: URL,
                 fileManager: FileManager = .default,
@@ -822,7 +871,12 @@ public final class BottleManager: @unchecked Sendable {
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
-    public func deleteProfile(_ name: String) throws {
+    /// Deletes a launch profile and its VR setup record (`VRSetup/<name>.json`), so a new
+    /// profile with the same name never inherits the record. With `restoringVR`, Restore Game
+    /// Files runs first and the profile is deleted only when Restore is complete; the report
+    /// is returned. Without it, Basalt's VR files stay in the game folder.
+    @discardableResult
+    public func deleteProfile(_ name: String, restoringVR: Bool = false) throws -> VRRestoreReport? {
         let file = try paths.profileFile(name)
         guard paths.contains(file) else {
             throw BottleToolError("Refusing to delete a profile outside the managed root")
@@ -830,11 +884,39 @@ public final class BottleManager: @unchecked Sendable {
         guard fileManager.fileExists(atPath: file.path) else {
             throw BottleToolError("Launch profile '\(name)' does not exist")
         }
+        var report: VRRestoreReport?
+        if restoringVR, try loadVRSetupRecord(name) != nil {
+            let restored = try restoreVR(profileName: name)
+            guard restored.isComplete else {
+                let folders = restored.unrestored.map { $0.deletingLastPathComponent().path }
+                    .joined(separator: ", ")
+                throw BottleToolError(
+                    "Restore is not complete: the original openvr_api.dll is missing in \(folders). Basalt kept its VR setup there and did not delete '\(name)'. Put the original back as openvr_api.dll.basalt-original and try again, or delete the profile without restoring.")
+            }
+            report = restored
+        }
+        // The record goes first: a record left without its profile would pass to the next
+        // profile with this name.
+        let record = try paths.vrSetupFile(name)
+        if pathExists(record.path) {
+            try fileManager.removeItem(at: record)
+        }
         try fileManager.removeItem(at: file)
+        return report
     }
 
+    /// File name of the real OpenComposite DLL when the Basalt proxy owns `openvr_api.dll`.
+    public static let openCompositeProxiedDLLName = "openvr_api_opencomposite.dll"
+
+    /// Installs OpenComposite as a game's `openvr_api.dll` and writes `opencomposite.ini`.
+    ///
+    /// With `proxy`, the Basalt proxy becomes `openvr_api.dll` and `artifact` is installed beside
+    /// it as `openvr_api_opencomposite.dll`. The proxy adds the Valve exports OpenComposite
+    /// lacks, such as the `VRControlPanel` export Half-Life: Alyx needs.
     public func installOpenComposite(profileName: String, artifact: URL,
-                                     targetDLL: URL) throws -> URL {
+                                     targetDLL: URL, proxy: URL? = nil,
+                                     configuration: OpenCompositeConfiguration = .standard)
+        throws -> URL {
         let profile = try loadProfile(profileName)
         let bottle = try loadBottle(profile.bottleName)
         let prefix = URL(fileURLWithPath: bottle.prefixPath).standardizedFileURL
@@ -858,9 +940,23 @@ public final class BottleManager: @unchecked Sendable {
             throw BottleToolError("OpenComposite target must be named openvr_api.dll")
         }
         let bytes = try Data(contentsOf: artifact)
-        guard bytes.count >= 2, bytes[bytes.startIndex] == 0x4d,
-              bytes[bytes.index(after: bytes.startIndex)] == 0x5a else {
+        guard Self.hasDOSHeader(bytes) else {
             throw BottleToolError("OpenComposite artifact is not a Windows PE DLL")
+        }
+        var proxyBytes: Data?
+        if let proxy {
+            let candidate = try Data(contentsOf: proxy)
+            guard let proxyMachine = Self.peMachine(candidate) else {
+                throw BottleToolError("OpenVR proxy is not a Windows PE DLL")
+            }
+            guard let artifactMachine = Self.peMachine(bytes) else {
+                throw BottleToolError("OpenComposite artifact is not a Windows PE DLL")
+            }
+            guard proxyMachine == artifactMachine else {
+                throw BottleToolError(
+                    "OpenVR proxy and OpenComposite artifact target different CPU architectures")
+            }
+            proxyBytes = candidate
         }
         try fileManager.createDirectory(
             at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -870,23 +966,56 @@ public final class BottleManager: @unchecked Sendable {
             throw BottleToolError(
                 "OpenComposite target resolves outside the managed bottle prefix")
         }
+        let ini = target.deletingLastPathComponent()
+            .appendingPathComponent(Self.openCompositeININame)
+        for url in [target, ini, target.appendingPathExtension(Self.originalSuffix)]
+        where isSymbolicLink(url) {
+            throw BottleToolError("\(url.path) is a symbolic link. Basalt will not write through it.")
+        }
+        if let current = try? String(contentsOf: ini, encoding: .utf8),
+           !current.hasPrefix(OpenCompositeConfiguration.managedHeader) {
+            throw BottleToolError(
+                "\(ini.path) was not written by Basalt. Move it away to use Basalt's configuration.")
+        }
         if fileManager.fileExists(atPath: target.path) {
             let backup = target.appendingPathExtension("basalt-original")
             if !fileManager.fileExists(atPath: backup.path) {
                 try copyFile(target, to: backup)
             }
         }
-        try bytes.write(to: target, options: .atomic)
-        let configuration = """
-        ; Managed by BasaltVR. OpenComposite remains a separately supplied GPLv3 artifact.
-        initUsingVulkan=false
-        enableAudio=false
-        """
-        try configuration.write(
-            to: target.deletingLastPathComponent()
-                .appendingPathComponent("opencomposite.ini"),
-            atomically: true, encoding: .utf8)
+        let proxied = target.deletingLastPathComponent()
+            .appendingPathComponent(Self.openCompositeProxiedDLLName)
+        if let proxyBytes {
+            // Write the forwarding target first so openvr_api.dll never forwards to nothing.
+            try bytes.write(to: proxied, options: .atomic)
+            try proxyBytes.write(to: target, options: .atomic)
+        } else {
+            try bytes.write(to: target, options: .atomic)
+            // A previous proxied install left the real DLL beside the target. Remove it so the
+            // directory holds a single OpenComposite.
+            if fileManager.fileExists(atPath: proxied.path) {
+                try fileManager.removeItem(at: proxied)
+            }
+        }
+        try configuration.iniText.write(to: ini, atomically: true, encoding: .utf8)
         return target
+    }
+
+    private static func hasDOSHeader(_ bytes: Data) -> Bool {
+        bytes.count >= 2 && bytes[bytes.startIndex] == 0x4d &&
+            bytes[bytes.index(after: bytes.startIndex)] == 0x5a
+    }
+
+    /// The COFF machine field of a PE image, or nil when `bytes` is not one.
+    static func peMachine(_ bytes: Data) -> UInt16? {
+        let image = [UInt8](bytes)
+        guard hasDOSHeader(bytes), image.count >= 0x40 else { return nil }
+        let offset = Int(image[0x3c]) | Int(image[0x3d]) << 8 |
+            Int(image[0x3e]) << 16 | Int(image[0x3f]) << 24
+        guard offset >= 0x40, offset <= image.count - 6,
+              image[offset] == 0x50, image[offset + 1] == 0x45,
+              image[offset + 2] == 0, image[offset + 3] == 0 else { return nil }
+        return UInt16(image[offset + 4]) | UInt16(image[offset + 5]) << 8
     }
 
     public func runProfile(_ name: String, controlFile: URL,
@@ -894,7 +1023,9 @@ public final class BottleManager: @unchecked Sendable {
         let command = try profileLaunchCommand(
             name, controlFile: controlFile,
             additionalArguments: additionalArguments)
-        return try runner.run(
+        // Not the caller's stdin: basaltctl may run with /dev/null as stdin, and hello_xr
+        // quits at end of file on stdin.
+        return try runner.runKeepingInputOpen(
             executable: command.executable,
             arguments: command.arguments,
             environment: command.environment,
@@ -1144,6 +1275,10 @@ public final class BottleManager: @unchecked Sendable {
             // it can never replace the original and relaunch itself.
             try copyFile(helper, to: backup)
         } else {
+            // The current shim, or a shim from another Basalt build (another
+            // checkout or worktree builds different bytes). Never preserve a
+            // shim as the original: the shim would then launch itself, and
+            // each launch would start another one (a process storm).
             guard fileManager.fileExists(atPath: backup.path) else {
                 throw BottleToolError(
                     "Steam UI compatibility is missing its preserved original helper")

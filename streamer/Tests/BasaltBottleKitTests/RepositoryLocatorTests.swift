@@ -27,6 +27,8 @@ final class RepositoryLocatorTests: XCTestCase {
             try RepositoryLocator.find(
                 startingAt: URL(fileURLWithPath: "/"),
                 environment: ["BASALT_REPO_ROOT": nested.path]))
+        XCTAssertEqual(RepositoryLocator.layout(of: temporary), .source)
+        XCTAssertNil(RepositoryLocator.layout(of: nested))
     }
 
     func testAcceptsPackagedSupportRoot() throws {
@@ -54,6 +56,7 @@ final class RepositoryLocatorTests: XCTestCase {
         XCTAssertEqual(
             try RepositoryLocator.find(startingAt: nested, environment: [:]),
             temporary.standardizedFileURL)
+        XCTAssertEqual(RepositoryLocator.layout(of: temporary), .packaged)
     }
 
     private func temporaryDirectory() throws -> URL {
