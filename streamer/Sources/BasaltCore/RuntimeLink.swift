@@ -12,7 +12,9 @@ import Security
 /// launcher hands the game bottle via BASALT_CONTROL, validates the Hello
 /// token, retains every registered swapchain IOSurface (IDs are untrusted:
 /// dimensions are re-checked after lookup), and surfaces fence-confirmed
-/// frames to `onFrame`. One runtime connection at a time.
+/// frames to `onFrame`. One runtime session at a time: a new connection that
+/// completes an authenticated Hello replaces the current one (a quick
+/// xrDestroySession/xrCreateSession may connect before the old EOF arrives).
 public final class RuntimeLink: @unchecked Sendable {
     /// Acknowledges one frame to the runtime, exactly once. Holders must keep
     /// it alive until their reads of the frame's surfaces finish: releasing
@@ -129,6 +131,11 @@ public final class RuntimeLink: @unchecked Sendable {
     private let listener: NWListener
     private var connection: NWConnection?
     private var receiveBuffer = Data()
+    /// Connections that have not yet sent an authenticated Hello. They never
+    /// receive runtime state, and each is dropped after `helloTimeout`.
+    private var candidates: [(connection: NWConnection, buffer: Data)] = []
+    static let maximumCandidateConnections = 4
+    var helloTimeout: DispatchTimeInterval = .seconds(5)
     private var helloDone = false
     private var swapchains: [UInt64: Swapchain] = [:]
     private var token = ""
@@ -243,6 +250,8 @@ public final class RuntimeLink: @unchecked Sendable {
 
     public func stop() {
         queue.async {
+            for candidate in self.candidates { candidate.connection.cancel() }
+            self.candidates.removeAll()
             self.dropConnection()
             self.listener.cancel()
             try? FileManager.default.removeItem(atPath: self.controlFilePath)
@@ -486,21 +495,100 @@ public final class RuntimeLink: @unchecked Sendable {
     // MARK: - connection handling (all on `queue`)
 
     private func accept(_ newConnection: NWConnection) {
-        guard connection == nil else {
-            newConnection.cancel()
-            return
+        // Unauthenticated connections cannot hold a slot the runtime needs:
+        // the oldest is dropped when too many are waiting for their Hello.
+        if candidates.count >= Self.maximumCandidateConnections {
+            dropCandidate(candidates[0].connection)
         }
-        connection = newConnection
-        receiveBuffer.removeAll()
-        helloDone = false
+        candidates.append((newConnection, Data()))
         newConnection.stateUpdateHandler = { [weak self, weak newConnection] state in
             guard case .failed = state, let self, let newConnection else { return }
+            self.dropCandidate(newConnection)
             // A replaced connection's late failure must not drop its
             // successor (e.g. a quick OpenXR session restart).
             self.onQueue(ifCurrent: newConnection) { self.dropConnection() }
         }
+        queue.asyncAfter(deadline: .now() + helloTimeout) { [weak self, weak newConnection] in
+            guard let self, let newConnection else { return }
+            self.dropCandidate(newConnection)
+        }
         newConnection.start(queue: queue)
-        receiveMore()
+        receiveHello(on: newConnection)
+    }
+
+    private func dropCandidate(_ candidate: NWConnection) {
+        guard let index = candidates.firstIndex(where: { $0.connection === candidate }) else {
+            return
+        }
+        candidates.remove(at: index)
+        candidate.cancel()
+    }
+
+    /// Reads a candidate until its first message, which must be an
+    /// authenticated Hello. Only then may it replace the live connection.
+    private func receiveHello(on candidate: NWConnection) {
+        candidate.receive(minimumIncompleteLength: 1, maximumLength: 65536) {
+            [weak self, weak candidate] data, _, isComplete, error in
+            guard let self, let candidate,
+                  let index = self.candidates.firstIndex(where: { $0.connection === candidate })
+            else { return }
+            if let data { self.candidates[index].buffer.append(data) }
+            switch Self.helloFrame(in: self.candidates[index].buffer) {
+            case .incomplete:
+                if isComplete || error != nil {
+                    self.dropCandidate(candidate)
+                } else {
+                    self.receiveHello(on: candidate)
+                }
+            case .invalid:
+                self.dropCandidate(candidate)
+            case .hello(let payload, let remaining):
+                self.candidates.remove(at: index)
+                let verdict = Self.helloVerdict(payload, token: self.token)
+                guard case .accept(let sessionId, let renderer) = verdict else {
+                    if case .refuse(let reason) = verdict { self.onProtocolError?(reason) }
+                    candidate.cancel()
+                    return
+                }
+                self.promote(candidate, sessionId: sessionId, renderer: renderer,
+                             remaining: remaining)
+                if isComplete || error != nil {
+                    self.dropConnection()
+                } else {
+                    self.receiveMore()
+                }
+            }
+        }
+    }
+
+    enum HelloFrame: Equatable {
+        case incomplete
+        /// The first message is malformed or not a Hello.
+        case invalid
+        case hello(payload: Data, remaining: Data)
+    }
+
+    static func helloFrame(in buffer: Data) -> HelloFrame {
+        guard buffer.count >= 6 else { return .incomplete }
+        let length = Int(buffer.readU32(at: 0))
+        guard length >= 2, length <= maxMessageLength,
+              buffer.readU16(at: 4) == MessageType.hello.rawValue else {
+            return .invalid
+        }
+        guard buffer.count >= 4 + length else { return .incomplete }
+        let start = buffer.startIndex
+        return .hello(
+            payload: buffer.subdata(in: (start + 6)..<(start + 4 + length)),
+            remaining: buffer.subdata(in: (start + 4 + length)..<buffer.endIndex))
+    }
+
+    private func promote(_ candidate: NWConnection, sessionId: UInt64, renderer: String,
+                         remaining: Data) {
+        dropConnection()
+        connection = candidate
+        receiveBuffer = remaining
+        completeHello(sessionId: sessionId, renderer: renderer)
+        if !drainMessages() { dropConnection() }
     }
 
     /// Runs `body` on `queue` only while `expected` is still the live
@@ -643,11 +731,7 @@ public final class RuntimeLink: @unchecked Sendable {
     }
 
     private func handle(type: UInt16, payload: Data) -> Bool {
-        guard let message = MessageType(rawValue: type) else { return false }
-        if !helloDone {
-            guard message == .hello else { return false }
-            return handleHello(payload)
-        }
+        guard helloDone, let message = MessageType(rawValue: type) else { return false }
         switch message {
         case .createSwapchain: return handleCreateSwapchain(payload)
         case .destroySwapchain: return handleDestroySwapchain(payload)
@@ -661,12 +745,7 @@ public final class RuntimeLink: @unchecked Sendable {
         }
     }
 
-    private func handleHello(_ payload: Data) -> Bool {
-        let verdict = Self.helloVerdict(payload, token: token)
-        guard case .accept(let sessionId, let renderer) = verdict else {
-            if case .refuse(let reason) = verdict { onProtocolError?(reason) }
-            return false
-        }
+    private func completeHello(sessionId: UInt64, renderer: String) {
         helloDone = true
         var ack = Data()
         ack.appendU16(Self.protocolVersion)
@@ -686,7 +765,6 @@ public final class RuntimeLink: @unchecked Sendable {
         if let latestControllerMaskPayload {
             send(type: .controllerMask, payload: latestControllerMaskPayload)
         }
-        return true
     }
 
     enum HelloVerdict: Equatable {

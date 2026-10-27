@@ -71,6 +71,8 @@ All notable changes to BasaltVR are documented here.
 - Out-of-range headset values (encoding gamma, latency statistics, IPD/FOV calibration, button
   path or controller profile 0) are ignored instead of crashing the streamer or making the runtime
   drop its control connection.
+- A restarted OpenXR session can replace the runtime connection before the old one closes, and a
+  connection that never sends its Hello is dropped after 5 seconds.
 
 ### Project maintenance
 

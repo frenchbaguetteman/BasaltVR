@@ -265,82 +265,146 @@ final class RuntimeLinkTests: XCTestCase {
         XCTAssertNil(payload(left: AlvrFov(left: -1, right: 1, up: 1, down: -1.6)))
     }
 
-    func testControllerSendSelectionAlternatesWhenBothHandsStayPending() throws {
-        var preferred = AlvrHand.left
-        var selected = [AlvrHand]()
-        for _ in 0..<6 {
-            let selection = try XCTUnwrap(RuntimeLink.controllerSendSelection(
-                pending: [.left, .right], preferred: preferred))
-            selected.append(selection.hand)
-            preferred = selection.next
-        }
-        XCTAssertEqual(selected, [.left, .right, .left, .right, .left, .right])
+    func testHelloFrameWaitsForAWholeHelloAndKeepsLaterBytes() {
+        var frame = Data()
+        frame.appendTestU32(2 + 3)
+        frame.appendTestU16(RuntimeLink.MessageType.hello.rawValue)
+        frame.append(contentsOf: [7, 8, 9])
+        XCTAssertEqual(RuntimeLink.helloFrame(in: frame.prefix(5)), .incomplete)
+        XCTAssertEqual(RuntimeLink.helloFrame(in: frame.prefix(8)), .incomplete)
+        XCTAssertEqual(RuntimeLink.helloFrame(in: frame + Data([1, 2])),
+                       .hello(payload: Data([7, 8, 9]), remaining: Data([1, 2])))
 
-        let rightOnly = try XCTUnwrap(RuntimeLink.controllerSendSelection(
-            pending: [.right], preferred: .left))
-        XCTAssertEqual(rightOnly.hand, .right)
-        XCTAssertEqual(rightOnly.next, .left)
+        var teardown = Data()
+        teardown.appendTestU32(2)
+        teardown.appendTestU16(RuntimeLink.MessageType.teardown.rawValue)
+        XCTAssertEqual(RuntimeLink.helloFrame(in: teardown), .invalid)
+        var oversized = Data()
+        oversized.appendTestU32(UInt32(RuntimeLink.maxMessageLength + 1))
+        oversized.appendTestU16(RuntimeLink.MessageType.hello.rawValue)
+        XCTAssertEqual(RuntimeLink.helloFrame(in: oversized), .invalid)
     }
 
-    func testButtonPayloadCacheCoalescesAndEnforcesCapacity() {
-        var payloads: [UInt64: Data] = [:]
-        for pathID in UInt64(1)...UInt64(RuntimeLink.maximumRetainedButtonPaths) {
-            XCTAssertTrue(RuntimeLink.retainButtonPayload(
-                pathID: pathID, payload: Data([UInt8(pathID)]), in: &payloads))
-        }
-        XCTAssertEqual(payloads.count, RuntimeLink.maximumRetainedButtonPaths)
-        XCTAssertFalse(RuntimeLink.retainButtonPayload(
-            pathID: 65, payload: Data([65]), in: &payloads))
+    func testAuthenticatedHelloReplacesSessionAndSilentConnectionsTimeOut() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("basalt-\(UUID().uuidString).control").path
+        let link = try RuntimeLink(controlFilePath: path)
+        link.helloTimeout = .milliseconds(300)
+        let events = RuntimeLinkEventLog()
+        link.onHello = { sessionId, _ in events.append("hello \(sessionId)") }
+        link.onTeardown = { events.append("teardown") }
+        try await link.start()
+        defer { link.stop() }
 
-        XCTAssertTrue(RuntimeLink.retainButtonPayload(
-            pathID: 1, payload: Data([99]), in: &payloads))
-        XCTAssertEqual(payloads.count, RuntimeLink.maximumRetainedButtonPaths)
-        XCTAssertEqual(payloads[1], Data([99]))
+        let fields = try String(contentsOfFile: path, encoding: .utf8)
+            .split(separator: " ")
+        let port = try XCTUnwrap(UInt16(fields[0]))
+        let token = String(fields[1].trimmingCharacters(in: .whitespacesAndNewlines))
+
+        // A silent local connection must not block the runtime.
+        let silent = try Self.connectLoopback(port: port)
+        defer { close(silent) }
+        let first = try Self.connectLoopback(port: port)
+        defer { close(first) }
+        try Self.sendHello(on: first, token: token, sessionId: 1)
+        XCTAssertEqual(try Self.receiveMessageType(from: first),
+                       RuntimeLink.MessageType.helloAck.rawValue)
+
+        // Without the token, a connection cannot displace the session.
+        let intruder = try Self.connectLoopback(port: port)
+        defer { close(intruder) }
+        try Self.sendHello(on: intruder, token: String(repeating: "0", count: 32), sessionId: 9)
+        XCTAssertNil(try Self.receiveMessageType(from: intruder))
+
+        // A restarted OpenXR session may connect before the old EOF arrives.
+        let second = try Self.connectLoopback(port: port)
+        defer { close(second) }
+        try Self.sendHello(on: second, token: token, sessionId: 2)
+        XCTAssertEqual(try Self.receiveMessageType(from: second),
+                       RuntimeLink.MessageType.helloAck.rawValue)
+        XCTAssertNil(try Self.receiveMessageType(from: first))
+        let deadline = Date().addingTimeInterval(1)
+        while events.snapshot().count < 3, Date() < deadline { usleep(1_000) }
+        XCTAssertEqual(events.snapshot(), ["hello 1", "teardown", "hello 2"])
+
+        // The silent connection was closed by the Hello deadline.
+        XCTAssertNil(try Self.receiveMessageType(from: silent))
     }
 
-    func testHelloRejectionExplainsStaleRuntimeBuilds() throws {
-        let token = String(repeating: "b", count: RuntimeLink.tokenLength)
-        func hello(version: UInt16, token: String, renderer: String = "Apple M3 Max") -> Data {
-            var payload = Data()
-            payload.appendTestU16(version)
-            payload.append(Data(token.utf8))
-            payload.appendTestU64(131_072)
-            payload.appendTestU16(UInt16(renderer.utf8.count))
-            payload.append(Data(renderer.utf8))
-            return payload
+    private static func connectLoopback(port: UInt16) throws -> Int32 {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw BasaltError("socket() failed") }
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        var noSigPipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
         }
-
-        XCTAssertEqual(RuntimeLink.helloVerdict(
-            hello(version: RuntimeLink.protocolVersion, token: token), token: token),
-            .accept(sessionId: 131_072, renderer: "Apple M3 Max"))
-
-        // An older bottle DLL is the black-headset case: name both versions.
-        guard case .refuse(let stale) = RuntimeLink.helloVerdict(
-            hello(version: RuntimeLink.protocolVersion - 2, token: token), token: token) else {
-            return XCTFail("a stale authenticated runtime must be reported")
+        guard result == 0 else {
+            close(fd)
+            throw BasaltError("connect() failed")
         }
-        XCTAssertTrue(stale.contains("v\(RuntimeLink.protocolVersion - 2)"))
-        XCTAssertTrue(stale.contains("v\(RuntimeLink.protocolVersion)"))
-        XCTAssertTrue(stale.contains("make runtime-build"))
+        return fd
+    }
 
-        // Without the token, nothing is reported: an arbitrary local process
-        // must not be able to raise the stale-runtime alert.
-        let wrongToken = String(repeating: "c", count: RuntimeLink.tokenLength)
-        XCTAssertEqual(
-            RuntimeLink.helloVerdict(
-                hello(version: RuntimeLink.protocolVersion, token: wrongToken), token: token),
-            .ignore)
-        XCTAssertEqual(
-            RuntimeLink.helloVerdict(
-                hello(version: RuntimeLink.protocolVersion - 2, token: wrongToken), token: token),
-            .ignore)
-        XCTAssertEqual(RuntimeLink.helloVerdict(Data([1]), token: token), .ignore)
+    private static func sendHello(on fd: Int32, token: String, sessionId: UInt64) throws {
+        var payload = Data()
+        payload.appendTestU16(RuntimeLink.protocolVersion)
+        payload.append(Data(token.utf8))
+        payload.appendTestU64(sessionId)
+        payload.appendTestU16(0)
+        var message = Data()
+        message.appendTestU32(UInt32(2 + payload.count))
+        message.appendTestU16(RuntimeLink.MessageType.hello.rawValue)
+        message.append(payload)
+        let sent = message.withUnsafeBytes { send(fd, $0.baseAddress, message.count, 0) }
+        guard sent == message.count else { throw BasaltError("Hello send failed") }
+    }
 
-        var truncated = hello(version: RuntimeLink.protocolVersion, token: token)
-        truncated.removeLast()
-        XCTAssertEqual(
-            RuntimeLink.helloVerdict(truncated, token: token),
-            .refuse("runtime sent a malformed Hello"))
+    /// The next message's type, or nil once the link closed the connection.
+    private static func receiveMessageType(from fd: Int32) throws -> UInt16? {
+        func receive(_ count: Int) throws -> Data? {
+            var bytes = [UInt8](repeating: 0, count: count)
+            var offset = 0
+            while offset < count {
+                let received = bytes[offset...].withUnsafeMutableBytes {
+                    recv(fd, $0.baseAddress, $0.count, 0)
+                }
+                if received == 0 || (received < 0 && errno == ECONNRESET) { return nil }
+                guard received > 0 else { throw BasaltError("recv timed out") }
+                offset += received
+            }
+            return Data(bytes)
+        }
+        guard let header = try receive(6) else { return nil }
+        let length = Int(header.readTestU32(at: 0))
+        guard try receive(max(0, length - 2)) != nil else { return nil }
+        return UInt16(header[4]) | (UInt16(header[5]) << 8)
+    }
+}
+
+private final class RuntimeLinkEventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [String] = []
+
+    func append(_ event: String) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
+    }
+
+    func snapshot() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
     }
 }
 
