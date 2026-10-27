@@ -89,6 +89,24 @@ struct BasaltStreamerApp {
     }
 
     static func run(_ options: StreamerOptions) async throws {
+        // Handle SIGINT/SIGTERM from the start: --route-audio switches the Mac
+        // output and --wired opens adb forwards before the headset handshake,
+        // and the manager may stop a session that never finished starting.
+        let shutdown = ShutdownSignals()
+        let systemState = SystemStateRestorer()
+        do {
+            try await runSession(options, shutdown: shutdown, systemState: systemState)
+        } catch {
+            systemState.restore()
+            throw error
+        }
+    }
+
+    private static func runSession(
+        _ options: StreamerOptions,
+        shutdown: ShutdownSignals,
+        systemState: SystemStateRestorer
+    ) async throws {
         // Runtime mode replaces desktop capture with frames the BasaltVR
         // OpenXR runtime submits over the control socket.
         let runtimeMode = options.runtimeControlFile != nil
@@ -128,13 +146,12 @@ struct BasaltStreamerApp {
             exit(1)
         }
         let alvrVideo = AlvrVideoStreamRouter()
-        var audioOutputRoute: GameAudioOutputRoute?
         var gameAudio: GameAudioCapture?
         if let audioDeviceName = options.audioDeviceName {
             if options.routeAudioToCaptureDevice {
                 let device = try GameAudioDeviceDiscovery.matchingInputDevice(audioDeviceName)
                 let route = try GameAudioOutputRoute(to: device)
-                audioOutputRoute = route
+                systemState.audioOutputRoute = route
                 print("Game audio output routed to \(device.name) for this session")
             }
             let capture = try GameAudioCapture(deviceNameContains: audioDeviceName)
@@ -301,7 +318,6 @@ struct BasaltStreamerApp {
         }
 
         var discovery: AlvrDiscoveryListener?
-        var wiredConnection: AlvrWiredConnection?
         if options.discover {
             let probeGate = AlvrControlProbeGate()
             discovery = try AlvrDiscoveryListener { beacon, ip in
@@ -334,8 +350,20 @@ struct BasaltStreamerApp {
             }
         } else if options.wired {
             let connection = try AlvrWiredConnection.setup()
-            wiredConnection = connection
+            systemState.wiredConnection = connection
             print("USB Quest \(connection.serial) is authorized; adb control/video forwards are ready.")
+        }
+
+        func tearDown() async {
+            print("\nShutting down…")
+            discovery?.stop()
+            runtimeLink?.stop()
+            gameAudio?.stop()
+            systemState.restore()
+            if !runtimeMode {
+                await capture.stop()
+            }
+            server.stop()
         }
 
         try await server.start()
@@ -343,17 +371,20 @@ struct BasaltStreamerApp {
             var lastError: Error?
             for attempt in 1...10 {
                 do {
-                    _ = try await connectHeadset(
-                        host: "127.0.0.1", expectedProtocolId: nil, wired: true,
-                        requestedViewWidth: negotiateViewWidth,
-                        requestedViewHeight: negotiateViewHeight,
-                        stereoComposer: stereoComposer, options: options,
-                        alvrVideo: alvrVideo,
-                        runtimeLink: runtimeLink,
-                        headsetLatencyReporter: headsetLatencyReporter,
-                        calibrationLogGate: calibrationLogGate,
-                        encoder: encoder,
-                        streamRecovery: streamRecovery)
+                    // nil (shutdown requested) also ends the retry loop.
+                    _ = try await shutdown.unlessRequested {
+                        try await connectHeadset(
+                            host: "127.0.0.1", expectedProtocolId: nil, wired: true,
+                            requestedViewWidth: negotiateViewWidth,
+                            requestedViewHeight: negotiateViewHeight,
+                            stereoComposer: stereoComposer, options: options,
+                            alvrVideo: alvrVideo,
+                            runtimeLink: runtimeLink,
+                            headsetLatencyReporter: headsetLatencyReporter,
+                            calibrationLogGate: calibrationLogGate,
+                            encoder: encoder,
+                            streamRecovery: streamRecovery)
+                    }
                     lastError = nil
                     break
                 } catch {
@@ -361,12 +392,19 @@ struct BasaltStreamerApp {
                     if error is AlvrTrackingTimeoutError { break }
                     guard attempt < 10 else { break }
                     fputs("ALVR USB handshake attempt \(attempt) failed; retrying…\n", stderr)
-                    try await Task.sleep(nanoseconds: 500_000_000)
+                    let slept: Void? = try await shutdown.unlessRequested {
+                        try await Task.sleep(nanoseconds: 500_000_000)
+                    }
+                    if slept == nil { break }
                 }
             }
-            if let lastError {
+            if let lastError, !shutdown.isRequested {
                 throw BasaltError("Could not start wired ALVR session: \(lastError.localizedDescription)")
             }
+        }
+        guard !shutdown.isRequested else {
+            await tearDown()
+            return
         }
         if let runtimeLink {
             try await runtimeLink.start()
@@ -412,25 +450,8 @@ struct BasaltStreamerApp {
         // Capture and networking run on their own queues; park main until
         // SIGINT/SIGTERM, then tear down cleanly (stops the capture stream
         // and closes client sockets instead of dying mid-write).
-        await ShutdownSignals().wait()
-        print("\nShutting down…")
-        discovery?.stop()
-        runtimeLink?.stop()
-        gameAudio?.stop()
-        if let audioOutputRoute {
-            do {
-                try audioOutputRoute.restore()
-                print("Restored the previous Mac audio output")
-            } catch {
-                fputs("Could not restore the previous Mac audio output: "
-                    + "\(error.localizedDescription)\n", stderr)
-            }
-        }
-        if !runtimeMode {
-            await capture.stop()
-        }
-        server.stop()
-        wiredConnection?.stop()
+        await shutdown.wait()
+        await tearDown()
     }
 
     private static func connectHeadset(
@@ -899,33 +920,112 @@ private final class CalibrationLogGate: @unchecked Sendable {
     }
 }
 
-/// Suspends until the process receives SIGINT or SIGTERM.
+/// Observes SIGINT and SIGTERM from creation, so a signal that arrives
+/// while the session is still starting is never lost.
 private final class ShutdownSignals: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<Void, Never>?
+    private var requested = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
     private var sources: [DispatchSourceSignal] = []
 
+    init() {
+        for signalNumber in [SIGINT, SIGTERM] {
+            signal(signalNumber, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(
+                signal: signalNumber, queue: .global())
+            source.setEventHandler { [weak self] in self?.fire() }
+            source.resume()
+            sources.append(source)
+        }
+    }
+
+    var isRequested: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return requested
+    }
+
+    /// Suspends until shutdown is requested; returns at once if it already was.
     func wait() async {
         await withCheckedContinuation { continuation in
             lock.lock()
-            self.continuation = continuation
+            guard !requested else {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            waiters.append(continuation)
             lock.unlock()
-            for signalNumber in [SIGINT, SIGTERM] {
-                signal(signalNumber, SIG_IGN)
-                let source = DispatchSource.makeSignalSource(
-                    signal: signalNumber, queue: .global())
-                source.setEventHandler { [weak self] in self?.fire() }
-                source.resume()
-                sources.append(source)
+        }
+    }
+
+    /// Runs `operation` until it finishes, or returns nil as soon as shutdown
+    /// is requested. The operation is then cancelled and abandoned: blocking
+    /// handshake sockets do not observe cancellation, and the process exits
+    /// once teardown completes.
+    func unlessRequested<T>(_ operation: @escaping () async throws -> T) async throws -> T? {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T?, Error>) in
+            let outcome = FirstOutcome(continuation)
+            let task = Task {
+                do {
+                    outcome.resume(with: .success(try await operation()))
+                } catch {
+                    outcome.resume(with: .failure(error))
+                }
+            }
+            Task {
+                await self.wait()
+                task.cancel()
+                outcome.resume(with: .success(nil))
             }
         }
     }
 
     private func fire() {
         lock.lock()
+        requested = true
+        let waiters = self.waiters
+        self.waiters.removeAll()
+        lock.unlock()
+        for waiter in waiters { waiter.resume() }
+    }
+}
+
+/// Resumes a continuation with whichever result arrives first.
+private final class FirstOutcome<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Error>?
+
+    init(_ continuation: CheckedContinuation<T, Error>) {
+        self.continuation = continuation
+    }
+
+    func resume(with result: Result<T, Error>) {
+        lock.lock()
         let continuation = self.continuation
         self.continuation = nil
         lock.unlock()
-        continuation?.resume()
+        continuation?.resume(with: result)
+    }
+}
+
+/// Mac state a session changes outside this process. Restored on every exit
+/// path, including a startup that failed or was interrupted.
+private final class SystemStateRestorer: @unchecked Sendable {
+    var audioOutputRoute: GameAudioOutputRoute?
+    var wiredConnection: AlvrWiredConnection?
+
+    func restore() {
+        if let audioOutputRoute {
+            self.audioOutputRoute = nil
+            do {
+                try audioOutputRoute.restore()
+                print("Restored the previous Mac audio output")
+            } catch {
+                fputs("Could not restore the previous Mac audio output: "
+                    + "\(error.localizedDescription)\n", stderr)
+            }
+        }
+        wiredConnection?.stop()
     }
 }
