@@ -48,7 +48,15 @@ shows the session state with a Stop button.
    with the Steam identity and BSIPA `winhttp` override already set. Toolbar search plus VR-only and tool
    filters are included; playable games sort first in each section. Existing profiles and direct Beat Saber detections appear alongside Steam
    and BSManager games. Steam games in a managed bottle can become `-applaunch APP_ID` profiles
-   without re-entering paths.
+   without re-entering paths. **Add Game…** (toolbar, `plus`) adds any other Windows game, such as
+   one from GOG or itch.io: pick a Basalt bottle and the game's `.exe` inside its `drive_c` (install
+   it first with Bottles → ⋯ → Run Windows Installer…). The name comes from the game folder,
+   skipping build folders such as `Binaries/Win64` or `bin/win64`. The source is itch.io when a
+   folder inside `drive_c` is named for it (the itch app's `itch\apps`, or `Itch Games`), else
+   Direct. Optional arguments are split on spaces, without
+   quotes. The game folder becomes the working directory and the profile's game folder
+   (`gameRoot`). SteamVR games still need OpenComposite from the profile editor; native OpenXR
+   games do not. It is the same profile as `basaltctl profile add`.
 4. **Profiles** can edit their source, Windows executable, working directory, arguments, and
    environment, or be deleted without removing the game. OpenComposite installation is available
    from the profile editor while keeping the separately supplied DLL inside the managed prefix.

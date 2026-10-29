@@ -354,7 +354,8 @@ struct FlowLayout: Layout {
 @MainActor
 enum FilePanels {
     static func chooseFile(
-        title: String, message: String? = nil, extensions: [String]
+        title: String, message: String? = nil, extensions: [String],
+        startingAt directory: URL? = nil
     ) -> URL? {
         let panel = NSOpenPanel()
         panel.title = title
@@ -362,6 +363,7 @@ enum FilePanels {
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
+        panel.directoryURL = directory
         panel.allowedContentTypes = extensions.compactMap {
             UTType(filenameExtension: $0)
         }

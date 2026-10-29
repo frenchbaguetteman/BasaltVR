@@ -27,6 +27,7 @@ enum LibrarySheet: Identifiable {
     case importBottle(DiscoveredBottle)
     case chooseBottle(BSManagerInstance)
     case installBSManager(URL)
+    case addGame
     case edit(LaunchProfile)
     case settings(String)
 
@@ -35,6 +36,7 @@ enum LibrarySheet: Identifiable {
         case .importBottle(let bottle): "import-\(bottle.id)"
         case .chooseBottle(let instance): "choose-bottle-\(instance.id)"
         case .installBSManager(let url): "install-\(url.path)"
+        case .addGame: "add-game"
         case .edit(let profile): "edit-\(profile.name)"
         case .settings(let profileName): "settings-\(profileName)"
         }
@@ -166,6 +168,12 @@ struct LibraryView: View {
         .searchable(text: $search, placement: .toolbar, prompt: "Search games or bottles")
         .toolbar {
             ToolbarItem {
+                Button { sheet = .addGame } label: {
+                    Label("Add Game…", systemImage: "plus")
+                }
+                .help("Add a Windows game from any folder in a Basalt bottle")
+            }
+            ToolbarItem {
                 Menu {
                     Toggle("VR Games Only", isOn: $vrOnly)
                     Toggle("Show Steam Tools", isOn: $showTools)
@@ -187,6 +195,8 @@ struct LibraryView: View {
                 BSManagerBottleSheet(instance: instance, model: model)
             case .installBSManager(let installer):
                 BSManagerInstallerSheet(installer: installer, model: model)
+            case .addGame:
+                AddGameSheet(model: model)
             case .edit(let profile):
                 ProfileEditorSheet(profile: profile, model: model)
             case .settings(let profileName):

@@ -160,7 +160,7 @@ struct ProfileEditorSheet: View {
             executable: executable.trimmingCharacters(in: .whitespacesAndNewlines),
             arguments: arguments.components(separatedBy: .newlines).filter { !$0.isEmpty },
             workingDirectory: workingDirectory.isEmpty ? nil : workingDirectory,
-            environment: values)
+            environment: values, gameRoot: profile.gameRoot)
         Task { await model.updateProfile(updated); dismiss() }
     }
 
@@ -354,6 +354,142 @@ struct BSManagerBottleSheet: View {
             if selectedBottle.isEmpty {
                 selectedBottle = instance.bottleName
                     ?? (model.bottles.count == 1 ? model.bottles[0].name : "")
+            }
+        }
+    }
+}
+
+/// Creates a launch profile for a Windows game Basalt does not find on its
+/// own: GOG, itch.io, or anything installed with a plain installer.
+struct AddGameSheet: View {
+    @ObservedObject var model: BasaltAppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedBottle = ""
+    @State private var executable: URL?
+    @State private var name = ""
+    @State private var source = LaunchSource.direct
+    @State private var arguments = ""
+    @State private var isAdding = false
+
+    private var bottle: ManagedBottle? {
+        model.bottles.first { $0.name == selectedBottle }
+    }
+
+    private var prefix: URL? {
+        bottle.map { URL(fileURLWithPath: $0.prefixPath, isDirectory: true) }
+    }
+
+    /// The chosen exe is not on the chosen bottle's C: drive.
+    private var isOutsideBottle: Bool {
+        guard let executable, let prefix else { return false }
+        return !ManualGame.isInstalled(executable, inPrefix: prefix)
+    }
+
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        SheetScaffold(
+            symbol: "plus.app",
+            title: "Add Game",
+            subtitle: "A Windows game from GOG, itch.io, or any installer."
+        ) {
+            if model.bottles.isEmpty {
+                ContentUnavailableView(
+                    "No Basalt bottle",
+                    systemImage: "shippingbox",
+                    description: Text("Create a bottle and install the game in it before adding the game."))
+                    .frame(maxHeight: .infinity)
+            } else {
+                Form {
+                    Section {
+                        BottlePicker(selection: $selectedBottle, bottles: model.bottles)
+                        LabeledContent("Game") {
+                            HStack(spacing: 8) {
+                                if let executable {
+                                    PathText(path: executable.path)
+                                }
+                                Button("Choose Game…") { chooseGame() }
+                                    .disabled(bottle == nil)
+                            }
+                        }
+                        if isOutsideBottle {
+                            Label("The game must be installed in the \(selectedBottle) bottle first. Use Bottles → ⋯ → Run Windows Installer…, then choose the game's .exe in the bottle's drive_c folder.",
+                                  systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } footer: {
+                        Text("Choose the game's .exe in the bottle's drive_c folder.")
+                            .formFooterStyle()
+                    }
+
+                    Section {
+                        TextField("Name", text: $name, prompt: Text("Game name"))
+                        Picker("Source", selection: $source) {
+                            Text("Direct").tag(LaunchSource.direct)
+                            Text("itch.io").tag(LaunchSource.itch)
+                        }
+                        TextField("Arguments", text: $arguments, prompt: Text("Optional"))
+                            .font(.body.monospaced())
+                    } footer: {
+                        Text("Separate arguments with spaces. Quotes are not parsed, so an argument cannot contain a space.")
+                            .formFooterStyle()
+                    }
+
+                    Section {
+                        Label("SteamVR games also need OpenComposite: after adding, open Edit Launch Profile… → OpenComposite → Install…. Native OpenXR games don't.",
+                              systemImage: "info.circle")
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+                .formStyle(.grouped)
+                .disabled(isAdding)
+            }
+        } actions: {
+            Spacer()
+            Button("Cancel") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+                .disabled(isAdding)
+            Button("Add Game") { add() }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .disabled(bottle == nil || executable == nil || isOutsideBottle
+                          || trimmedName.isEmpty || isAdding)
+        }
+        .frame(width: 600, height: 520)
+        .interactiveDismissDisabled(isAdding)
+        .onAppear {
+            if selectedBottle.isEmpty, model.bottles.count == 1 {
+                selectedBottle = model.bottles[0].name
+            }
+        }
+    }
+
+    private func chooseGame() {
+        guard let prefix, let url = FilePanels.chooseFile(
+            title: "Choose the Game's Windows Executable",
+            message: "Select the game's .exe inside the bottle's drive_c folder.",
+            extensions: ["exe"],
+            startingAt: prefix.appendingPathComponent("drive_c", isDirectory: true))
+        else { return }
+        executable = url
+        name = ManualGame.suggestedName(for: url)
+        source = ManualGame.inferredSource(for: url)
+    }
+
+    private func add() {
+        guard let bottle, let executable else { return }
+        isAdding = true
+        Task {
+            if await model.createGameProfile(
+                named: trimmedName, executable: executable, source: source,
+                arguments: ManualGame.arguments(from: arguments), in: bottle) {
+                dismiss()
+            } else {
+                isAdding = false
             }
         }
     }

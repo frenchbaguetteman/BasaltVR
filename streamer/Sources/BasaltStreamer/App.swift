@@ -83,7 +83,9 @@ struct BasaltStreamerApp {
             try await run(options)
         } catch {
             fputs("error: \(error.localizedDescription)\n", stderr)
-            fputs("(If this is a capture error, grant Screen Recording permission to your terminal in System Settings → Privacy & Security.)\n", stderr)
+            if let hint = ScreenCaptureError.permissionHint(for: error) {
+                fputs(hint + "\n", stderr)
+            }
             exit(1)
         }
     }
