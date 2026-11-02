@@ -151,10 +151,19 @@ bool prepareSwapchainViewForExport(
 // number on the caller's thread (must be the xrEndFrame thread, which owns
 // the immediate context per XR_KHR_D3D11_enable), and a waiter thread sends
 // the message only after the fence completes (Phase 1 frame-done contract).
-void controlFrameReady(
+// exportViews runs prepareSwapchainViewForExport on application views; the
+// compositor passes false for its already-exported output images. Returns
+// the queued frame number, or 0 when nothing was queued.
+uint64_t controlFrameReady(
     int64_t displayTime,
     uint64_t questTrackingTimestampNanoseconds,
     const ControlFrameView* views,
-    uint32_t viewCount);
+    uint32_t viewCount,
+    bool exportViews);
+
+// Blocks until the daemon has consumed frameNumber (finished its Metal reads
+// of that frame's surfaces), so a runtime-owned image can be redrawn. False
+// on disconnect or timeout; frameNumber 0 returns true immediately.
+bool controlWaitForFrameConsumed(XrSession session, uint64_t frameNumber);
 
 }  // namespace basalt

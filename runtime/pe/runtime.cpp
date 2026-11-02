@@ -16,6 +16,22 @@ SRWLOCK gInstanceLock = SRWLOCK_INIT;
 uintptr_t gNextInstanceHandle = kFirstInstanceHandle;
 XrInstance gLiveInstance = XR_NULL_HANDLE;
 bool gD3D11ExtensionEnabled = false;
+bool gVisibilityMaskExtensionEnabled = false;
+
+struct ExtensionDefinition {
+    const char* name;
+    uint32_t version;
+};
+
+// Every extension needs a session, and sessions need D3D11, so all of them
+// are hidden together when the D3D11 capability gate fails.
+// XR_KHR_visibility_mask is implemented purely in software.
+constexpr ExtensionDefinition kExtensions[] = {
+    {XR_KHR_D3D11_ENABLE_EXTENSION_NAME, XR_KHR_D3D11_enable_SPEC_VERSION},
+    {XR_KHR_VISIBILITY_MASK_EXTENSION_NAME, XR_KHR_visibility_mask_SPEC_VERSION},
+};
+constexpr uint32_t kExtensionCount =
+    static_cast<uint32_t>(sizeof(kExtensions) / sizeof(kExtensions[0]));
 
 XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
     const char* layerName,
@@ -29,29 +45,30 @@ XrResult XRAPI_CALL basaltEnumerateInstanceExtensionProperties(
         return XR_ERROR_API_LAYER_NOT_PRESENT;
     }
 
-    const bool d3d11Available = basalt::isD3D11RuntimeAvailable();
-    *propertyCountOutput = d3d11Available ? 1 : 0;
+    const uint32_t count = basalt::isD3D11RuntimeAvailable() ? kExtensionCount : 0;
+    *propertyCountOutput = count;
     if (propertyCapacityInput == 0) {
         return XR_SUCCESS;
     }
     if (properties == nullptr) {
         return XR_ERROR_VALIDATION_FAILURE;
     }
-    if (!d3d11Available) {
-        return XR_SUCCESS;
-    }
-    if (propertyCapacityInput < 1) {
+    if (propertyCapacityInput < count) {
         return XR_ERROR_SIZE_INSUFFICIENT;
     }
-    if (properties[0].type != XR_TYPE_EXTENSION_PROPERTIES) {
-        return XR_ERROR_VALIDATION_FAILURE;
+    for (uint32_t index = 0; index < count; ++index) {
+        if (properties[index].type != XR_TYPE_EXTENSION_PROPERTIES) {
+            return XR_ERROR_VALIDATION_FAILURE;
+        }
     }
-    std::strncpy(
-        properties[0].extensionName,
-        XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
-        XR_MAX_EXTENSION_NAME_SIZE - 1);
-    properties[0].extensionName[XR_MAX_EXTENSION_NAME_SIZE - 1] = '\0';
-    properties[0].extensionVersion = XR_KHR_D3D11_enable_SPEC_VERSION;
+    for (uint32_t index = 0; index < count; ++index) {
+        std::strncpy(
+            properties[index].extensionName,
+            kExtensions[index].name,
+            XR_MAX_EXTENSION_NAME_SIZE - 1);
+        properties[index].extensionName[XR_MAX_EXTENSION_NAME_SIZE - 1] = '\0';
+        properties[index].extensionVersion = kExtensions[index].version;
+    }
     return XR_SUCCESS;
 }
 
@@ -104,13 +121,17 @@ XrResult XRAPI_CALL basaltCreateInstance(
         return XR_ERROR_API_VERSION_UNSUPPORTED;
     }
     bool enableD3D11 = false;
+    bool enableVisibilityMask = false;
     for (uint32_t index = 0; index < createInfo->enabledExtensionCount; ++index) {
         const char* extensionName = createInfo->enabledExtensionNames[index];
         if (extensionName == nullptr) {
             std::fprintf(stderr, "Basalt OpenXR: null enabled extension name at index %u\n", index);
             return XR_ERROR_VALIDATION_FAILURE;
         }
-        if (std::strcmp(extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) != 0) {
+        const bool isD3D11 = std::strcmp(extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0;
+        const bool isVisibilityMask =
+            std::strcmp(extensionName, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0;
+        if (!isD3D11 && !isVisibilityMask) {
             std::fprintf(stderr, "Basalt OpenXR: unsupported enabled extension '%s'\n", extensionName);
             return XR_ERROR_EXTENSION_NOT_PRESENT;
         }
@@ -118,7 +139,8 @@ XrResult XRAPI_CALL basaltCreateInstance(
             std::fprintf(stderr, "Basalt OpenXR: D3D11 runtime support is unavailable\n");
             return XR_ERROR_EXTENSION_NOT_PRESENT;
         }
-        enableD3D11 = true;
+        enableD3D11 = enableD3D11 || isD3D11;
+        enableVisibilityMask = enableVisibilityMask || isVisibilityMask;
     }
 
     AcquireSRWLockExclusive(&gInstanceLock);
@@ -132,6 +154,7 @@ XrResult XRAPI_CALL basaltCreateInstance(
     }
     gLiveInstance = reinterpret_cast<XrInstance>(gNextInstanceHandle);
     gD3D11ExtensionEnabled = enableD3D11;
+    gVisibilityMaskExtensionEnabled = enableVisibilityMask;
     gNextInstanceHandle += kInstanceHandleStride;
     *instance = gLiveInstance;
     ReleaseSRWLockExclusive(&gInstanceLock);
@@ -150,6 +173,7 @@ XrResult XRAPI_CALL basaltDestroyInstance(XrInstance instance) {
     }
     gLiveInstance = XR_NULL_HANDLE;
     gD3D11ExtensionEnabled = false;
+    gVisibilityMaskExtensionEnabled = false;
     ReleaseSRWLockExclusive(&gInstanceLock);
     basalt::invalidateSessionForInstance(instance);
     basalt::invalidateInputForInstance(instance);
@@ -268,6 +292,16 @@ bool isD3D11ExtensionEnabled(XrInstance instance) {
     return enabled;
 }
 
+bool isVisibilityMaskExtensionEnabled(XrInstance instance) {
+    if (instance == XR_NULL_HANDLE) {
+        return false;
+    }
+    AcquireSRWLockShared(&gInstanceLock);
+    const bool enabled = instance == gLiveInstance && gVisibilityMaskExtensionEnabled;
+    ReleaseSRWLockShared(&gInstanceLock);
+    return enabled;
+}
+
 XrResult XRAPI_CALL getInstanceProcAddr(
     XrInstance instance,
     const char* name,
@@ -355,6 +389,9 @@ XrResult XRAPI_CALL getInstanceProcAddr(
     } else if (std::strcmp(name, "xrGetD3D11GraphicsRequirementsKHR") == 0 &&
                isD3D11ExtensionEnabled(instance)) {
         *function = asVoidFunction(getD3D11GraphicsRequirements);
+    } else if (std::strcmp(name, "xrGetVisibilityMaskKHR") == 0 &&
+               isVisibilityMaskExtensionEnabled(instance)) {
+        *function = asVoidFunction(getVisibilityMask);
     } else if (std::strcmp(name, "xrCreateSession") == 0) {
         *function = asVoidFunction(createSession);
     } else if (std::strcmp(name, "xrDestroySession") == 0) {

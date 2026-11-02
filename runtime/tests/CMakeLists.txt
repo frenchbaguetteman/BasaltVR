@@ -56,6 +56,19 @@ target_compile_definitions(d3d11_runtime_smoke PRIVATE XR_USE_GRAPHICS_API_D3D11
 target_compile_options(d3d11_runtime_smoke PRIVATE -Wall -Wextra -Wpedantic)
 target_link_options(d3d11_runtime_smoke PRIVATE -static -static-libgcc -static-libstdc++)
 
+add_executable(d3d11_compositor_smoke d3d11_compositor_smoke.cpp)
+target_link_libraries(
+    d3d11_compositor_smoke
+    PRIVATE
+        OpenXR::openxr_loader
+        d3d11
+        dxgi
+        dxguid
+)
+target_compile_definitions(d3d11_compositor_smoke PRIVATE XR_USE_GRAPHICS_API_D3D11)
+target_compile_options(d3d11_compositor_smoke PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(d3d11_compositor_smoke PRIVATE -static -static-libgcc -static-libstdc++)
+
 add_executable(frame_timer_probe frame_timer_probe.cpp)
 target_compile_options(frame_timer_probe PRIVATE -Wall -Wextra -Wpedantic)
 target_link_options(frame_timer_probe PRIVATE -static -static-libgcc -static-libstdc++)
@@ -124,3 +137,7 @@ if(BASALT_BUILD_KHR_HELLO_XR)
     target_link_options(
         khr_hello_xr_d3d11 PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
+
+add_executable(opencomposite_frame_timing_smoke opencomposite_frame_timing_smoke.cpp)
+target_compile_options(opencomposite_frame_timing_smoke PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(opencomposite_frame_timing_smoke PRIVATE -static -static-libgcc -static-libstdc++)
