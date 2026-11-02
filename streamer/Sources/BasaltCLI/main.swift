@@ -70,7 +70,7 @@ private struct BasaltCLI {
       basaltctl [--root PATH] [--repo PATH] profile show NAME
       basaltctl [--root PATH] [--repo PATH] profile add NAME --bottle BOTTLE \
         --source direct|steam|bsmanager|itch --exe PATH [--cwd PATH] \
-        [--arg VALUE ...] [--env KEY=VALUE ...]
+        [--arg VALUE ...] [--env KEY=VALUE ...] [--game-root PATH]
       basaltctl [--root PATH] [--repo PATH] opencomposite install PROFILE \
         --artifact /path/openvr_api.dll --target /managed/prefix/.../openvr_api.dll
       basaltctl [--root PATH] [--repo PATH] run PROFILE --control-file PATH [-- ARG ...]
@@ -237,6 +237,7 @@ private struct BasaltCLI {
                     "profile add requires --bottle, a valid --source, and --exe")
             }
             let cwd = try cursor.value(after: "--cwd")
+            let gameRoot = try cursor.value(after: "--game-root")
             let arguments = try cursor.repeatedValues(after: "--arg")
             let environmentValues = try cursor.repeatedValues(after: "--env")
             var environment = [String: String]()
@@ -250,7 +251,8 @@ private struct BasaltCLI {
             let profile = LaunchProfile(
                 name: name, bottleName: bottle, source: source,
                 executable: executable, arguments: arguments,
-                workingDirectory: cwd, environment: environment)
+                workingDirectory: cwd, environment: environment,
+                gameRoot: gameRoot)
             try manager.saveProfile(profile)
             print("Saved launch profile '\(name)'")
         default:

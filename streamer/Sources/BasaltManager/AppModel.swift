@@ -351,6 +351,38 @@ final class BasaltAppModel: ObservableObject {
         }
     }
 
+    /// A launch profile for a Windows game chosen by hand (GOG, itch.io, or
+    /// any installer). Its folder becomes the profile's game folder
+    /// (`gameRoot`).
+    @discardableResult
+    func createGameProfile(
+        named title: String, executable: URL, source: LaunchSource,
+        arguments: [String], in bottle: ManagedBottle
+    ) async -> Bool {
+        let prefix = URL(fileURLWithPath: bottle.prefixPath, isDirectory: true)
+        let folder = executable.deletingLastPathComponent()
+        guard ManualGame.isInstalled(executable, inPrefix: prefix),
+              let windowsExecutable = ManualGame.windowsPath(for: executable, prefix: prefix),
+              let windowsFolder = ManualGame.windowsPath(for: folder, prefix: prefix) else {
+            alertMessage = "Install \(executable.lastPathComponent) in the \(bottle.name) bottle first."
+            return false
+        }
+        let name = uniqueProfileName(for: title)
+        do {
+            try manager.saveProfile(LaunchProfile(
+                name: name, bottleName: bottle.name, source: source,
+                executable: windowsExecutable,
+                arguments: arguments,
+                workingDirectory: folder.path,
+                gameRoot: windowsFolder))
+            await refresh()
+            return true
+        } catch {
+            alertMessage = error.localizedDescription
+            return false
+        }
+    }
+
     func profile(for instance: BSManagerInstance) -> LaunchProfile? {
         profiles.first { profile in
             guard profile.source == .bsmanager,
@@ -706,7 +738,8 @@ final class BasaltAppModel: ObservableObject {
                     self.stop()
                 }
             }
-            try game.run()
+            // Replaces attachOutput's /dev/null stdin: hello_xr quits at its EOF.
+            try HeldOpenStandardInput.run(game)
             gameProcess = game
             activeWineCommand = command
             activeLaunchID = nil
@@ -833,26 +866,11 @@ final class BasaltAppModel: ObservableObject {
     }
 
     private func sanitizedProfileName(_ value: String) -> String {
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
-        let mapped = value.lowercased().unicodeScalars.map {
-            allowed.contains($0) ? Character(String($0)) : "-"
-        }
-        let collapsed = String(mapped).replacingOccurrences(
-            of: "-+", with: "-", options: .regularExpression)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-._"))
-        return String((collapsed.isEmpty ? "game" : collapsed).prefix(56))
+        ProfileNaming.slug(value)
     }
 
     private func uniqueProfileName(for value: String) -> String {
-        let existingNames = Set(profiles.map { $0.name.lowercased() })
-        let base = sanitizedProfileName(value)
-        var name = base
-        var suffix = 2
-        while existingNames.contains(name.lowercased()) {
-            name = "\(base)-\(suffix)"
-            suffix += 1
-        }
-        return name
+        ProfileNaming.unique(value, existing: profiles.map(\.name))
     }
 
     private func persistSettings() {

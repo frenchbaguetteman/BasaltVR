@@ -175,6 +175,17 @@ final class BottleManagerTests: XCTestCase {
             environment: ["KEY": "VALUE"])
         XCTAssertEqual(try decoder.decode(
             LaunchProfile.self, from: encoder.encode(profile)), profile)
+
+        // gameRoot is optional: profiles saved before it existed still load.
+        let legacy = Data("""
+            {"formatVersion":1,"name":"lab","bottleName":"test","source":"steam",\
+            "executable":"C:\\\\Lab.exe","arguments":[],"environment":{}}
+            """.utf8)
+        XCTAssertNil(try decoder.decode(LaunchProfile.self, from: legacy).gameRoot)
+        var rooted = profile
+        rooted.gameRoot = #"C:\Program Files (x86)\Steam\steamapps\common\The Lab"#
+        XCTAssertEqual(try decoder.decode(
+            LaunchProfile.self, from: encoder.encode(rooted)).gameRoot, rooted.gameRoot)
     }
 
     func testProfileAndOpenCompositeInstallStayInsideManagedPrefix() throws {

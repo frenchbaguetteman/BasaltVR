@@ -2,6 +2,33 @@ import Foundation
 import ScreenCaptureKit
 import CoreMedia
 
+/// A desktop-capture (ScreenCaptureKit) failure. Only this kind of fatal error gets the
+/// Screen Recording hint; an adb or ALVR error does not.
+public struct ScreenCaptureError: LocalizedError {
+    public let underlying: Error
+
+    public init(_ underlying: Error) { self.underlying = underlying }
+
+    public var errorDescription: String? { underlying.localizedDescription }
+
+    /// The Screen Recording hint to print after `error`, or nil if it is not a capture error.
+    public static func permissionHint(for error: Error) -> String? {
+        guard error is ScreenCaptureError
+                || (error as NSError).domain == SCStreamErrorDomain else { return nil }
+        return "(Screen capture failed: grant Screen Recording permission to your terminal in System Settings → Privacy & Security.)"
+    }
+
+    static func wrapping<T>(_ body: () async throws -> T) async throws -> T {
+        do {
+            return try await body()
+        } catch let error as ScreenCaptureError {
+            throw error
+        } catch {
+            throw ScreenCaptureError(error)
+        }
+    }
+}
+
 /// Captures the main display with ScreenCaptureKit and hands raw frames
 /// (NV12 CVPixelBuffers) to `onFrame`.
 ///
@@ -35,6 +62,10 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Discovers the main display and configures the stream. Must be called
     /// before `start()`; `width`/`height` are valid afterwards.
     public func prepare(fps: Int) async throws {
+        try await ScreenCaptureError.wrapping { try await prepareStream(fps: fps) }
+    }
+
+    private func prepareStream(fps: Int) async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(
             false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else {
@@ -72,7 +103,7 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         // Clear any prior run before ScreenCaptureKit can begin delivering the
         // next run's surfaces.
         stopPacing()
-        try await stream.startCapture()
+        try await ScreenCaptureError.wrapping { try await stream.startCapture() }
         startPacing()
     }
 

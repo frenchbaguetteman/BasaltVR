@@ -83,11 +83,17 @@ public struct LaunchProfile: Codable, Equatable, Sendable {
     public var arguments: [String]
     public var workingDirectory: String?
     public var environment: [String: String]
+    /// Install folder of the game (a Windows path), for games whose executable
+    /// is not at the top of it (a launcher, or `bin/win64`). Prepare VR looks
+    /// for the game's OpenVR DLLs here. When nil, the `steamapps/common/<Game>`
+    /// folder of `executable` is used, or the executable's own folder.
+    public var gameRoot: String?
 
     public init(name: String, bottleName: String, source: LaunchSource,
                 executable: String, arguments: [String] = [],
                 workingDirectory: String? = nil,
-                environment: [String: String] = [:]) {
+                environment: [String: String] = [:],
+                gameRoot: String? = nil) {
         formatVersion = Self.currentFormatVersion
         self.name = name
         self.bottleName = bottleName
@@ -96,6 +102,7 @@ public struct LaunchProfile: Codable, Equatable, Sendable {
         self.arguments = arguments
         self.workingDirectory = workingDirectory
         self.environment = environment
+        self.gameRoot = gameRoot
     }
 }
 
@@ -135,6 +142,20 @@ public struct BottleLaunchCommand: Equatable, Sendable {
 public protocol BottleCommandRunning: Sendable {
     func run(executable: URL, arguments: [String], environment: [String: String],
              currentDirectory: URL?) throws -> CommandOutput
+    /// Like `run`, for a game: the child gets an empty stdin that stays open until it
+    /// exits (see `HeldOpenStandardInput`), not the caller's stdin.
+    func runKeepingInputOpen(executable: URL, arguments: [String],
+                             environment: [String: String],
+                             currentDirectory: URL?) throws -> CommandOutput
+}
+
+extension BottleCommandRunning {
+    public func runKeepingInputOpen(executable: URL, arguments: [String],
+                                    environment: [String: String],
+                                    currentDirectory: URL?) throws -> CommandOutput {
+        try run(executable: executable, arguments: arguments,
+                environment: environment, currentDirectory: currentDirectory)
+    }
 }
 
 public struct ProcessBottleCommandRunner: BottleCommandRunning {
@@ -143,6 +164,20 @@ public struct ProcessBottleCommandRunner: BottleCommandRunning {
     public func run(executable: URL, arguments: [String],
                     environment: [String: String], currentDirectory: URL?) throws
         -> CommandOutput {
+        try execute(executable: executable, arguments: arguments, environment: environment,
+                    currentDirectory: currentDirectory, keepsInputOpen: false)
+    }
+
+    public func runKeepingInputOpen(executable: URL, arguments: [String],
+                                    environment: [String: String],
+                                    currentDirectory: URL?) throws -> CommandOutput {
+        try execute(executable: executable, arguments: arguments, environment: environment,
+                    currentDirectory: currentDirectory, keepsInputOpen: true)
+    }
+
+    private func execute(executable: URL, arguments: [String],
+                         environment: [String: String], currentDirectory: URL?,
+                         keepsInputOpen: Bool) throws -> CommandOutput {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
@@ -172,12 +207,18 @@ public struct ProcessBottleCommandRunner: BottleCommandRunning {
         defer { try? outputHandle.close() }
         process.standardOutput = outputHandle
         process.standardError = outputHandle
+        var input: HeldOpenStandardInput?
         do {
-            try process.run()
+            if keepsInputOpen {
+                input = try HeldOpenStandardInput.run(process)
+            } else {
+                try process.run()
+            }
         } catch {
             throw BottleToolError("Could not run \(executable.path): \(error.localizedDescription)")
         }
         process.waitUntilExit()
+        input?.close()
         try? outputHandle.synchronize()
         let data = (try? Data(contentsOf: outputURL)) ?? Data()
         return CommandOutput(
@@ -894,7 +935,9 @@ public final class BottleManager: @unchecked Sendable {
         let command = try profileLaunchCommand(
             name, controlFile: controlFile,
             additionalArguments: additionalArguments)
-        return try runner.run(
+        // Not the caller's stdin: basaltctl may run with /dev/null as stdin, and hello_xr
+        // quits at end of file on stdin.
+        return try runner.runKeepingInputOpen(
             executable: command.executable,
             arguments: command.arguments,
             environment: command.environment,

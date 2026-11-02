@@ -26,6 +26,12 @@ All notable changes to BasaltVR are documented here.
 - A live stream-health banner flags a silent headset, a sustained frame rate below target, high
   latency for the selected preset, thermal pressure, and Low Power Mode, with a settings suggestion.
 - The session log can be saved to a file, and every metric sample of a session exported as CSV.
+- **Add Game…** in the Library toolbar makes a launch profile for a Windows game from GOG, itch.io,
+  or any installer, without `basaltctl profile add`. Choose a bottle and the game's `.exe` in its
+  `drive_c`; the name comes from the game folder (build folders such as `Binaries/Win64` or
+  `bin/win64` are skipped), itch.io is detected from a folder named `itch` inside `drive_c`, and the
+  `.exe` folder becomes the profile's working directory and `gameRoot`. Profile names now fold
+  accents and drop other non-ASCII letters, so `basaltctl` accepts every name the app creates.
 
 ### Changed
 
@@ -58,6 +64,12 @@ All notable changes to BasaltVR are documented here.
   every Steam/game line rather than only the first line of each chunk.
 - Diagnostic reports no longer include audio device names (only BlackHole or another device) or
   `[U:1:…]` Steam IDs.
+- The `hello-xr` profile no longer quits after about 10 s without a frame when started from the
+  app. Khronos hello_xr quits at end of file on stdin, and the game got `/dev/null`. The game now
+  gets an empty pipe as stdin that stays open until it exits (`HeldOpenStandardInput` in
+  BasaltBottleKit, used by app sessions and `basaltctl run`).
+- The streamer prints the Screen Recording hint only after a screen-capture error, not after every
+  fatal error (an adb error got it too).
 - Open BSManager now launches with `start /wait`. A bare `start` exited immediately, and the
   utility exit handler then stopped every Wine process in the bottle, closing BSManager before its
   window appeared.
