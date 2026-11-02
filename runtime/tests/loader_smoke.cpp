@@ -3,7 +3,211 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
+
+namespace {
+
+// OpenComposite (gitlab.com/znixian/OpenOVR, openxr branch, cff07db) aborts
+// the game if xrSuggestInteractionProfileBindings fails. Every path it can
+// suggest must appear in its InteractionProfile::validInputPaths, so these
+// lists are copied exactly from OpenOVR/Misc/Input/*InteractionProfile.cpp
+// (per-hand suffixes are expanded for both hands below).
+struct OpenCompositeProfile {
+    const char* profile;
+    std::vector<const char*> handPaths;
+    std::vector<const char*> fullPaths;
+};
+
+const OpenCompositeProfile kOpenCompositeProfiles[] = {
+    {"/interaction_profiles/microsoft/motion_controller",
+     {"/input/menu/click", "/input/squeeze/click", "/input/trigger/value",
+      "/input/thumbstick/x", "/input/thumbstick/y", "/input/thumbstick/click",
+      "/input/thumbstick", "/input/trackpad/x", "/input/trackpad/y",
+      "/input/trackpad/click", "/input/trackpad/touch", "/input/trackpad",
+      "/input/grip/pose", "/input/aim/pose", "/output/haptic"},
+     {}},
+    {"/interaction_profiles/valve/index_controller",
+     {"/input/a/click", "/input/a/touch", "/input/b/click", "/input/b/touch",
+      "/input/squeeze/value", "/input/squeeze/force", "/input/trigger/click",
+      "/input/trigger/value", "/input/trigger/touch", "/input/thumbstick/x",
+      "/input/thumbstick/y", "/input/thumbstick/click", "/input/thumbstick/touch",
+      "/input/thumbstick", "/input/trackpad/x", "/input/trackpad/y",
+      "/input/trackpad/force", "/input/trackpad/touch", "/input/trackpad",
+      "/input/grip/pose", "/input/aim/pose", "/output/haptic"},
+     {}},
+    {"/interaction_profiles/htc/vive_controller",
+     {"/input/squeeze/click", "/input/menu/click", "/input/trigger/click",
+      "/input/trigger/value", "/input/trackpad/x", "/input/trackpad/y",
+      "/input/trackpad/click", "/input/trackpad/touch", "/input/trackpad",
+      "/input/grip/pose", "/input/aim/pose", "/output/haptic"},
+     {}},
+    {"/interaction_profiles/oculus/touch_controller",
+     {"/input/squeeze/value", "/input/trigger/value", "/input/trigger/touch",
+      "/input/thumbstick/x", "/input/thumbstick/y", "/input/thumbstick",
+      "/input/thumbstick/click", "/input/thumbstick/touch", "/input/thumbrest/touch",
+      "/input/grip/pose", "/input/aim/pose", "/output/haptic"},
+     {"/user/hand/left/input/x/click", "/user/hand/left/input/x/touch",
+      "/user/hand/left/input/y/click", "/user/hand/left/input/y/touch",
+      "/user/hand/left/input/menu/click", "/user/hand/right/input/a/click",
+      "/user/hand/right/input/a/touch", "/user/hand/right/input/b/click",
+      "/user/hand/right/input/b/touch"}},
+    {"/interaction_profiles/khr/simple_controller",
+     {"/input/select/click", "/input/menu/click", "/input/grip/pose",
+      "/input/aim/pose", "/output/haptic"},
+     {}},
+};
+
+bool endsWith(const std::string& value, const char* suffix) {
+    const size_t length = std::strlen(suffix);
+    return value.size() >= length &&
+           value.compare(value.size() - length, length, suffix) == 0;
+}
+
+bool suggestBindings(
+    XrInstance instance,
+    const char* profile,
+    const std::vector<XrActionSuggestedBinding>& bindings,
+    XrResult expected) {
+    XrInteractionProfileSuggestedBinding suggestedBindings{};
+    suggestedBindings.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
+    XrResult result = xrStringToPath(
+        instance, profile, &suggestedBindings.interactionProfile);
+    suggestedBindings.countSuggestedBindings = static_cast<uint32_t>(bindings.size());
+    suggestedBindings.suggestedBindings = bindings.data();
+    if (XR_SUCCEEDED(result)) {
+        result = xrSuggestInteractionProfileBindings(instance, &suggestedBindings);
+    }
+    if (result != expected) {
+        std::fprintf(stderr, "FAIL: OpenComposite suggestion for '%s' (%zu bindings) returned %d\n",
+                     profile, bindings.size(), result);
+        return false;
+    }
+    return true;
+}
+
+// Replays OpenComposite's suggestion pattern: the internal info set suggests
+// one /click source per hand cumulatively (so each profile twice), then every
+// valid path of every profile is suggested, twice, with type-matched actions.
+bool openCompositeBindingsAccepted(XrInstance instance, const XrPath handPaths[2]) {
+    XrActionSetCreateInfo setInfo{};
+    setInfo.type = XR_TYPE_ACTION_SET_CREATE_INFO;
+    std::strncpy(setInfo.actionSetName, "opencomposite-internal-info-set",
+                 XR_MAX_ACTION_SET_NAME_SIZE - 1);
+    std::strncpy(setInfo.localizedActionSetName, "OpenComposite internal info set",
+                 XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE - 1);
+    XrActionSet set = XR_NULL_HANDLE;
+    XrResult result = xrCreateActionSet(instance, &setInfo, &set);
+
+    struct NamedAction {
+        const char* name;
+        const char* localizedName;
+        XrActionType type;
+        XrAction handle;
+    };
+    NamedAction actions[] = {
+        {"opencomposite-internal-info-act", "OpenComposite internal info action",
+         XR_ACTION_TYPE_BOOLEAN_INPUT, XR_NULL_HANDLE},
+        {"oc-float", "OC float", XR_ACTION_TYPE_FLOAT_INPUT, XR_NULL_HANDLE},
+        {"oc-vector", "OC vector", XR_ACTION_TYPE_VECTOR2F_INPUT, XR_NULL_HANDLE},
+        {"oc-pose", "OC pose", XR_ACTION_TYPE_POSE_INPUT, XR_NULL_HANDLE},
+        {"oc-haptic", "OC haptic", XR_ACTION_TYPE_VIBRATION_OUTPUT, XR_NULL_HANDLE},
+    };
+    for (NamedAction& action : actions) {
+        if (XR_FAILED(result)) {
+            break;
+        }
+        XrActionCreateInfo actionInfo{};
+        actionInfo.type = XR_TYPE_ACTION_CREATE_INFO;
+        actionInfo.actionType = action.type;
+        actionInfo.countSubactionPaths = 2;
+        actionInfo.subactionPaths = handPaths;
+        std::strncpy(actionInfo.actionName, action.name, XR_MAX_ACTION_NAME_SIZE - 1);
+        std::strncpy(actionInfo.localizedActionName, action.localizedName,
+                     XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
+        result = xrCreateAction(set, &actionInfo, &action.handle);
+    }
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: OpenComposite action setup returned %d\n", result);
+        return false;
+    }
+    const XrAction booleanAction = actions[0].handle;
+
+    const char* hands[] = {"/user/hand/left", "/user/hand/right"};
+    for (const OpenCompositeProfile& profile : kOpenCompositeProfiles) {
+        std::vector<std::string> paths;
+        for (const char* hand : hands) {
+            for (const char* suffix : profile.handPaths) {
+                paths.push_back(std::string(hand) + suffix);
+            }
+        }
+        for (const char* path : profile.fullPaths) {
+            paths.push_back(path);
+        }
+
+        std::vector<XrActionSuggestedBinding> infoBindings;
+        for (const char* hand : hands) {
+            for (const std::string& path : paths) {
+                if (path.find("/click") != std::string::npos &&
+                    path.compare(0, std::strlen(hand), hand) == 0) {
+                    XrPath binding = XR_NULL_PATH;
+                    if (XR_FAILED(xrStringToPath(instance, path.c_str(), &binding))) {
+                        return false;
+                    }
+                    infoBindings.push_back({booleanAction, binding});
+                    break;
+                }
+            }
+            if (!suggestBindings(instance, profile.profile, infoBindings, XR_SUCCESS)) {
+                return false;
+            }
+        }
+
+        std::vector<XrActionSuggestedBinding> bindings;
+        for (const std::string& path : paths) {
+            XrAction action = actions[1].handle;
+            if (endsWith(path, "/pose")) {
+                action = actions[3].handle;
+            } else if (endsWith(path, "/output/haptic")) {
+                action = actions[4].handle;
+            } else if (endsWith(path, "/thumbstick") || endsWith(path, "/trackpad")) {
+                action = actions[2].handle;
+            } else if (endsWith(path, "/click") || endsWith(path, "/touch")) {
+                action = booleanAction;
+            }
+            XrPath binding = XR_NULL_PATH;
+            if (XR_FAILED(xrStringToPath(instance, path.c_str(), &binding))) {
+                return false;
+            }
+            bindings.push_back({action, binding});
+        }
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            if (!suggestBindings(instance, profile.profile, bindings, XR_SUCCESS)) {
+                return false;
+            }
+        }
+    }
+
+    // OpenComposite never suggests its Vive tracker profile
+    // (ViveTrackerInteractionProfile::CanHaveBindings() is false). Without
+    // XR_HTCX_vive_tracker_interaction the spec result is PATH_UNSUPPORTED.
+    XrPath leftGrip = XR_NULL_PATH;
+    result = xrStringToPath(instance, "/user/hand/left/input/grip/pose", &leftGrip);
+    if (XR_FAILED(result) ||
+        !suggestBindings(instance, "/interaction_profiles/htc/vive_tracker_htcx",
+                         {{actions[3].handle, leftGrip}}, XR_ERROR_PATH_UNSUPPORTED)) {
+        return false;
+    }
+
+    result = xrDestroyActionSet(set);
+    if (XR_FAILED(result)) {
+        std::fprintf(stderr, "FAIL: OpenComposite action set teardown returned %d\n", result);
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
 
 int main() {
     const bool expectD3D11 = [] {
@@ -431,6 +635,11 @@ int main() {
     }
     if (result != XR_ERROR_PATH_UNSUPPORTED) {
         std::fprintf(stderr, "FAIL: top-level binding source returned %d\n", result);
+        xrDestroyInstance(instance);
+        return 1;
+    }
+
+    if (!openCompositeBindingsAccepted(instance, handPaths)) {
         xrDestroyInstance(instance);
         return 1;
     }

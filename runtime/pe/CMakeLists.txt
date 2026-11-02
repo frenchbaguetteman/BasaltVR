@@ -2,16 +2,19 @@ add_library(
     basalt_openxr
     SHARED
     basalt_openxr.def
+    compositor.cpp
     control.cpp
     entrypoints.cpp
     frame.cpp
     graphics.cpp
+    hand_tracking.cpp
     input.cpp
     path.cpp
     runtime.cpp
     space.cpp
     swapchain.cpp
     system.cpp
+    visibility_mask.cpp
 )
 
 target_include_directories(basalt_openxr PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

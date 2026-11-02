@@ -73,6 +73,90 @@ final class AlvrVideoPacketizerTests: XCTestCase {
         XCTAssertEqual(packet[34..<38], Data([2, 0, 0, 0]))
     }
 
+    /// Decodes the bincode `alvr_packets::Haptics` payload after the 18-byte
+    /// stream header: device_id u64, Duration { secs u64, nanos u32 },
+    /// frequency f32, amplitude f32, all little-endian.
+    private func decodeHaptics(_ packet: Data) -> (deviceID: UInt64, seconds: UInt64,
+                                                   nanos: UInt32, frequency: Float,
+                                                   amplitude: Float) {
+        func littleEndian<T: FixedWidthInteger>(_ range: Range<Int>) -> T {
+            packet[range].reversed().reduce(T(0)) { ($0 << 8) | T($1) }
+        }
+        return (littleEndian(18..<26), littleEndian(26..<34), littleEndian(34..<38),
+                Float(bitPattern: littleEndian(38..<42)),
+                Float(bitPattern: littleEndian(42..<46)))
+    }
+
+    func testHapticsPayloadMatchesAlvrDurationHertzAndAmplitudeUnits() throws {
+        // The Lab's teleport hint after the runtime: 500 us at 2 kHz, full
+        // amplitude. Sub-millisecond durations must survive as nanoseconds.
+        let hint = decodeHaptics(try AlvrHapticsPacketizer.packet(
+            hand: .left, durationNanoseconds: 500_000,
+            frequency: 2_000, amplitude: 1, packetIndex: 0))
+        XCTAssertEqual(hint.deviceID, AlvrHand.left.alvrDeviceID)
+        XCTAssertEqual(hint.seconds, 0)
+        XCTAssertEqual(hint.nanos, 500_000)
+        XCTAssertEqual(hint.frequency, 2_000)
+        XCTAssertEqual(hint.amplitude, 1)
+
+        // The runtime's minimum pulse (XR_MIN_HAPTIC_DURATION and zero-length
+        // OpenVR pulses): 5 ms, frequency unspecified (0).
+        let minimum = decodeHaptics(try AlvrHapticsPacketizer.packet(
+            hand: .right, durationNanoseconds: 5_000_000,
+            frequency: 0, amplitude: 0.25, packetIndex: 1))
+        XCTAssertEqual(minimum.deviceID, AlvrHand.right.alvrDeviceID)
+        XCTAssertEqual(minimum.seconds, 0)
+        XCTAssertEqual(minimum.nanos, 5_000_000)
+        XCTAssertEqual(minimum.frequency, 0)
+        XCTAssertEqual(minimum.amplitude, 0.25)
+
+        // Durations past one second split into whole seconds and nanoseconds.
+        let long = decodeHaptics(try AlvrHapticsPacketizer.packet(
+            hand: .left, durationNanoseconds: 2_500_000_000,
+            frequency: 160, amplitude: 0.5, packetIndex: 2))
+        XCTAssertEqual(long.seconds, 2)
+        XCTAssertEqual(long.nanos, 500_000_000)
+    }
+
+    func testHapticsStopIsZeroDurationAndAmplitude() throws {
+        // xrStopHapticFeedback and zero-amplitude xrApplyHapticFeedback reach
+        // ALVR as an all-zero vibration, which replaces any running pulse.
+        let stop = decodeHaptics(try AlvrHapticsPacketizer.packet(
+            hand: .left, durationNanoseconds: 0, frequency: 0, amplitude: 0,
+            packetIndex: 3))
+        XCTAssertEqual(stop.seconds, 0)
+        XCTAssertEqual(stop.nanos, 0)
+        XCTAssertEqual(stop.frequency, 0)
+        XCTAssertEqual(stop.amplitude, 0)
+    }
+
+    func testHapticsPacketRejectsValuesOutsideTheRuntimeContract() {
+        for (frequency, amplitude) in [(Float.nan, 0.5), (-1, 0.5), (.infinity, 0.5),
+                                       (0, .nan), (0, -0.1), (0, 1.5)] as [(Float, Float)] {
+            XCTAssertThrowsError(try AlvrHapticsPacketizer.packet(
+                hand: .left, durationNanoseconds: 5_000_000,
+                frequency: frequency, amplitude: amplitude, packetIndex: 0),
+                "frequency \(frequency) amplitude \(amplitude)")
+        }
+    }
+
+    func testHapticsLogIsEnvironmentGatedAndNamesEachField() {
+        XCTAssertFalse(AlvrHapticsLog.isEnabled(environment: [:]))
+        XCTAssertFalse(AlvrHapticsLog.isEnabled(environment: ["BASALT_HAPTIC_LOG": ""]))
+        XCTAssertFalse(AlvrHapticsLog.isEnabled(environment: ["BASALT_HAPTIC_LOG": "0"]))
+        XCTAssertTrue(AlvrHapticsLog.isEnabled(environment: ["BASALT_HAPTIC_LOG": "1"]))
+
+        XCTAssertEqual(
+            AlvrHapticsLog.line(hand: .right, durationNanoseconds: 500_000,
+                                frequency: 2_000, amplitude: 1,
+                                uptimeNanoseconds: 12_345_678_901),
+            "haptic t=12345ms right pulse duration=500000ns frequency=2000.0 amplitude=1.0")
+        XCTAssertEqual(
+            AlvrHapticsLog.line(hand: .left, durationNanoseconds: 0,
+                                frequency: 0, amplitude: 0, uptimeNanoseconds: 0),
+            "haptic t=0ms left stop duration=0ns frequency=0.0 amplitude=0.0")
+    }
+
     func testStereoPCMIsShardedOnAudioStreamAndReconstructable() throws {
         let pcm = Data((0..<(480 * 4)).map { UInt8($0 % 251) })
         let shards = try AlvrAudioPacketizer.shards(
