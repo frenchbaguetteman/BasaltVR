@@ -35,4 +35,28 @@ final class StreamReportTests: XCTestCase {
         XCTAssertNil(StreamReport.parse("USB Quest TESTQUEST00001 is authorized; adb forwards are ready."))
         XCTAssertNil(StreamReport.parse("encoder busy (runtime): dropped 1 frame(s) to bound latency"))
     }
+
+    func testPipelineLineIsReadableAndNeverChartedAsQuestOrVideo() {
+        let line = StreamReport.pipelineLine(PipelineStatistics.Snapshot(
+            elapsedSeconds: 123.45, intervalSeconds: 2,
+            trackingPackets: 144, trackingMaximumGapMilliseconds: 31.25,
+            trackingBackwardTimestamps: 1, runtimeFrames: 140,
+            runtimeUntrackedFrames: 3, runtimeRepeatedTimestamps: 7,
+            encoderBusyDrops: 2, compositorBusyDrops: 1, networkDrops: 0,
+            networkBusyDrops: 5, awaitingIDRDrops: 6, encodedFrames: 136, encoderDroppedFrames: 4,
+            encodeAverageMilliseconds: 8.14, encodeMaximumMilliseconds: 12.5,
+            poseAgeAverageMilliseconds: 24.04, poseAgeMaximumMilliseconds: 40))
+        XCTAssertEqual(line,
+            "  pipeline t=123.5s: tracking 72.0/s (max gap 31.2 ms, 1 backward); "
+            + "runtime 70.0/s (3 untracked, 7 repeated pose); "
+            + "encoded 68.0/s (8.1 ms avg, 12.5 ms max); "
+            + "drops encoder-busy 2, compositor-busy 1, rate-control 4, network-busy 5, "
+            + "network 0, awaiting-IDR 6; "
+            + "pose age at send 24.0 ms avg, 40.0 ms max")
+        XCTAssertNil(StreamReport.parse(line))
+
+        let empty = StreamReport.pipelineLine(PipelineStatistics.Snapshot())
+        XCTAssertTrue(empty.contains("max gap - ms"))
+        XCTAssertNil(StreamReport.parse(empty))
+    }
 }

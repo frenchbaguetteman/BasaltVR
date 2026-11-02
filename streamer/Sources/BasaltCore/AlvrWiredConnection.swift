@@ -1,6 +1,12 @@
 import Foundation
 
 public enum AlvrADBDeviceParser {
+    /// The serial `--wired` uses for every adb command. A Quest with adb over Wi-Fi
+    /// appears twice in `adb devices` (USB serial and `ip:5555`), and a bare
+    /// `adb` command fails with "more than one device/emulator", so Basalt always
+    /// passes `-s` with one serial. Only physical USB transports qualify; when
+    /// several USB devices are attached the lowest serial wins, so the choice
+    /// does not depend on the order adb prints them.
     public static func authorizedUSBSerial(from output: String) -> String? {
         output.split(whereSeparator: \.isNewline).dropFirst().compactMap { line in
             let fields = line.split(whereSeparator: \.isWhitespace)
@@ -9,7 +15,24 @@ public enum AlvrADBDeviceParser {
                 return nil
             }
             return String(fields[0])
-        }.first
+        }.min()
+    }
+
+    /// Authorized devices reached over the network (`ip:port` or Wireless
+    /// debugging `adb-...` serials). `--wired` never uses these (video would
+    /// cross Wi-Fi inside adb); they only improve the error message.
+    public static func authorizedNetworkSerials(from output: String) -> [String] {
+        output.split(whereSeparator: \.isNewline).dropFirst().compactMap { line in
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard fields.count >= 2, fields[1] == "device",
+                  !fields.dropFirst(2).contains(where: { $0.hasPrefix("usb:") }) else {
+                return nil
+            }
+            let serial = String(fields[0])
+            let isNetwork = serial.hasPrefix("adb-")
+                || (serial.contains(":") && !serial.hasPrefix("emulator-"))
+            return isNetwork ? serial : nil
+        }.sorted()
     }
 
     public static func hasUnauthorizedDevice(in output: String) -> Bool {
@@ -25,6 +48,22 @@ public enum AlvrADBDeviceParser {
         })
         return ["alvr.client", "alvr.client.stable", "alvr.client.dev"]
             .first(where: installed.contains)
+    }
+
+    /// Ports from `ports` that `adb forward --list` does not forward for
+    /// `serial` (lines read `SERIAL tcp:LOCAL tcp:REMOTE`). adb drops a
+    /// device's forwards when its USB transport goes away, for example when
+    /// the Quest reboots or the cable is replugged.
+    public static func missingForwards(serial: String, ports: [UInt16],
+                                       from output: String) -> [UInt16] {
+        let present = Set(output.split(whereSeparator: \.isNewline).compactMap { line -> String? in
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard fields.count >= 3, fields[0] == serial, fields[1] == fields[2] else {
+                return nil
+            }
+            return String(fields[1])
+        })
+        return ports.filter { !present.contains("tcp:\($0)") }
     }
 
     public static func activityIsResumed(from output: String) -> Bool {
@@ -82,6 +121,9 @@ public final class AlvrWiredConnection: @unchecked Sendable {
             if AlvrADBDeviceParser.hasUnauthorizedDevice(in: devices) {
                 throw BasaltError("Quest USB debugging is unauthorized; accept the USB debugging prompt in the headset")
             }
+            if !AlvrADBDeviceParser.authorizedNetworkSerials(from: devices).isEmpty {
+                throw BasaltError("adb only sees the Quest over Wi-Fi. --wired needs the USB cable; use --wireless to stream without the cable")
+            }
             throw BasaltError("No authorized USB Quest found by adb; connect a data-capable cable and enable Developer Mode")
         }
 
@@ -131,6 +173,25 @@ public final class AlvrWiredConnection: @unchecked Sendable {
             throw error
         }
         return AlvrWiredConnection(serial: serial, packageName: package)
+    }
+
+    /// Re-creates any missing control/stream forward before a reconnect.
+    /// It does not wake the headset or relaunch ALVR: the user may have
+    /// taken the Quest off on purpose. Returns the ports it re-created.
+    @discardableResult
+    public func rearmForwards() throws -> [UInt16] {
+        lock.lock()
+        let isStopped = stopped
+        lock.unlock()
+        guard !isStopped else { return [] }
+        let ports = [AlvrDiscoveryListener.alvrPort, AlvrVideoStreamSender.defaultPort]
+        let list = try Self.runADB(["forward", "--list"])
+        let missing = AlvrADBDeviceParser.missingForwards(
+            serial: serial, ports: ports, from: list)
+        for port in missing {
+            _ = try Self.runADB(["-s", serial, "forward", "tcp:\(port)", "tcp:\(port)"])
+        }
+        return missing
     }
 
     public func stop() {

@@ -144,6 +144,15 @@ uint64_t gLastConsumedFrameNumber = 0;
 PendingFrame gPendingFrames[kPendingFrameCapacity]{};
 size_t gPendingHead = 0;
 size_t gPendingCount = 0;
+// Headset refresh period from HELLO_ACK; the 72 Hz default while headless.
+XrDuration gDisplayPeriod = BASALT_CONTROL_DEFAULT_DISPLAY_PERIOD_NS;
+
+XrDuration sanitizedDisplayPeriod(uint64_t period) {
+    return period >= BASALT_CONTROL_MIN_DISPLAY_PERIOD_NS &&
+                   period <= BASALT_CONTROL_MAX_DISPLAY_PERIOD_NS
+               ? static_cast<XrDuration>(period)
+               : static_cast<XrDuration>(BASALT_CONTROL_DEFAULT_DISPLAY_PERIOD_NS);
+}
 
 void resetSystemButtonLocked() {
     gSystemButtonPressTime = 0;
@@ -800,6 +809,7 @@ DisconnectState beginDisconnectLocked() {
     resetTrackingStateLocked();
     gPendingHead = 0;
     gPendingCount = 0;
+    gDisplayPeriod = BASALT_CONTROL_DEFAULT_DISPLAY_PERIOD_NS;
     WakeAllConditionVariable(&gAckCondition);
     WakeAllConditionVariable(&gFrameDeliveryCondition);
     return state;
@@ -1007,10 +1017,18 @@ bool connectSocketLocked(uint16_t port) {
         gWsaStarted = true;
     }
 
-    const SOCKET connection = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    // Never inheritable: a game that launches its successor with
+    // CreateProcess(bInheritHandles=TRUE) and exits (The Lab -> Robot Repair
+    // via OpenComposite's LaunchInternalProcess) would otherwise leave this
+    // connection open inside the child, so the streamer never sees the old
+    // session end. socket() handles are inheritable by default.
+    const SOCKET connection = WSASocketW(
+        AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0,
+        WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
     if (connection == INVALID_SOCKET) {
         return false;
     }
+    SetHandleInformation(reinterpret_cast<HANDLE>(connection), HANDLE_FLAG_INHERIT, 0);
 
     const DWORD timeout = kSocketTimeoutMilliseconds;
     setsockopt(connection, SOL_SOCKET, SO_RCVTIMEO,
@@ -1164,22 +1182,25 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
             break;
         }
 
-        uint8_t ack[8]{};
+        uint8_t ack[16]{};
         size_t ackLength = 0;
         uint16_t acceptedVersion = 0;
+        uint64_t displayPeriod = 0;
         if (!recvExpectedMessage(
                 gSocket, BASALT_MSG_HELLO_ACK, ack, sizeof(ack), &ackLength) ||
-            ackLength != sizeof(acceptedVersion)) {
+            ackLength != sizeof(acceptedVersion) + sizeof(displayPeriod)) {
             closesocket(gSocket);
             gSocket = INVALID_SOCKET;
             break;
         }
         std::memcpy(&acceptedVersion, ack, sizeof(acceptedVersion));
+        std::memcpy(&displayPeriod, ack + sizeof(acceptedVersion), sizeof(displayPeriod));
         if (acceptedVersion != BASALT_CONTROL_PROTOCOL_VERSION) {
             closesocket(gSocket);
             gSocket = INVALID_SOCKET;
             break;
         }
+        gDisplayPeriod = sanitizedDisplayPeriod(displayPeriod);
 
         gWaiterWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         gFenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -1241,6 +1262,16 @@ bool controlActive(XrSession session) {
                         gSocket != INVALID_SOCKET && !gReceiverFailed;
     ReleaseSRWLockShared(&gControlLock);
     return active;
+}
+
+XrDuration controlDisplayPeriod(XrSession session) {
+    AcquireSRWLockShared(&gControlLock);
+    const XrDuration period =
+        session != XR_NULL_HANDLE && gControlSession == session
+            ? gDisplayPeriod
+            : static_cast<XrDuration>(BASALT_CONTROL_DEFAULT_DISPLAY_PERIOD_NS);
+    ReleaseSRWLockShared(&gControlLock);
+    return period;
 }
 
 void controlNotePredictedDisplayTime(XrSession session, XrTime predictedDisplayTime) {
@@ -1501,31 +1532,32 @@ void controlUnregisterSwapchain(XrSwapchain swapchain) {
     }
 }
 
-void controlFrameReady(
+uint64_t controlFrameReady(
     int64_t displayTime,
     uint64_t questTrackingTimestampNanoseconds,
     const ControlFrameView* views,
-    uint32_t viewCount) {
+    uint32_t viewCount,
+    bool exportViews) {
     if (viewCount == 0 || viewCount > kMaxFrameViews) {
-        return;
+        return 0;
     }
 
     AcquireSRWLockExclusive(&gControlLock);
     if (gSocket == INVALID_SOCKET || gReceiverFailed ||
         gFence == nullptr || gContext4 == nullptr) {
         ReleaseSRWLockExclusive(&gControlLock);
-        return;
+        return 0;
     }
 
     ControlFrameView preparedViews[kMaxFrameViews]{};
     for (uint32_t index = 0; index < viewCount; ++index) {
         preparedViews[index] = views[index];
-        if (!prepareSwapchainViewForExport(
+        if (exportViews && !prepareSwapchainViewForExport(
                 gContext4, &preparedViews[index])) {
             DisconnectState state = beginDisconnectLocked();
             ReleaseSRWLockExclusive(&gControlLock);
             finishDisconnect(state, false);
-            return;
+            return 0;
         }
     }
 
@@ -1538,7 +1570,7 @@ void controlFrameReady(
         DisconnectState state = beginDisconnectLocked();
         ReleaseSRWLockExclusive(&gControlLock);
         finishDisconnect(state, false);
-        return;
+        return 0;
     }
     slot = &gPendingFrames[(gPendingHead + gPendingCount) % kPendingFrameCapacity];
     ++gPendingCount;
@@ -1583,12 +1615,44 @@ void controlFrameReady(
         DisconnectState state = beginDisconnectLocked();
         ReleaseSRWLockExclusive(&gControlLock);
         finishDisconnect(state, false);
-        return;
+        return 0;
     }
     if (wake != nullptr) {
         SetEvent(wake);
     }
     ReleaseSRWLockExclusive(&gControlLock);
+    return frameNumber;
+}
+
+bool controlWaitForFrameConsumed(XrSession session, uint64_t frameNumber) {
+    if (frameNumber == 0) {
+        return true;
+    }
+    AcquireSRWLockExclusive(&gControlLock);
+    bool timedOut = false;
+    while (gControlSession == session && gSocket != INVALID_SOCKET &&
+           !gReceiverFailed && gLastConsumedFrameNumber < frameNumber) {
+        if (!SleepConditionVariableSRW(
+                &gFrameDeliveryCondition, &gControlLock,
+                kFrameConsumeMilliseconds, 0)) {
+            timedOut = true;
+            break;
+        }
+    }
+    const bool consumed = gControlSession == session &&
+                          gSocket != INVALID_SOCKET && !gReceiverFailed &&
+                          gLastConsumedFrameNumber >= frameNumber;
+    DisconnectState state;
+    if (timedOut && gControlSession == session) {
+        // Same policy as the frame budget: a daemon that stops consuming is
+        // dropped instead of letting the compositor overwrite a read image.
+        state = beginDisconnectLocked();
+    }
+    ReleaseSRWLockExclusive(&gControlLock);
+    if (state.socket != INVALID_SOCKET) {
+        finishDisconnect(state, false);
+    }
+    return consumed;
 }
 
 }  // namespace basalt

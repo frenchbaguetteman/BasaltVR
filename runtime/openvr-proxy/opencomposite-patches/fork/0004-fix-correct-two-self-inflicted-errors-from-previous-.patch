@@ -1,0 +1,67 @@
+From b652f54b825a3117a61fbb7d7d0b7e04d6e71c95 Mon Sep 17 00:00:00 2001
+From: Mac <charmillionaire@192.168.1.100>
+Date: Mon, 12 Oct 2026 20:20:41 +0800
+Subject: [PATCH 4/6] fix: correct two self-inflicted errors from previous
+ patch
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1. BaseCompositor.h: typedef 必须放在 IVRCompositor_029.h 的 include 之后
+   （原来插在文件第一行，此时 vr::IVRCompositor_029 尚未声明）
+2. BaseApplications: 该类使用类内别名 EVRApplicationError / VRApplicationError_None，
+   不应加 vr:: 前缀
+---
+ OpenOVR/Reimpl/BaseApplications.cpp | 4 ++--
+ OpenOVR/Reimpl/BaseApplications.h   | 2 +-
+ OpenOVR/Reimpl/BaseCompositor.h     | 4 +++-
+ 3 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/OpenOVR/Reimpl/BaseApplications.cpp b/OpenOVR/Reimpl/BaseApplications.cpp
+index ae11339c104bd4e5f115e872684583fd238a9be6..dc08288a2e4ff220ede8dcdc4c647d28a22213eb 100644
+--- a/OpenOVR/Reimpl/BaseApplications.cpp
++++ b/OpenOVR/Reimpl/BaseApplications.cpp
+@@ -178,8 +178,8 @@ uint32_t BaseApplications::GetCurrentSceneProcessId()
+ 	STUBBED();
+ }
+ 
+-vr::EVRApplicationError BaseApplications::RegisterSubprocess(uint32_t nPid)
++BaseApplications::EVRApplicationError BaseApplications::RegisterSubprocess(uint32_t nPid)
+ {
+ 	STUBBED();
+-	return vr::VRApplicationError_None;
++	return VRApplicationError_None;
+ }
+diff --git a/OpenOVR/Reimpl/BaseApplications.h b/OpenOVR/Reimpl/BaseApplications.h
+index 96566b2044bdc6559a29347535cf74ac2893b679..d53dbb1def38294b8349bf40f15666510631dfd2 100644
+--- a/OpenOVR/Reimpl/BaseApplications.h
++++ b/OpenOVR/Reimpl/BaseApplications.h
+@@ -211,5 +211,5 @@ public:
+ 	 * focus once it starts rendering, but it will appear here once it calls VR_Init with the Scene application
+ 	 * type. */
+ 	uint32_t GetCurrentSceneProcessId();
+-	vr::EVRApplicationError RegisterSubprocess(uint32_t nPid);
++	EVRApplicationError RegisterSubprocess(uint32_t nPid);
+ };
+diff --git a/OpenOVR/Reimpl/BaseCompositor.h b/OpenOVR/Reimpl/BaseCompositor.h
+index b816ccd2b8d9e1976e6774f0f6202e99df46080c..d4c93f4b45286d93eaec006d933bd5de33062964 100644
+--- a/OpenOVR/Reimpl/BaseCompositor.h
++++ b/OpenOVR/Reimpl/BaseCompositor.h
+@@ -1,4 +1,3 @@
+-typedef vr::IVRCompositor_029::EVRCompositorTextureUsage OOVR_EVRCompositorTextureUsage;
+ #include "generated/interfaces/IVRCompositor_029.h"
+ #pragma once
+ #include "../BaseCommon.h" // TODO don't import from OCOVR, and remove the "../"
+@@ -6,6 +5,9 @@ typedef vr::IVRCompositor_029::EVRCompositorTextureUsage OOVR_EVRCompositorTextu
+ 
+ #include "../Compositor/compositor_backend.h" // TODO don't import from OCOVR, and remove the "../"
+ 
++// OpenVR 2.x: IVRCompositor_029 引入的新枚举，给 Base 层一个稳定别名
++typedef vr::IVRCompositor_029::EVRCompositorTextureUsage OOVR_EVRCompositorTextureUsage;
++
+ #include <vector>
+ 
+ typedef unsigned int GLuint;
+-- 
+2.39.5
+
