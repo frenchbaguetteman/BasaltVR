@@ -386,6 +386,25 @@ final class AlvrSessionSupervisorTests: XCTestCase {
         let ignored = await mailbox.next()
         XCTAssertNil(ignored)
     }
+
+    func testPinnedBeaconMailboxDropsOtherDevices() async {
+        let mailbox = AlvrBeaconMailbox()
+        let quest = AlvrBeacon(protocolId: 7, hostname: "Quest")
+        let first = AlvrBeaconMailbox.Announcement(beacon: quest, ip: "10.0.0.2")
+        mailbox.pin(first)
+        mailbox.pin(.init(beacon: AlvrBeacon(protocolId: 7, hostname: "Other"), ip: "10.0.0.9"))
+
+        // Another device, the same hostname from another address, and another
+        // hostname from the headset's address are all dropped.
+        XCTAssertFalse(mailbox.post(.init(
+            beacon: AlvrBeacon(protocolId: 7, hostname: "Other"), ip: "10.0.0.9")))
+        XCTAssertFalse(mailbox.post(.init(beacon: quest, ip: "10.0.0.9")))
+        XCTAssertFalse(mailbox.post(.init(
+            beacon: AlvrBeacon(protocolId: 7, hostname: "Other"), ip: "10.0.0.2")))
+        XCTAssertTrue(mailbox.post(first))
+        let delivered = await mailbox.next()
+        XCTAssertEqual(delivered, first)
+    }
 }
 
 // MARK: - Transport-level detection

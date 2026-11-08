@@ -359,6 +359,8 @@ The stream is your screen, so the streamer is conservative by default:
   interaction profiles, hand skeletons (with gesture-emulated Touch input), calibrated views, and
   reverse haptics are bridged into the OpenXR runtime.
   A missing-hand mask clears pose and velocity immediately; a newer motion sample recovers them.
+  After a disconnect, only the headset from the first session (the same hostname at the same
+  address) can reconnect; beacons from other devices are ignored and logged.
 - `--wired` talks only to localhost ports forwarded to one authorized physical USB device by
   ADB. It does not expose the screen on the LAN and removes those forwards during clean shutdown.
 - The runtime control socket is loopback-only and authenticated by a per-session token written to
