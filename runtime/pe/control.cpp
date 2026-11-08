@@ -651,6 +651,10 @@ DWORD WINAPI receiverThreadProc(LPVOID) {
             AcquireSRWLockExclusive(&gControlLock);
             if (gSocket == socket && !gReceiverFailed) {
                 markReceiverFailedLocked();
+                // Let the streamer see the runtime go, as for a rejected
+                // message, instead of writing tracking nobody reads. The
+                // socket is still this session's while the lock is held.
+                shutdown(socket, SD_BOTH);
             }
             ReleaseSRWLockExclusive(&gControlLock);
             return 0;
@@ -1180,6 +1184,15 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
             gSocket = INVALID_SOCKET;
             break;
         }
+        // The receive timeout bounds only the handshake. While the headset is
+        // disconnected the streamer has no tracking to forward and no frames
+        // to acknowledge, so the receiver must outlast that silence. Ack waits
+        // keep their own timeout, and disconnects shut the socket down to wake
+        // the receiver.
+        const DWORD noReceiveTimeout = 0;
+        setsockopt(gSocket, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&noReceiveTimeout),
+                   sizeof(noReceiveTimeout));
 
         gWaiterWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         gFenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
