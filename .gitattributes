@@ -4,7 +4,9 @@
 *.cpp text eol=lf
 *.h text eol=lf
 *.md text eol=lf
-*.patch text eol=lf
+# Patch context lines must match the patched source byte for byte, trailing
+# whitespace included, so `git diff --check` skips them.
+*.patch text eol=lf -whitespace
 *.swift text eol=lf
 *.yml text eol=lf
 *.zsh text eol=lf

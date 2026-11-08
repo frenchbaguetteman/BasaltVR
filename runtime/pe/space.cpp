@@ -27,6 +27,21 @@ constexpr std::array<XrReferenceSpaceType, 4> kSupportedReferenceSpaces = {
     XR_REFERENCE_SPACE_TYPE_STAGE,
 };
 
+// STAGE and LOCAL_FLOOR share LOCAL's origin. ALVR delivers poses in the
+// Quest's floor-level guardian frame, and control.cpp's leveledHeadOrigin()
+// keeps Y = 0 of that frame when it defines LOCAL (only X/Z and yaw are
+// centered; see docs/DXMT-INTEROP.md, and the control-daemon smoke sees an
+// injected standing head at LOCAL y = 1.5). LOCAL's origin is therefore
+// already on the floor, which is the STAGE and LOCAL_FLOOR definition, so
+// STAGE-from-LOCAL and LOCAL_FLOOR-from-LOCAL are identity. The recenter
+// gesture moves this shared origin, so all three move together, and
+// queueReferenceSpaceChange (frame.cpp) queues an event for each of them.
+bool isWorldReferenceSpace(XrReferenceSpaceType referenceSpaceType) {
+    return referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL ||
+           referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR ||
+           referenceSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE;
+}
+
 // The headset supplies LOCAL-from-HEAD. These eye values are conservative
 // fallbacks until the control protocol delivers the Quest's calibrated IPD/FOV.
 constexpr float kEyeOffsetMeters = 0.063f / 2.0f;
@@ -358,9 +373,12 @@ XrResult XRAPI_CALL locateSpace(
                         XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
     } else if (target.kind == SpaceKind::kReference &&
                base.kind == SpaceKind::kReference &&
-               target.referenceSpaceType == base.referenceSpaceType) {
-        // The natural transform cancels for LOCAL↔LOCAL and VIEW↔VIEW, so
-        // creation offsets remain valid even before the first head sample.
+               (target.referenceSpaceType == base.referenceSpaceType ||
+                (isWorldReferenceSpace(target.referenceSpaceType) &&
+                 isWorldReferenceSpace(base.referenceSpaceType)))) {
+        // The natural transform cancels for VIEW↔VIEW and between LOCAL,
+        // LOCAL_FLOOR, and STAGE, which share one origin, so creation offsets
+        // remain valid even before the first head sample.
         location->locationFlags =
             XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
             XR_SPACE_LOCATION_POSITION_VALID_BIT;
@@ -581,6 +599,8 @@ XrResult XRAPI_CALL getReferenceSpaceBoundsRect(
         return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
     }
 
+    // ALVR does not forward the Quest guardian, so no space has known bounds.
+    // OpenComposite accepts this result for STAGE.
     bounds->width = 0.0f;
     bounds->height = 0.0f;
     return XR_SPACE_BOUNDS_UNAVAILABLE;

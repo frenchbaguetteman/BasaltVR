@@ -1,0 +1,43 @@
+diff --git a/DrvOpenXR/XrBackend.cpp b/DrvOpenXR/XrBackend.cpp
+index d7177a9..f5760c3 100644
+--- a/DrvOpenXR/XrBackend.cpp
++++ b/DrvOpenXR/XrBackend.cpp
+@@ -29,6 +29,7 @@
+ #include "../OpenOVR/convert.h"
+ #include "generated/static_bases.gen.h"
+ 
++#include "generated/interfaces/IVRCompositor_013.h"
+ #include "generated/interfaces/IVRCompositor_018.h"
+ 
+ #include "tmp_gfx/TemporaryGraphics.h"
+@@ -688,6 +689,30 @@ bool XrBackend::GetFrameTiming(OOVR_Compositor_FrameTiming* pTiming, uint32_t un
+ 		return true;
+ 	}
+ 
++	// Basalt: IVRCompositor_012 to _014 use a smaller struct (168 or 176 bytes, not 200).
++	// Leaving it all zero breaks old SteamVR Unity plugins (The Lab's Secret Shop, Unity 5.4,
++	// IVRCompositor_013): SteamVR_Render sets
++	//   Time.fixedDeltaTime = timeScale * m_nNumFramePresents / hmd_DisplayFrequency
++	// so a zero there makes Unity run physics thousands of times per frame (about 1 fps).
++	if (pTiming->m_nSize >= sizeof(IVRCompositor_013::Compositor_FrameTiming)) {
++		using LegacyTiming = IVRCompositor_013::Compositor_FrameTiming;
++		static_assert(offsetof(LegacyTiming, m_nNumFramePresents) == offsetof(OOVR_Compositor_FrameTiming, m_nNumFramePresents),
++		    "m_nNumFramePresents moved");
++		LegacyTiming* legacy = reinterpret_cast<LegacyTiming*>(pTiming);
++		legacy->m_nFrameIndex = nFrameIndex;
++		legacy->m_nNumFramePresents = 1;
++		legacy->m_nNumDroppedFrames = 0;
++		legacy->m_flSystemTimeInSeconds = frameSubmitTimeUs;
++		legacy->m_flSceneRenderGpuMs = 8.0f;
++		legacy->m_flTotalRenderGpuMs = 9.0f;
++		legacy->m_flCompositorRenderGpuMs = 1.5f;
++		legacy->m_flCompositorRenderCpuMs = 3.0f;
++		legacy->m_flCompositorIdleCpuMs = 0.1f;
++		legacy->m_flClientFrameIntervalMs = 11.1f;
++		GetPrimaryHMD()->GetPose(vr::ETrackingUniverseOrigin::TrackingUniverseSeated, &legacy->m_HmdPose, ETrackingStateType::TrackingStateType_Rendering);
++		return true;
++	}
++
+ 	return false;
+ }
+ 
