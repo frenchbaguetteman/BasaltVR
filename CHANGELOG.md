@@ -32,6 +32,7 @@ before each session). The streamer reports a mismatched DLL instead of connectin
   or oversized swapchains and flipped rects into a BGRA output; up to 16 swapchains.
 - The streamer survives ALVR client disconnects over USB and Wi-Fi: it ends that session, sends
   `INPUT_RESET` to the runtime, and accepts the next connection while the game keeps running.
+  Over Wi-Fi only the first session's headset (same hostname and address) may reconnect.
 - Loss recovery: frames are not encoded while the transport is busy, and after a lost access
   unit P-frames are held until a forced IDR, so the Quest never decodes against a missing
   reference. The USB link rides out pauses of up to 5 s instead of dropping the headset.
