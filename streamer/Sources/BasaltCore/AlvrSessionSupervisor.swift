@@ -566,7 +566,8 @@ private final class OneShot<Value: Sendable>: @unchecked Sendable {
 /// Hands the newest ALVR discovery beacon to the Wi-Fi connect loop. The
 /// client keeps announcing itself while it waits for a server, so after a
 /// disconnect the next beacon starts the next handshake; beacons that arrive
-/// while a session streams are ignored.
+/// while a session streams are ignored. Once a headset is pinned, beacons
+/// from any other hostname or address are dropped.
 public final class AlvrBeaconMailbox: @unchecked Sendable {
     public struct Announcement: Equatable, Sendable {
         public let beacon: AlvrBeacon
@@ -582,23 +583,48 @@ public final class AlvrBeaconMailbox: @unchecked Sendable {
     private var latest: Announcement?
     private var waiter: CheckedContinuation<Announcement?, Never>?
     private var closed = false
+    private var pinned: Announcement?
 
     public init() {}
 
-    public func post(_ announcement: Announcement) {
+    /// Accepts only `announcement`'s headset from now on. The first session's
+    /// headset is the one the user chose; without the pin, any device on the
+    /// LAN that announces itself while the headset is away would receive the
+    /// stream and drive the game's tracking. A later call keeps the first pin.
+    public func pin(_ announcement: Announcement) {
         lock.lock()
+        if pinned == nil { pinned = announcement }
+        lock.unlock()
+    }
+
+    /// Returns false when `announcement` comes from a device other than the
+    /// pinned headset; the mailbox drops it.
+    @discardableResult
+    public func post(_ announcement: Announcement) -> Bool {
+        lock.lock()
+        if let pinned, !Self.isSameHeadset(pinned, announcement) {
+            lock.unlock()
+            return false
+        }
         guard !closed else {
             lock.unlock()
-            return
+            return true
         }
         if let waiter {
             self.waiter = nil
             lock.unlock()
             waiter.resume(returning: announcement)
-            return
+            return true
         }
         latest = announcement
         lock.unlock()
+        return true
+    }
+
+    /// Any device can claim any hostname in its beacon, so the address must
+    /// match too.
+    private static func isSameHeadset(_ pinned: Announcement, _ other: Announcement) -> Bool {
+        pinned.beacon.hostname == other.beacon.hostname && pinned.ip == other.ip
     }
 
     /// Waits for a beacon that arrives after this call (or one pending from
