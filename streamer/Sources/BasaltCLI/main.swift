@@ -349,8 +349,13 @@ private struct BasaltCLI {
         process.environment = environment
         process.standardInput = FileHandle.nullDevice
         if let log {
-            FileManager.default.createFile(atPath: log, contents: nil)
-            let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: log))
+            // Append, so an existing file at that path (an earlier session's
+            // log, or anything else) is not emptied.
+            let descriptor = open(log, O_WRONLY | O_CREAT | O_APPEND, 0o600)
+            guard descriptor >= 0 else {
+                throw BottleToolError("Could not open log \(log): \(String(cString: strerror(errno)))")
+            }
+            let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
             process.standardOutput = handle
             process.standardError = handle
         } else {

@@ -476,8 +476,14 @@ struct BasaltStreamerApp {
         var discovery: AlvrDiscoveryListener?
         let beaconMailbox = AlvrBeaconMailbox()
         if options.discover {
+            let ignoredBeaconLog = ThrottledEventLog()
             discovery = try AlvrDiscoveryListener { beacon, ip in
-                beaconMailbox.post(.init(beacon: beacon, ip: ip))
+                if !beaconMailbox.post(.init(beacon: beacon, ip: ip)) {
+                    ignoredBeaconLog.record {
+                        "Ignored an ALVR beacon from '\(beacon.hostname)' at \(ip) (\($0)x): "
+                            + "only the headset from the first session may reconnect."
+                    }
+                }
             }
         } else if options.wired {
             let connection = try AlvrWiredConnection.setup()
@@ -533,7 +539,9 @@ struct BasaltStreamerApp {
                 let protocolHex = String(format: "%016llx", beacon.protocolId)
                 print("ALVR headset '\(beacon.hostname)' announced itself from \(announcement.ip) "
                     + "(protocol id \(protocolHex)); probing TCP control handshake…")
-                return try await connectSession(request(announcement.ip, beacon.protocolId))
+                let session = try await connectSession(request(announcement.ip, beacon.protocolId))
+                beaconMailbox.pin(announcement)
+                return session
             }
             let everStreamed = SessionFlag()
             sessionSupervisor.onSessionStarted = { _, generation in
