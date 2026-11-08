@@ -1,0 +1,150 @@
+From 7ccaf3ea6fa37385d65f5c0bea65b4a2412fd38b Mon Sep 17 00:00:00 2001
+From: Mac <charmillionaire@192.168.1.100>
+Date: Mon, 12 Oct 2026 20:16:58 +0800
+Subject: [PATCH 3/6] fix: complete OpenVR 2.x interface support (build errors)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+修复上一轮 CI 暴露的 6 处编译错误：
+
+1. libparse.py 支持 'enum class X : uint32_t' 语法
+   —— 根因：旧正则不匹配 enum class，导致 EVRDistortionChannel
+      未被登记进类型上下文，生成的 CVRSystem_026 类（全局作用域）
+      缺少 vr:: 前缀而报 C2061 / C3668 / C2259
+2. BaseCompositor.h 增加 OOVR_EVRCompositorTextureUsage 类型别名
+3. BaseApplications 增加 RegisterSubprocess 空实现
+4. BaseInput 眼动追踪方法从 private 移到 public
+5. BaseChaperoneSetup::SetWorkingPerimeter 参数补 const（对齐新版头文件）
+---
+ OpenOVR/Reimpl/BaseApplications.cpp   |  6 ++++++
+ OpenOVR/Reimpl/BaseApplications.h     |  1 +
+ OpenOVR/Reimpl/BaseChaperoneSetup.cpp |  2 +-
+ OpenOVR/Reimpl/BaseChaperoneSetup.h   |  2 +-
+ OpenOVR/Reimpl/BaseCompositor.cpp     |  2 +-
+ OpenOVR/Reimpl/BaseCompositor.h       |  3 ++-
+ OpenOVR/Reimpl/BaseInput.h            | 10 ++++++----
+ scripts/libparse.py                   |  2 +-
+ 8 files changed, 19 insertions(+), 9 deletions(-)
+
+diff --git a/OpenOVR/Reimpl/BaseApplications.cpp b/OpenOVR/Reimpl/BaseApplications.cpp
+index 614dacae928bbbd715629ef1dad0067a06f2e06b..ae11339c104bd4e5f115e872684583fd238a9be6 100644
+--- a/OpenOVR/Reimpl/BaseApplications.cpp
++++ b/OpenOVR/Reimpl/BaseApplications.cpp
+@@ -177,3 +177,9 @@ uint32_t BaseApplications::GetCurrentSceneProcessId()
+ {
+ 	STUBBED();
+ }
++
++vr::EVRApplicationError BaseApplications::RegisterSubprocess(uint32_t nPid)
++{
++	STUBBED();
++	return vr::VRApplicationError_None;
++}
+diff --git a/OpenOVR/Reimpl/BaseApplications.h b/OpenOVR/Reimpl/BaseApplications.h
+index e69e741fd924087d5a357b8fb924a0cdbb74dc67..96566b2044bdc6559a29347535cf74ac2893b679 100644
+--- a/OpenOVR/Reimpl/BaseApplications.h
++++ b/OpenOVR/Reimpl/BaseApplications.h
+@@ -211,4 +211,5 @@ public:
+ 	 * focus once it starts rendering, but it will appear here once it calls VR_Init with the Scene application
+ 	 * type. */
+ 	uint32_t GetCurrentSceneProcessId();
++	vr::EVRApplicationError RegisterSubprocess(uint32_t nPid);
+ };
+diff --git a/OpenOVR/Reimpl/BaseChaperoneSetup.cpp b/OpenOVR/Reimpl/BaseChaperoneSetup.cpp
+index 42cc3098da6a181c8bee8e089087cc20af43753e..61b08a6163b3f718a0b57ed82a2ed510f3c0ac92 100644
+--- a/OpenOVR/Reimpl/BaseChaperoneSetup.cpp
++++ b/OpenOVR/Reimpl/BaseChaperoneSetup.cpp
+@@ -119,7 +119,7 @@ bool BaseChaperoneSetup::ImportFromBufferToWorking(const char* pBuffer, uint32_t
+ {
+ 	STUBBED();
+ }
+-void BaseChaperoneSetup::SetWorkingPerimeter(VR_ARRAY_COUNT(unPointCount) HmdVector2_t* pPointBuffer, uint32_t unPointCount)
++void BaseChaperoneSetup::SetWorkingPerimeter(VR_ARRAY_COUNT(unPointCount) const HmdVector2_t* pPointBuffer, uint32_t unPointCount)
+ {
+ 	STUBBED();
+ }
+diff --git a/OpenOVR/Reimpl/BaseChaperoneSetup.h b/OpenOVR/Reimpl/BaseChaperoneSetup.h
+index a2fba311dd85480f7f8e60af7cd64838a6797bfa..19a5572924d50b713a358740a0477f607b315aa6 100644
+--- a/OpenOVR/Reimpl/BaseChaperoneSetup.h
++++ b/OpenOVR/Reimpl/BaseChaperoneSetup.h
+@@ -77,7 +77,7 @@ public:
+ 	bool ImportFromBufferToWorking(const char* pBuffer, uint32_t nImportFlags);
+ 
+ 	/** Sets the Collision Bounds in the working copy. */
+-	void SetWorkingPerimeter(VR_ARRAY_COUNT(unPointCount) vr::HmdVector2_t* pPointBuffer, uint32_t unPointCount);
++	void SetWorkingPerimeter(VR_ARRAY_COUNT(unPointCount) const vr::HmdVector2_t* pPointBuffer, uint32_t unPointCount);
+ 
+ 	/** Shows the chaperone data in the working set to preview in the compositor.*/
+ 	void ShowWorkingSetPreview();
+diff --git a/OpenOVR/Reimpl/BaseCompositor.cpp b/OpenOVR/Reimpl/BaseCompositor.cpp
+index 5607c0fa739a177ede7c10c8f767f7cc13978cf4..f8941593226eb65121318019d2974b1b27ba61a2 100644
+--- a/OpenOVR/Reimpl/BaseCompositor.cpp
++++ b/OpenOVR/Reimpl/BaseCompositor.cpp
+@@ -602,7 +602,7 @@ ovr_enum_t BaseCompositor::GetPosesForFrame(uint32_t unPosePredictionID, Tracked
+ }
+ 
+ 
+-BaseCompositor::ovr_enum_t BaseCompositor::GetSubmitTexture(vr::Texture_t *pOutTexture, bool *pNeedsFlush, vr::IVRCompositor_029::EVRCompositorTextureUsage eUsage, const vr::Texture_t *pTexture, const vr::VRTextureBounds_t *pBounds, vr::EVRSubmitFlags nSubmitFlags)
++BaseCompositor::ovr_enum_t BaseCompositor::GetSubmitTexture(vr::Texture_t *pOutTexture, bool *pNeedsFlush, OOVR_EVRCompositorTextureUsage eUsage, const vr::Texture_t *pTexture, const vr::VRTextureBounds_t *pBounds, vr::EVRSubmitFlags nSubmitFlags)
+ {
+ 	STUBBED();
+ 	return 106; // VRCompositorError_SharedTexturesNotSupported
+diff --git a/OpenOVR/Reimpl/BaseCompositor.h b/OpenOVR/Reimpl/BaseCompositor.h
+index 356afc974d603b5f2e34dabefad21e10dafc8526..b816ccd2b8d9e1976e6774f0f6202e99df46080c 100644
+--- a/OpenOVR/Reimpl/BaseCompositor.h
++++ b/OpenOVR/Reimpl/BaseCompositor.h
+@@ -1,3 +1,4 @@
++typedef vr::IVRCompositor_029::EVRCompositorTextureUsage OOVR_EVRCompositorTextureUsage;
+ #include "generated/interfaces/IVRCompositor_029.h"
+ #pragma once
+ #include "../BaseCommon.h" // TODO don't import from OCOVR, and remove the "../"
+@@ -367,5 +368,5 @@ public:
+ 	ovr_enum_t GetPosesForFrame(uint32_t unPosePredictionID, vr::TrackedDevicePose_t* pPoseArray, uint32_t unPoseArrayCount);
+ 
+ 	// OpenVR 2.x additions
+-	ovr_enum_t GetSubmitTexture(vr::Texture_t *pOutTexture, bool *pNeedsFlush, vr::IVRCompositor_029::EVRCompositorTextureUsage eUsage, const vr::Texture_t *pTexture, const vr::VRTextureBounds_t *pBounds = 0, vr::EVRSubmitFlags nSubmitFlags = vr::Submit_Default);
++	ovr_enum_t GetSubmitTexture(vr::Texture_t *pOutTexture, bool *pNeedsFlush, OOVR_EVRCompositorTextureUsage eUsage, const vr::Texture_t *pTexture, const vr::VRTextureBounds_t *pBounds = 0, vr::EVRSubmitFlags nSubmitFlags = vr::Submit_Default);
+ };
+diff --git a/OpenOVR/Reimpl/BaseInput.h b/OpenOVR/Reimpl/BaseInput.h
+index 15ca3d9261685bdab4dfd1583d2e36183448979c..0fbf010374db723b2d1cb2214614fb627e9ae8fe 100644
+--- a/OpenOVR/Reimpl/BaseInput.h
++++ b/OpenOVR/Reimpl/BaseInput.h
+@@ -364,7 +364,11 @@ public:
+ 	 */
+ 	EVRInputError GetBindingVariant(vr::VRInputValueHandle_t ulDevicePath, char* pchVariantArray, uint32_t unVariantArraySize);
+ 
+-public: // INTERNAL FUNCTIONS
++	// OpenVR 2.x additions
++	vr::EVRInputError GetEyeTrackingDataForNextFrame(vr::VRActionHandle_t action, vr::ETrackingUniverseOrigin eOrigin, vr::VREyeTrackingData_t *pEyeTrackingData, uint32_t ulEyeTrackingDataSize);
++	vr::EVRInputError GetEyeTrackingDataRelativeToNow(vr::VRActionHandle_t action, vr::ETrackingUniverseOrigin eOrigin, float fPredictedSecondsFromNow, vr::VREyeTrackingData_t *pEyeTrackingData, uint32_t ulEyeTrackingDataSize);
++
++	public: // INTERNAL FUNCTIONS
+ 	/**
+ 	 * Bind all the inputs to the current OpenXR session. This must be called after swapping the session to keep
+ 	 * the inputs working.
+@@ -869,7 +873,5 @@ private:
+ 	void checkIfActionsMustBeDiscoveredFromSteam();
+ 	bool triedDiscoveringManifest = false;
+ 
+-	// OpenVR 2.x additions
+-	vr::EVRInputError GetEyeTrackingDataForNextFrame(vr::VRActionHandle_t action, vr::ETrackingUniverseOrigin eOrigin, vr::VREyeTrackingData_t *pEyeTrackingData, uint32_t ulEyeTrackingDataSize);
+-	vr::EVRInputError GetEyeTrackingDataRelativeToNow(vr::VRActionHandle_t action, vr::ETrackingUniverseOrigin eOrigin, float fPredictedSecondsFromNow, vr::VREyeTrackingData_t *pEyeTrackingData, uint32_t ulEyeTrackingDataSize);
++
+ };
+diff --git a/scripts/libparse.py b/scripts/libparse.py
+index 03100a824dd452e4d8aa752a930fcb1a505c60a1..c7ca6d8a5ecec0e203559aff7ab941ace2c9d8a8 100644
+--- a/scripts/libparse.py
++++ b/scripts/libparse.py
+@@ -9,7 +9,7 @@ regex = re.compile(regex_src)
+ arg_src = r"(?P<type>[^=]+ \**)(?P<name>\w+)(?: = (?P<default>.*))?"
+ argr = re.compile(arg_src)
+ 
+-typedecl = re.compile(r"^(?:enum|struct)\s+(?P<name>\w+)$")
++typedecl = re.compile(r"^(?:enum(?:\s+class)?|struct)\s+(?P<name>\w+)(?:\s*:\s*\w+)?$")
+ 
+ typedef = re.compile(r"^typedef\s+(?P<def>[\w\s\d_\*&]+)\s+(?P<name>\w+);$")
+ typedef_struct = re.compile(r"^typedef\s+(?:struct|union)$")
+-- 
+2.39.5
+

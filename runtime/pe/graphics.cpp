@@ -365,6 +365,7 @@ XrResult XRAPI_CALL destroySession(XrSession session) {
     controlSessionDestroyed(session);
     invalidateSessionLifecycle(session);
     invalidateSpacesForSession(session);
+    invalidateHandTrackersForSession(session);
     invalidateSwapchainForSession(session);
     invalidateInputForSession(session);
     release(device);
@@ -412,6 +413,7 @@ void invalidateSessionForInstance(XrInstance instance) {
         controlSessionDestroyed(session);
         invalidateSessionLifecycle(session);
         invalidateSpacesForSession(session);
+        invalidateHandTrackersForSession(session);
         invalidateSwapchainForSession(session);
         invalidateInputForSession(session);
     }

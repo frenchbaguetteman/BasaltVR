@@ -16,6 +16,9 @@ toolchain_file=${runtime_dir}/cmake/toolchains/mingw-x86_64.cmake
 fps=${BASALT_HEADSET_FPS:-72}
 megabits=${BASALT_HEADSET_MBPS:-12}
 resolution=${BASALT_HEADSET_RESOLUTION:-balanced}
+# Extra basalt-streamer flags for A/B runs, split on spaces, for example
+# BASALT_HEADSET_STREAMER_ARGS='--idr-interval 10 --entropy cavlc'.
+extra_streamer_args=(${=BASALT_HEADSET_STREAMER_ARGS:-})
 
 if [[ ${fps} != <-> ]] || (( fps < 1 || fps > 240 )); then
     print -u2 "BASALT_HEADSET_FPS must be an integer from 1 to 240"
@@ -134,7 +137,8 @@ print "Starting ALVR and waiting for the Quest..."
     --runtime "${control_file}" \
     --fps "${fps}" \
     --mbps "${megabits}" \
-    --resolution "${resolution}" &
+    --resolution "${resolution}" \
+    "${extra_streamer_args[@]}" &
 streamer_pid=$!
 
 for _ in {1..300}; do
