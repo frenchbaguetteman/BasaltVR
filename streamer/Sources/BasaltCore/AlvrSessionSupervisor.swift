@@ -496,14 +496,13 @@ public final class AlvrSessionSupervisor: @unchecked Sendable {
     /// abandoned connect is cancelled; a session it still returns is torn
     /// down when it arrives.
     private func connectUnlessStopped(_ attempt: Int) async throws -> AlvrLiveSession? {
-        lock.lock()
-        guard !stopped else {
+        let started = lock.withLock {
             // Never start a handshake that a stop already abandoned.
-            lock.unlock()
-            return nil
+            guard !stopped else { return false }
+            runningConnects += 1
+            return true
         }
-        runningConnects += 1
-        lock.unlock()
+        guard started else { return nil }
         let outcome = await withCheckedContinuation {
             (continuation: CheckedContinuation<Result<AlvrLiveSession, Error>?, Never>) in
             let result = OneShot<Result<AlvrLiveSession, Error>?>(continuation)
