@@ -103,6 +103,9 @@ All notable changes to BasaltVR are documented here.
 - A restarted OpenXR session can replace the runtime connection before the old one closes, and a
   connection that never sends its Hello is dropped after 5 seconds.
 - `basaltctl run` no longer reads its own options from game arguments after `--`.
+- The runtime keeps its streamer connection through more than 5 seconds without a message, such
+  as while the headset is disconnected, instead of silently stopping rendering for the rest of the
+  session. If the connection does fail, the runtime now closes it so the streamer notices.
 
 ### Project maintenance
 
