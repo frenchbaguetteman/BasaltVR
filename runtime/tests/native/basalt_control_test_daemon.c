@@ -8,8 +8,11 @@
  * consistency, and teardown. Exits 0 only if at least --expect-frames
  * FrameReady messages referencing registered swapchains arrived.
  *
+ * --quiet-gap-ms N models a headset outage: after the fifth frame the daemon
+ * sends nothing at all (no tracking, no FrameConsumed) for N ms, then resumes.
+ *
  * Usage: basalt_control_test_daemon --control-file <path> [--expect-frames N]
- *        [--frame-delay-ms N] [--view-width N --view-height N]
+ *        [--frame-delay-ms N] [--quiet-gap-ms N] [--view-width N --view-height N]
  *        [--display-period-ns N] [--verify-clears | --compositor-scenarios]
  *        [--hand-tracking]
  *
@@ -38,6 +41,7 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../../pe/basalt_control_protocol.h"
@@ -93,6 +97,9 @@ static RecordedHaptic g_haptics[MAX_RECORDED_HAPTICS];
 static bool g_refresh_tracking = false;
 static bool g_head_turned = false;
 static unsigned int g_frame_delay_ms = 0;
+static unsigned int g_quiet_gap_ms = 0;
+// The fifth frame is inside the smoke's render loop, past its setup frames.
+#define QUIET_GAP_AFTER_FRAMES 5
 static unsigned int g_view_width = 0;
 static unsigned int g_view_height = 0;
 /* HELLO_ACK display period; the runtime paces xrWaitFrame to it. */
@@ -840,6 +847,19 @@ static bool handle_frame_ready(int fd, const uint8_t* payload, size_t length) {
         printf("daemon: frame %" PRIu64 " ready (display time %" PRId64 ", %u views)\n",
                frame_number, display_time, view_count);
     }
+    if (g_quiet_gap_ms > 0 && g_frames_received == QUIET_GAP_AFTER_FRAMES) {
+        // While the Quest is disconnected the streamer has no tracking to
+        // forward and no frames to acknowledge. Hold this frame's
+        // FrameConsumed and send nothing, longer than any socket timeout.
+        printf("daemon: quiet for %u ms after frame %" PRIu64 "\n", g_quiet_gap_ms,
+               frame_number);
+        fflush(stdout);
+        const struct timespec gap = {
+            .tv_sec = g_quiet_gap_ms / 1000,
+            .tv_nsec = (long)(g_quiet_gap_ms % 1000) * 1000000L,
+        };
+        nanosleep(&gap, NULL);
+    }
     // A continuously readable frame socket can prevent the select timeout in
     // the main loop from firing. Refresh tracking here as well so an
     // intentionally slow consumer does not make the test pose expire while
@@ -869,6 +889,8 @@ int main(int argc, char** argv) {
             g_compositor_scenarios = true;
         } else if (strcmp(argv[i], "--frame-delay-ms") == 0 && i + 1 < argc) {
             g_frame_delay_ms = (unsigned int)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--quiet-gap-ms") == 0 && i + 1 < argc) {
+            g_quiet_gap_ms = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--view-width") == 0 && i + 1 < argc) {
             g_view_width = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--view-height") == 0 && i + 1 < argc) {
@@ -888,7 +910,8 @@ int main(int argc, char** argv) {
          (g_view_width != BASALT_COMPOSITOR_VIEW_WIDTH ||
           g_view_height != BASALT_COMPOSITOR_VIEW_HEIGHT))) {
         fprintf(stderr, "usage: %s --control-file <path> [--expect-frames N] "
-                        "[--frame-delay-ms N] [--view-width N --view-height N] "
+                        "[--frame-delay-ms N] [--quiet-gap-ms N] "
+                        "[--view-width N --view-height N] "
                         "[--display-period-ns N] "
                         "[--verify-clears | --compositor-scenarios] "
                         "[--hand-tracking]\n",

@@ -413,6 +413,16 @@ if [[ -f ${fork_install}/x86_64-windows/d3d11.dll && -f ${fork_install}/x86_64-u
     print "PASS: BASALT_RUNTIME_LOG records compositor activation and layer diagnostics"
     rm -f "${runtime_log}"
 
+    # A headset outage leaves the streamer with nothing to send. The runtime
+    # must keep its control session through a silence longer than its 5 s
+    # socket timeout and render again once tracking and FrameConsumed resume.
+    run_control_gate "control-socket quiet gap" \
+        BASALT_EXPECT_HEAD_POSE=1 \
+        BASALT_EXPECT_VIEW_WIDTH=1152 BASALT_EXPECT_VIEW_HEIGHT=1216 -- \
+        "${probe_dir}/basalt_control_test_daemon" \
+        --expect-frames 21 --quiet-gap-ms 7000 \
+        --view-width 1152 --view-height 1216
+
     # The production streamer's RuntimeLink, not just the C test daemon, must
     # complete the same handshake, swapchain registration, ordered
     # FrameConsumed acknowledgements, and H.264 encode against this runtime.
